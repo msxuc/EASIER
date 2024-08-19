@@ -1,0 +1,6 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# .sh script are always checked-out with LF line endings, this is required
+# by Linux shells.
+*.sh text eol=lf

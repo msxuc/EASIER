@@ -1,0 +1,56 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# This file lists the dependencies required for development.
+#
+# This file contains extra dependencies for unit testing and functional test
+# than the minimum requirements for runtime.
+#
+# To ensure the consistency of development activities, it's recommended to
+# specify the exact version of a dependency,
+# rather than specifying a range of versions, especially for those dependencies
+# whose interfaces are in rapid evolution.
+#
+# However, the version of Python itself isn't specified here but it should be
+# fixed to Python 3.8.
+#
+#
+# To setup the environment:
+#
+#   sudo apt-get install libopenmpi-dev
+#
+#   pip install Cython mpi4py                   # see below
+#   pip install -r dev-requirements.txt
+#
+
+pytest
+more-itertools
+numpy
+scipy
+matplotlib
+
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.0.1+cu117
+
+# To profile using PyTorch integration of tensorboard
+# Both packages need to be installed on the machine where TensorBoard will be
+# launched.
+tensorboard
+torch-tb-profiler
+
+# To profile using Nsight Systems
+nvtx
+
+# WARNING
+# mgmetis wrongly specifies Cython a "install time" requirement and mpi4py
+# as optional but they should both be "setup time" requirements.
+# Therefore we need to install them separatedly before
+# `pip install mgmetis` or `pip install -r dev-requirements.txt`
+# so that ParMETIS support can be added.
+Cython
+mpi4py
+
+mgmetis
+debugpy
+
+h5py
