@@ -65,6 +65,7 @@ jobs:
       with:
         python-version: '3.9'
     - run: |
+        sudo apt install libopenmpi-dev
         pip install Cython mpi4py
         pip install -r requirements.txt
         pip install -e .
