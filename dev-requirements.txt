@@ -47,8 +47,8 @@ nvtx
 # Therefore we need to install them separatedly before
 # `pip install mgmetis` or `pip install -r dev-requirements.txt`
 # so that ParMETIS support can be added.
-Cython
-mpi4py
+# Cython
+# mpi4py
 
 mgmetis
 debugpy
