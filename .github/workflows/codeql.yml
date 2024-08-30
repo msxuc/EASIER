@@ -69,7 +69,7 @@ jobs:
       run: |
         sudo apt install libopenmpi-dev
         pip install Cython mpi4py
-        pip install -r requirements.txt
+        pip install -r dev-requirements.txt
         pip install -e .
 
     # Initializes the CodeQL tools for scanning.
