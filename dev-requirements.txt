@@ -23,11 +23,11 @@
 #   pip install -r dev-requirements.txt
 #
 
-pytest
-more-itertools
-numpy
-scipy
-matplotlib
+pytest==8.3.2
+more-itertools==10.4.0
+numpy==1.24.4
+scipy==1.10.1
+matplotlib==3.7.5
 
 --find-links https://download.pytorch.org/whl/torch_stable.html
 torch==2.0.1+cu117
@@ -47,10 +47,11 @@ nvtx
 # Therefore we need to install them separatedly before
 # `pip install mgmetis` or `pip install -r dev-requirements.txt`
 # so that ParMETIS support can be added.
-# Cython
-# mpi4py
+Cython==3.0.11
+mpi4py==3.1.5
 
-mgmetis
+mgmetis==0.1.1
+
+h5py==3.11.0
+
 debugpy
-
-h5py
