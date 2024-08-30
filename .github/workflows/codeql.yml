@@ -43,10 +43,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - language: c-cpp
-          build-mode: none
         - language: python
           build-mode: none
+        - language: c-cpp
+          build-mode: autobuild
+
         # CodeQL supports the following values keywords for 'language': 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
@@ -58,6 +59,15 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Python setup
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    - run: |
+        pip install Cython mpi4py
+        pip install -r requirements.txt
+        pip install -e .
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
