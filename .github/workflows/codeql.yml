@@ -60,18 +60,18 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.8'
+    #- name: Setup Python
+    #  uses: actions/setup-python@v5
+    #  with:
+    #    python-version: '3.8'
 
     - name: Install EASIER
       run: |
         sudo apt-get install openmpi-bin libopenmpi-dev
-        python3.8 -m pip install Cython==3.0.11 mpi4py==3.1.5
-        python3.8 -m pip install mgmetis==0.1.1
-        python3.8 -m pip install -r dev-requirements.txt
-        python3.8 -m pip install -e .
+        pip install Cython==3.0.11 mpi4py==3.1.5
+        pip install mgmetis==0.1.1
+        pip install -r dev-requirements.txt
+        pip install -e .
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
