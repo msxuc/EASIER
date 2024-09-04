@@ -68,10 +68,10 @@ jobs:
     - name: Install EASIER
       run: |
         sudo apt-get install openmpi-bin libopenmpi-dev
-        pip install Cython==3.0.11 mpi4py==3.1.5
-        pip install mgmetis==0.1.1
-        pip install -r dev-requirements.txt
-        pip install -e .
+        python3.8 -m pip install Cython==3.0.11 mpi4py==3.1.5
+        python3.8 -m pip install mgmetis==0.1.1
+        python3.8 -m pip install -r dev-requirements.txt
+        python3.8 -m pip install -e .
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
