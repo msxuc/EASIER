@@ -1,0 +1,5 @@
+# The owners for everything in the repo.
+# This CODEOWNERS file will exist in all branches (especially main and dev),
+# the owners will be included as reviewers and get notified for PRs
+# targeting those branches.
+*   @gxiaotian @msxuc
