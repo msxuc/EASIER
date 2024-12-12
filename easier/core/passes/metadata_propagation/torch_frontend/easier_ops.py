@@ -149,7 +149,7 @@ def _calc_sliced_region_shape(
         elif pslice is Ellipsis:
             ellipsis_consumed = True
         else:
-            assert False, "unreachable"
+            raise EasierJitException(f"Unexpected index {pslice}")
 
     # The comparison is `<=`, because not necessarily all dims in `shape`
     # must be consumed, e.g. `zeros(2,3,4)[1,...,2] = xxx`
@@ -192,7 +192,9 @@ def _calc_sliced_region_shape(
                 # ```
                 # as that one indexing list/tuple can be nested and make
                 # difference in the resultant ndim.
-                assert False, "unreachable"  # raised NotImplementedError above
+                assert False, \
+                    "unreachable, should have been interrupted by" \
+                    " NotImplementedError above"
 
             elif isinstance(pslice, Node):
                 slice_meta = V.assert_non_structured(pslice)
@@ -219,7 +221,7 @@ def _calc_sliced_region_shape(
 
             else:
                 # Ellipsis is not expected here.
-                assert False, "unreachable"
+                assert False, f"Unexpected pslice {pslice}"
 
     resultant_dimlens_before_ellipsis = []
     resultant_dimlens_after_ellipsis = []
@@ -475,6 +477,10 @@ class _HaloExchangerRule(MetadataRuleBase):
         imeta = V.assert_non_structured(local)
 
         callee_haloxchg: HaloExchanger = self.callee
+
+        if callee_haloxchg.chunk_v is None:
+            return imeta
+
         shape = tuple(callee_haloxchg.chunk_v.shape)
 
         return EasierTensorMeta(shape=shape, dtype=imeta.dtype,

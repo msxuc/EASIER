@@ -7,7 +7,7 @@ from torch.utils import cpp_extension
 entry_points = {
     "console_scripts": [
         # EXE_NAME = PY_MOD:FUNC_NAME
-        "erun = easier.launcher.main:main"
+        "easierrun = easier.launcher.main:main"
     ]
 }
 

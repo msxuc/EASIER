@@ -5,11 +5,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from typing_extensions import Literal, TypeAlias
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing_extensions import Literal, TypeAlias, TypeVar
 import typing
 import threading
 import time
+import functools
+import copy
 
 import torch
 import torch.distributed as dist
@@ -18,9 +20,24 @@ from mpi4py import MPI
 
 from easier.core.utils import logger, EasierJitException
 
+_T = TypeVar("_T")
+
 
 def is_launched_by_easier_launcher():
     return os.environ.get("EASIER_USE_EASIER_LAUNCHER", None) is not None
+
+
+def _wrap_commapi_pre_filter(prefilter, api):
+    """
+    Both `api` and `pre_filter` function objects are not 
+    bound to some DistEnv instance yet, the `self` argument
+    will be included at the head in `args` in the wrapper.
+    """
+    @functools.wraps(api)
+    def wrapper(*args, **kwargs):
+        args, kwargs = prefilter(*args, **kwargs)
+        return api(*args, **kwargs)
+    return wrapper
 
 
 class DistEnv:
@@ -41,6 +58,25 @@ class DistEnv:
         # existing `torch.device` instance remains unchanged.
         self.comm_device = torch.device(device)
 
+    def __init_subclass__(cls) -> None:
+        """
+        Before a communication API provided by subclass DistEnv runs,
+        a _prefilter_ defined in base DistEnv will run first to check and
+        transform the given arguments, to do some common precondition checks.
+        """
+        for member_name, member in list(cls.__dict__.items()):
+            # cls.__dict__ doesn't contain inherited methods from DistEnv
+            if callable(member):
+                # both `member` and `pre_filter` function objects are not
+                # bound to some DistEnv instance yet, the `self` argument
+                # will be included at the head in `args` in the wrapper.
+                pre_filter = getattr(DistEnv, '_pre_' + member_name, None)
+                if pre_filter is not None:
+                    setattr(
+                        cls, member_name,
+                        _wrap_commapi_pre_filter(pre_filter, member)
+                    )
+
     @property
     def is_host(self):
         return self.rank == self.host_rank
@@ -50,14 +86,35 @@ class DistEnv:
 
     @typing.overload
     def broadcast(self, src: int, *,
-                  shape: Tuple[int, ...],
+                  shape: Sequence[int],
                   dtype: torch.dtype) -> torch.Tensor: ...
 
     def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
                   *,
-                  shape: Optional[Tuple[int, ...]] = None,
+                  shape: Optional[Sequence[int]] = None,
                   dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         raise NotImplementedError()
+
+    def _pre_broadcast(self, src, tensor=None, *, shape=None, dtype=None):
+        assert 0 <= src < self.world_size
+
+        if src == self.rank:
+            assert tensor is not None, \
+                "Broadcast sender must provide the tensor"
+            assert shape is None and dtype is None, \
+                "Broadcast sender should not specify the shape or dtype"
+
+            if not tensor.is_contiguous():
+                logger.debug('Broadcasting a non-contiguous tensor')
+                tensor = tensor.contiguous()
+
+        else:
+            assert tensor is None, \
+                "Broadcast receiver should not provide the tensor"
+            assert shape is not None and dtype is not None, \
+                "Broadcast receiver must specify the shape and dtype"
+
+        return (self, src, tensor), {'shape': shape, 'dtype': dtype}
 
     @typing.overload
     def broadcast_object_list(self, src: int, object_list: List[Any]): ...
@@ -79,6 +136,16 @@ class DistEnv:
         """
         raise NotImplementedError()
 
+    def _pre_broadcast_object_list(self, src, object_list=None):
+        assert 0 <= src < self.world_size
+
+        if src == self.rank:
+            assert object_list is not None, \
+                "Broadcast sender must provide the object list"
+        else:
+            object_list = None  # unused
+        return (self, src, object_list), {}
+
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
         """
         To achieve compatibility on different communication backends like
@@ -86,6 +153,14 @@ class DistEnv:
         but to define its description first then `DistEnv.batch_isend_irecv`.
         """
         raise NotImplementedError()
+
+    def _pre_def_isend(self, tensor, dst, tag):
+        assert 0 <= dst < self.world_size
+
+        if not tensor.is_contiguous():
+            logger.debug('Defining isend on a non-contiguous tensor')
+            tensor = tensor.contiguous()
+        return (self, tensor, dst, tag), {}
 
     def def_irecv(self, buffer: torch.Tensor, src: int, tag: int) -> Any:
         """
@@ -95,8 +170,47 @@ class DistEnv:
         """
         raise NotImplementedError()
 
+    def _pre_def_irecv(self, buffer, src, tag):
+        assert 0 <= src < self.world_size
+
+        if not buffer.is_contiguous():
+            # If the `buffer` parameter is not contiguous,
+            # there is no last chance to recover and reflect to callers.
+            raise EasierJitException(
+                "Defining irecv on a non-contiguous tensor")
+        return (self, buffer, src, tag), {}
+
     def batch_isend_irecv(self, p2p_ops: List[Any]) -> List[Any]:
         raise NotImplementedError()
+
+    def send(self, tensor: torch.Tensor, dst: int, tag: int) -> None:
+        """
+        Blockingly send one tensor.
+        """
+        isend = self.def_isend(tensor, dst, tag)
+        for req in self.batch_isend_irecv([isend]):
+            req.wait()
+
+    def recv(self, buffer: torch.Tensor, src: int, tag: int) -> torch.Tensor:
+        """
+        Blockingly receive one tensor.
+        """
+        irecv = self.def_irecv(buffer, src, tag)
+        for req in self.batch_isend_irecv([irecv]):
+            req.wait()
+        return buffer
+
+    def send_int64(self, x: int, dst: int, tag: Optional[int] = None) -> None:
+        self.send(
+            torch.tensor([x], dtype=torch.int64, device=self.comm_device),
+            dst=dst,
+            tag=tag or dst  # default tag: destination
+        )
+
+    def recv_int64(self, src: int, tag: Optional[int] = None) -> int:
+        t = torch.empty((1,), dtype=torch.int64, device=self.comm_device)
+        self.recv(t, src=src, tag=tag or self.rank)  # default tag: destination
+        return int(t)
 
     def all_to_all_single(self, local_input: torch.Tensor) -> torch.Tensor:
         """
@@ -105,6 +219,12 @@ class DistEnv:
         Currently `local_input` must have ndim==1.
         """
         raise NotImplementedError()
+
+    def _pre_all_to_all_single(self, local_input):
+        if not local_input.is_contiguous():
+            logger.debug('Doing all_to_all_single on a non-contiguous tensor')
+            local_input = local_input.contiguous()
+        return (self, local_input,), {}
 
     def all_to_all(self, tensors: Sequence[torch.Tensor]
                    ) -> List[torch.Tensor]:
@@ -116,14 +236,53 @@ class DistEnv:
         """
         raise NotImplementedError()
 
+    def _pre_all_to_all(self, tensors):
+        assert len(tensors) == self.world_size
+        for i, tensor in enumerate(tensors):
+            assert tensor.ndim == 1
+        dtypes = set(t.dtype for t in tensors)
+        assert len(dtypes) == 1
+
+        tensors = list(tensors)  # copy the list
+        for i, tensor in enumerate(tensors):
+            if not tensor.is_contiguous():
+                # Ensure contiguousness for the last time.
+                logger.debug(
+                    f'The {i}-th tensor to all_to_all is non-contiguous')
+                tensors[i] = tensor.contiguous()
+
+        return (self, tensors,), {}
+
     def all_gather_into_tensor(self, send_tensor: torch.Tensor,
                                form: Literal['concat', 'stack'] = 'concat'):
         raise NotImplementedError()
+
+    def _pre_all_gather_into_tensor(self, send_tensor, form='concat'):
+        if not send_tensor.is_contiguous():
+            # Ensure contiguousness for the last time.
+            logger.debug(
+                'Doing all_gather_into_tensor on a non-contiguous tensor')
+            send_tensor = send_tensor.contiguous()
+
+        return (self, send_tensor, form), {}
 
     def all_gather(self, send_tensor: torch.Tensor,
                    shapes: Sequence[Sequence[int]]
                    ) -> List[torch.Tensor]:
         raise NotImplementedError()
+
+    def _pre_all_gather(self, send_tensor, shapes):
+        shapes = list(map(tuple, shapes))
+        assert len(shapes) == self.world_size
+        assert shapes[self.rank] == send_tensor.shape
+
+        if not send_tensor.is_contiguous():
+            # Ensure contiguousness for the last time.
+            logger.debug(
+                'Doing all_gather on a non-contiguous tensor')
+            send_tensor = send_tensor.contiguous()
+
+        return (self, send_tensor, shapes), {}
 
     def gather(self, dst: int, send_tensor: torch.Tensor
                ) -> Optional[List[torch.Tensor]]:
@@ -136,6 +295,42 @@ class DistEnv:
         interchange too.
         """
         raise NotImplementedError()
+
+    def _pre_gather(self, dst, send_tensor):
+        assert 0 <= dst < self.world_size
+
+        if not send_tensor.is_contiguous():
+            # Ensure contiguousness for the last time.
+            logger.debug(
+                'Doing all_gather on a non-contiguous tensor')
+            send_tensor = send_tensor.contiguous()
+        return (self, dst, send_tensor), {}
+
+    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        raise NotImplementedError()
+
+    def _pre_gather_object(self, dst, obj):
+        assert 0 <= dst < self.world_size
+        return (self, dst, obj), {}
+
+    @typing.overload
+    def scatter_object(self, src: int) -> Any: ...
+    @typing.overload
+    def scatter_object(self, src: int, objs: List[_T]) -> _T: ...
+
+    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+        raise NotImplementedError()
+
+    def _pre_scatter_object(self, src, objs=None):
+        assert 0 <= src < self.world_size
+
+        if src == self.rank:
+            assert objs is not None
+            assert len(objs) == self.world_size
+        else:
+            objs = None  # unused
+
+        return (self, src, objs), {}
 
     def abort(self):
         """
@@ -176,15 +371,12 @@ class DummyDistEnv(DistEnv):
 
     def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
                   *,
-                  shape: Optional[Tuple[int, ...]] = None,
+                  shape: Optional[Sequence[int]] = None,
                   dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         assert src == 0, \
             "Broadcast in dummy environment is from rank 0 to rank 0"
         assert tensor is not None, \
             "Broadcast sender in dummy environment must provide the tensor"
-        assert shape is None and dtype is None, \
-            "Broadcast sender in dummy environment is sending to itself," \
-            " do not specify the shape or dtype"
         return tensor.clone()
 
     def broadcast_object_list(self, src: int,
@@ -192,9 +384,6 @@ class DummyDistEnv(DistEnv):
                               ) -> Optional[list]:
         assert src == 0, \
             "Broadcast in dummy environment is from rank 0 to rank 0"
-        assert object_list is not None, \
-            "Broadcast sender in dummy environment must provide the object list"
-        import copy
         return copy.deepcopy(object_list)
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
@@ -214,8 +403,6 @@ class DummyDistEnv(DistEnv):
 
     def all_to_all(self, tensors: Sequence[torch.Tensor]
                    ) -> List[torch.Tensor]:
-        assert len(tensors) == 1
-        assert tensors[0].ndim == 1
         return [tensors[0].clone()]
 
     def all_gather_into_tensor(self, send_tensor: torch.Tensor,
@@ -228,14 +415,18 @@ class DummyDistEnv(DistEnv):
     def all_gather(self, send_tensor: torch.Tensor,
                    shapes: Sequence[Sequence[int]]
                    ) -> List[torch.Tensor]:
-        assert [send_tensor.shape] == list(map(tuple, shapes))
         return [send_tensor.clone()]
 
     def gather(self, dst: int, send_tensor: torch.Tensor
                ) -> Optional[List[torch.Tensor]]:
-        assert dst == 0, \
-            "Gather in dummy environment is from rank 0 to rank 0"
         return [send_tensor.clone()]
+
+    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        return [copy.deepcopy(obj)]
+
+    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+        assert objs is not None
+        return copy.deepcopy(objs[0])
 
     def abort(self):
         exit(-1)
@@ -272,25 +463,14 @@ class TorchDistEnv(DistEnv):
 
     def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
                   *,
-                  shape: Optional[Tuple[int, ...]] = None,
+                  shape: Optional[Sequence[int]] = None,
                   dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         if src == self.rank:
-            assert tensor is not None, \
-                "Broadcast sender must provide the tensor"
-            assert shape is None and dtype is None, \
-                "Broadcast sender should not specify the shape or dtype"
-
-            if not tensor.is_contiguous():
-                logger.debug('Broadcasting a non-contiguous tensor')
-                tensor = tensor.contiguous()
-
+            assert tensor is not None
             dist.broadcast(tensor, src)
             return tensor
         else:
-            assert tensor is None, \
-                "Broadcast receiver should not provide the tensor"
-            assert shape is not None and dtype is not None, \
-                "Broadcast receiver must specify the shape and dtype"
+            assert shape is not None and dtype is not None
             recv_buffer = torch.empty(shape, dtype=dtype,
                                       device=self.comm_device)
             dist.broadcast(recv_buffer, src)
@@ -310,29 +490,17 @@ class TorchDistEnv(DistEnv):
         ensure those tensors are with `device='cpu'`.
         """
         if src == self.rank:
-            assert object_list is not None, \
-                "Broadcast sender must provide the object list"
             dist.broadcast_object_list([object_list], src)
             return object_list
         else:
-            assert object_list is None, \
-                "Broadcast receiver should not provide the object list"
             recv_list = [None]  # type: ignore
             dist.broadcast_object_list(recv_list, src)
             return recv_list[0]
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> dist.P2POp:
-        if not tensor.is_contiguous():
-            logger.debug('Defining isend on a non-contiguous tensor')
-            tensor = tensor.contiguous()
         return dist.P2POp(dist.isend, tensor, peer=dst, tag=tag)
 
     def def_irecv(self, buffer: torch.Tensor, src: int, tag: int) -> dist.P2POp:
-        if not buffer.is_contiguous():
-            # If the `buffer` parameter is not contiguous,
-            # there is no last chance to recover and reflect to callers.
-            raise EasierJitException(
-                "Defining irecv on a non-contiguous tensor")
         return dist.P2POp(dist.irecv, buffer, peer=src, tag=tag)
 
     def batch_isend_irecv(self, p2p_ops: List[dist.P2POp]) -> List[dist.Work]:
@@ -344,9 +512,6 @@ class TorchDistEnv(DistEnv):
             return []
 
     def all_to_all_single(self, local_input: torch.Tensor) -> torch.Tensor:
-        if not local_input.is_contiguous():
-            logger.debug('Doing all_to_all_single on a non-contiguous tensor')
-            local_input = local_input.contiguous()
         local_output = torch.empty_like(local_input)
         dist.all_to_all_single(local_output, local_input)
         return local_output
@@ -388,20 +553,7 @@ class TorchDistEnv(DistEnv):
         Currently the only use case is during JIT time, and all input tensors
         have ndim==1.
         """
-        assert len(tensors) == self.world_size
-        for i, tensor in enumerate(tensors):
-            assert tensor.ndim == 1
-        dtypes = set(t.dtype for t in tensors)
-        assert len(dtypes) == 1
-        dtype, = dtypes
-
-        tensors = list(tensors)  # copy the list
-        for i, tensor in enumerate(tensors):
-            if not tensor.is_contiguous():
-                # Ensure contiguousness for the last time.
-                logger.debug(
-                    f'The {i}-th tensor to all_to_all is non-contiguous')
-                tensors[i] = tensor.contiguous()
+        dtype = tensors[0].dtype
 
         send_lengths = torch.tensor([t.shape[0] for t in tensors],
                                     dtype=torch.int64, device=self.comm_device)
@@ -437,12 +589,6 @@ class TorchDistEnv(DistEnv):
 
     def all_gather_into_tensor(self, send_tensor: torch.Tensor,
                                form: Literal['concat', 'stack'] = 'concat'):
-        if not send_tensor.is_contiguous():
-            # Ensure contiguousness for the last time.
-            logger.debug(
-                'Doing all_gather_into_tensor on a non-contiguous tensor')
-            send_tensor = send_tensor.contiguous()
-
         if self.backend == 'gloo':
             return self._gloo_all_gather_into_tensor(send_tensor, form)
 
@@ -476,19 +622,12 @@ class TorchDistEnv(DistEnv):
                 recv_buffers.append(recv)
         return recv_buffers
 
-    def all_gather(self, send_tensor: torch.Tensor,
-                   shapes: Sequence[Sequence[int]]  # type: ignore
-                   ) -> List[torch.Tensor]:
-        shapes: List[Tuple[int, ...]] = list(map(tuple, shapes))
-        assert len(shapes) == self.world_size
-        assert shapes[self.rank] == send_tensor.shape
-
-        if not send_tensor.is_contiguous():
-            # Ensure contiguousness for the last time.
-            logger.debug(
-                'Doing all_gather on a non-contiguous tensor')
-            send_tensor = send_tensor.contiguous()
-
+    def all_gather(
+        self, send_tensor: torch.Tensor,
+        # NOTE base method has `shape: Seq[Seq[int]]` but here we have made it
+        # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
+        shapes: List[Tuple[int, ...]]
+    ) -> List[torch.Tensor]:
         if self.backend == 'gloo' and len(set(shapes)) > 1:
             return self._gloo_all_gather_different_shapes(
                 send_tensor, shapes
@@ -504,17 +643,11 @@ class TorchDistEnv(DistEnv):
 
     def gather(self, dst: int, send_tensor: torch.Tensor
                ) -> Optional[List[torch.Tensor]]:
-        if self.rank == dst:
-            shapes = [None] * self.world_size  # type: ignore
-        else:
-            # in this case it must be None as torch.dist requires
-            shapes = None   # type: ignore
-
         shape = tuple(send_tensor.shape)
-        dist.gather_object(shape, shapes, dst)
+        shapes = self.gather_object(dst, shape)
 
         if self.rank == dst:
-            shapes: List[Tuple[int, ...]]
+            assert shapes is not None
             recv_buffers = [
                 torch.empty(shape, dtype=send_tensor.dtype,
                             device=self.comm_device)
@@ -530,11 +663,32 @@ class TorchDistEnv(DistEnv):
         else:
             return None
 
+    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        if self.rank == dst:
+            recvs = [None] * self.world_size  # type: ignore
+        else:
+            # in this case it must be None as torch.dist.gather_object requires
+            recvs = None   # type: ignore
+
+        dist.gather_object(obj, recvs, dst)
+
+        return recvs  # type: ignore
+
+    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+        recvs = [None]
+        dist.scatter_object_list(recvs, objs, src=src)
+        return recvs[0]  # type: ignore
+
     def abort(self):
         raise NotImplementedError("Consider aborting using CPU dist env.")
 
     def barrier(self):
         dist.barrier()
+
+
+# TODO seems used in many place, move to utils.
+def torch_dtype_to_numpy_dtype(torch_dtype: torch.dtype):
+    return torch.empty([0], dtype=torch_dtype).numpy().dtype
 
 
 class MPIDistEnv(DistEnv):
@@ -555,6 +709,101 @@ class MPIDistEnv(DistEnv):
                          host_rank=0,
                          device='cpu')
 
+        self._mpi_dtypes: Dict[torch.dtype, Optional[MPI.Datatype]] = {}
+
+    def _check_unsupported_buffer_dtype(self, dtype: torch.dtype, method: str):
+        """
+        TODO MPI buffer-based APIs (capitalized APIs like Irecv) do not support
+        torch.float16 etc. directly.
+        We may need to bypass DLPack (if input is torch Tensor not numpy array)
+        and specify it as uint8.
+        """
+        from mpi4py.util import dtlib
+
+        if dtype not in self._mpi_dtypes:
+            try:
+                mpi_dtype = dtlib.from_numpy_dtype(
+                    torch_dtype_to_numpy_dtype(dtype)
+                )
+            except ValueError:  # conversion fails
+                mpi_dtype = None
+
+            self._mpi_dtypes[dtype] = mpi_dtype
+
+        unsupported = self._mpi_dtypes[dtype] is None
+        if unsupported:
+            raise NotImplementedError(
+                f'MPI method {method} does not support dtype {dtype}'
+            )
+
+    def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
+                  *,
+                  shape: Optional[Sequence[int]] = None,
+                  dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        if src == self.rank:
+            assert tensor is not None
+
+            self._check_unsupported_buffer_dtype(tensor.dtype, 'Bcast')
+
+            # uppercase, buffer-based mpi4py op can be used on torch.Tensor,
+            # via __dlpack__ protocol.
+            self.comm.Bcast(tensor, src)
+            return tensor
+        else:
+            assert shape is not None and dtype is not None
+
+            self._check_unsupported_buffer_dtype(dtype, 'Bcast')
+
+            recv_buffer = torch.empty(shape, dtype=dtype,
+                                      device=self.comm_device)
+            self.comm.Bcast(recv_buffer, src)  # uppercase, buffer-based
+            return recv_buffer
+
+    def broadcast_object_list(self, src: int,
+                              object_list: Optional[list] = None,
+                              ) -> Optional[list]:
+        if src == self.rank:
+            return self.comm.bcast(object_list, src)  # pickle-based
+        else:
+            object_list = None  # unused
+            return self.comm.bcast(None, src)  # pickle-based
+
+    # TODO MPIDistEnv.def_isend/def_irecv/batch_isend_irecv have very different
+    # semantics than TorchDistEnv. As the abstraction of torch.distributed over
+    # NCCL requires the non-blocking communication is defined-then-invoked
+    # within a context of a "batch" (e.g. with NCCL these p2p ops become
+    # a single ring-topo call).
+    #
+    # We definitely need to re-evaluate the network performance, and adapt
+    # the DistEnv code for that. So for now let's simply invoke MPI p2p
+    # immediately.
+
+    def def_isend(self, tensor: torch.Tensor, dst: int, tag: int
+                  ) -> MPI.Request:
+
+        self._check_unsupported_buffer_dtype(tensor.dtype, 'Isend')
+
+        return self.comm.Isend(tensor, dst, tag)
+
+    def def_irecv(self, buffer: torch.Tensor, src: int, tag: int
+                  ) -> MPI.Request:
+
+        self._check_unsupported_buffer_dtype(buffer.dtype, 'Irecv')
+        # mpi4py has very different usage on pickle-based recv method, where
+        # the input must still be a memory buffer, but should be **big enough**
+        # to store the pickle bytesstream.
+        # TODO We may need to:
+        # - cast float16 to float32 and send/recv;
+        # - for torch Tensor, it's handled by DLPack protocol, where dtype is
+        #   respected, we may "reinterpret cast" it to uint8 Tensor and Irecv.
+
+        return self.comm.Irecv(buffer, src, tag)
+
+    def batch_isend_irecv(self, p2p_ops: List[MPI.Request]
+                          ) -> List[MPI.Request]:
+        # TODO MPIDistEnv.batch_isend_irecv is a NO-OP.
+        return p2p_ops
+
     def all_to_all_single(self, local_input: torch.Tensor) -> torch.Tensor:
         # We use mpi4py lowercase `alltoall` since `local_input` is a
         # small vector and cheap to pickle.
@@ -567,53 +816,10 @@ class MPIDistEnv(DistEnv):
         # it's ok since this is only called JIT-time.
         return self.comm.alltoall(tensors)
 
-    def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
-                  *,
-                  shape: Optional[Tuple[int, ...]] = None,
-                  dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if src == self.rank:
-            assert tensor is not None, \
-                "Broadcast sender must provide the tensor"
-            assert shape is None and dtype is None, \
-                "Broadcast sender should not specify the shape or dtype"
-
-            if not tensor.is_contiguous():
-                logger.debug('Broadcasting a non-contiguous tensor')
-                tensor = tensor.contiguous()
-
-            # uppercase, buffer-based mpi4py op can be used on torch.Tensor,
-            # via __dlpack__ protocol.
-            self.comm.Bcast(tensor, src)
-            return tensor
-        else:
-            assert tensor is None, \
-                "Broadcast receiver should not provide the tensor"
-            assert shape is not None and dtype is not None, \
-                "Broadcast receiver must specify the shape and dtype"
-            recv_buffer = torch.empty(shape, dtype=dtype,
-                                      device=self.comm_device)
-            self.comm.Bcast(recv_buffer, src)  # uppercase, buffer-based
-            return recv_buffer
-
-    def broadcast_object_list(self, src: int,
-                              object_list: Optional[list] = None,
-                              ) -> Optional[list]:
-        if src == self.rank:
-            assert object_list is not None, \
-                "Broadcast sender must provide the object list"
-            return self.comm.bcast(object_list, src)  # pickle-based
-        else:
-            assert object_list is None, \
-                "Broadcast receiver should not provide the object list"
-            return self.comm.bcast(None, src)  # pickle-based
-
     def all_gather_into_tensor(self, send_tensor: torch.Tensor,
                                form: Literal['concat', 'stack'] = 'concat'):
-        if not send_tensor.is_contiguous():
-            # Ensure contiguousness for the last time.
-            logger.debug(
-                'Doing all_gather_into_tensor on a non-contiguous tensor')
-            send_tensor = send_tensor.contiguous()
+
+        self._check_unsupported_buffer_dtype(send_tensor.dtype, 'Allgather')
 
         shape = list(send_tensor.shape)
         if form == 'concat':
@@ -631,47 +837,17 @@ class MPIDistEnv(DistEnv):
 
         return recv_buffer
 
-    def all_gather(self, send_tensor: torch.Tensor,
-                   shapes: Sequence[Sequence[int]]  # type: ignore
-                   ) -> List[torch.Tensor]:
-        shapes: List[Tuple[int, ...]] = list(map(tuple, shapes))
-        assert len(shapes) == self.world_size
-        assert shapes[self.rank] == send_tensor.shape
-
-        if not send_tensor.is_contiguous():
-            # Ensure contiguousness for the last time.
-            logger.debug(
-                'Doing all_gather on a non-contiguous tensor')
-            send_tensor = send_tensor.contiguous()
-
+    def all_gather(
+        self, send_tensor: torch.Tensor,
+        # NOTE base method has `shape: Seq[Seq[int]]` but here we have made it
+        # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
+        shapes: List[Tuple[int, ...]]
+    ) -> List[torch.Tensor]:
         # TODO `send_tensor` may have different batch sizes, we simply use
         # lowercase, pickle-baed `allgather` to do it. It's ok since
         # `dist_env.all_gather` is used only in `easier.Tensor.collect()`.
         recv_tensors = self.comm.allgather(send_tensor)
         return recv_tensors
-
-    # TODO MPIDistEnv.def_isend/def_irecv/batch_isend_irecv have very different
-    # semantics than TorchDistEnv. As the abstraction of torch.distributed over
-    # NCCL requires the non-blocking communication is defined-then-invoked
-    # within a context of a "batch" (e.g. with NCCL these p2p ops become
-    # a single ring-topo call).
-    #
-    # We definitely need to re-evaluate the network performance, and adapt
-    # the DistEnv code for that. So for now let's simply invoke MPI p2p
-    # immediately.
-
-    def def_isend(self, tensor: torch.Tensor, dst: int, tag: int
-                  ) -> MPI.Request:
-        return self.comm.Isend(tensor, dst, tag)
-
-    def def_irecv(self, buffer: torch.Tensor, src: int, tag: int
-                  ) -> MPI.Request:
-        return self.comm.Irecv(buffer, src, tag)
-
-    def batch_isend_irecv(self, p2p_ops: List[MPI.Request]
-                          ) -> List[MPI.Request]:
-        # TODO MPIDistEnv.batch_isend_irecv is a NO-OP.
-        return p2p_ops
 
     def gather(self, dst: int, send_tensor: torch.Tensor
                ) -> Optional[List[torch.Tensor]]:
@@ -681,6 +857,12 @@ class MPIDistEnv(DistEnv):
         # TODO send_tensor may have different batch sizes, use buffer-based
         # `comm.Gatherv`.
         return self.comm.gather(send_tensor, dst)
+
+    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        return self.comm.gather(obj, dst)
+
+    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+        return self.comm.scatter(objs, src)  # type: ignore
 
     def abort(self):
         self.comm.Abort(-1)

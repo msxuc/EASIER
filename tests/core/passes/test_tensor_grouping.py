@@ -45,9 +45,9 @@ def test_tensor_grouping__simple():
             self.s33_44 = Selector(torch.LongTensor([0] * 44))
             self.r44_22 = Reducer(torch.LongTensor([0] * 44), 22)
             self.r44_44 = Reducer(torch.LongTensor([0] * 44), 44)
-            self.v1 = Tensor(torch.zeros([55, 3]), dist='partition')
-            self.v2 = Tensor(torch.zeros([55, 3]), dist='partition')
-            self.v3 = Tensor(torch.zeros([55, 3]), dist='partition')
+            self.v1 = Tensor(torch.zeros([55, 3]), mode='partition')
+            self.v2 = Tensor(torch.zeros([55, 3]), mode='partition')
+            self.v3 = Tensor(torch.zeros([55, 3]), mode='partition')
 
         def forward(self):
             t33 = self.s55_33(self.v1)
@@ -118,9 +118,9 @@ def test_tensor_grouping__simple():
 
 
 def test_tensor_grouping__cross_graph():
-    v1 = esr.Tensor(torch.zeros(55, 66, 77), dist='partition')
-    v2 = esr.Tensor(torch.zeros(55, 66, 77), dist='partition')
-    v3 = esr.Tensor(torch.zeros(55, 66, 77), dist='partition')
+    v1 = esr.Tensor(torch.zeros(55, 66, 77), mode='partition')
+    v2 = esr.Tensor(torch.zeros(55, 66, 77), mode='partition')
+    v3 = esr.Tensor(torch.zeros(55, 66, 77), mode='partition')
 
     class M1(esr.Module):
         def __init__(self):

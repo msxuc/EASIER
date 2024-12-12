@@ -127,7 +127,7 @@ def _assemble_poisson(mesh_path: str):
 
 
 class Poisson(esr.Module):
-    def __init__(self, mesh_size=100, device='cpu') -> None:
+    def __init__(self, mesh_size=100, device='cpu', x=None) -> None:
         super().__init__()
 
         comm = MPI.COMM_WORLD
@@ -152,28 +152,29 @@ class Poisson(esr.Module):
 
         self.x = esr.Tensor(
             esr.zeros((self.nc,), dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition'
+        ) if x is None else x
         # b: (nc,)
         self.b = esr.Tensor(
             esr.hdf5(poisson, 'b', dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition')
         # Ac: (nc,)
         self.Ac = esr.Tensor(
             esr.hdf5(poisson, 'Ac', dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition')
         # Af: (src.shape[0],)
         self.Af = esr.Tensor(
             esr.hdf5(poisson, 'Af', dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition')
         self.A = Linsys(self.Ac, self.Af, self.selector, self.reducer)
 
         self.rho = esr.Tensor(
             esr.hdf5(poisson, 'rho', dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition')
         # centroid: (nc, 2)
         self.centroid = esr.Tensor(
             esr.hdf5(poisson, 'centroid', dtype=torch.double, device=device),
-            dist='partition')
+            mode='partition')
 
 
 class Poisson1D(esr.Module):
@@ -181,12 +182,12 @@ class Poisson1D(esr.Module):
     def __init__(self, n):
         super().__init__()
         Ac = torch.ones((n, 2)) * -2
-        self.Ac = esr.Tensor(Ac.reshape(-1, 2).double(), dist='partition')
+        self.Ac = esr.Tensor(Ac.reshape(-1, 2).double(), mode='partition')
 
         Af = torch.concat(
             (torch.ones((n - 1)),
              torch.ones((n - 1))))
-        self.Af = esr.Tensor(Af.reshape(-1, 1).double(), dist='partition')
+        self.Af = esr.Tensor(Af.reshape(-1, 1).double(), mode='partition')
 
         src = torch.concat(
             (torch.linspace(1, n - 1, n - 1, dtype=torch.long),
@@ -198,10 +199,10 @@ class Poisson1D(esr.Module):
              torch.linspace(1, n - 1, n - 1, dtype=torch.long)))
         self.reducer = esr.Reducer(dst, n)
 
-        self.x = esr.Tensor(torch.ones((n, 2)).double(), dist='partition')
+        self.x = esr.Tensor(torch.ones((n, 2)).double(), mode='partition')
         b = torch.exp(
             -0.5 * 100 * (torch.linspace(0, 1, n) - 0.5)**2) / (n - 1)**2
-        self.b = esr.Tensor(b.reshape(-1, 1).double(), dist='partition')
+        self.b = esr.Tensor(b.reshape(-1, 1).double(), mode='partition')
         self.A = Linsys(self.Ac, self.Af, self.selector, self.reducer)
 
 
@@ -227,8 +228,8 @@ class Circuit(esr.Module):
         n = 13
         self.reducer = esr.Reducer(dst, n)
         self.selector = esr.Selector(src)
-        self.Af = esr.Tensor(Af.reshape(-1, 1).double(), dist='partition')
-        self.Ac = esr.Tensor(Ac.reshape(-1, 1).double(), dist='partition')
-        self.x = esr.Tensor(torch.zeros((n, 2)).double(), dist='partition')
-        self.b = esr.Tensor(b.reshape(-1, 1).double(), dist='partition')
+        self.Af = esr.Tensor(Af.reshape(-1, 1).double(), mode='partition')
+        self.Ac = esr.Tensor(Ac.reshape(-1, 1).double(), mode='partition')
+        self.x = esr.Tensor(torch.zeros((n, 2)).double(), mode='partition')
+        self.b = esr.Tensor(b.reshape(-1, 1).double(), mode='partition')
         self.A = Linsys(self.Ac, self.Af, self.selector, self.reducer)

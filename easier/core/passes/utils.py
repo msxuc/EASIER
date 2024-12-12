@@ -7,17 +7,28 @@
 
 from collections import defaultdict
 from typing import Any, Callable, Dict, Generic, Iterable, Iterator, List, \
-    Optional, Set, Tuple, Type, Union, MutableSet, Sequence, TypeVar, cast
-from typing_extensions import OrderedDict, TypeVar, TypeGuard, Literal
+    Optional, Set, Tuple, Type, Union, MutableSet, Sequence, cast, \
+    TYPE_CHECKING
+from torch.nn.modules import Module
+from typing_extensions import \
+    OrderedDict, TypeVar, TypeGuard, Literal, TypeAlias
+import string
+import dataclasses
+import numpy
+import pickle
 
 import torch
+import torch.fx
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
 
 import easier.core.module as esr
-from easier.core.runtime.dist_env import DistEnv, get_runtime_dist_env
+from easier.core.runtime.dist_env import DistEnv, get_cpu_dist_env
 from easier.core.utils import EasierJitException
+
+if TYPE_CHECKING:
+    from easier.core.passes.tensor_partition import ElemPart
 
 _T = TypeVar("_T")
 
@@ -61,18 +72,26 @@ class EasierInterpreter(Generic[_T]):
         # Properties accessible during interpretation
         self.current_module: esr.Module
         self.current_graph: Graph
+        self.current_module_index: int
         self.current_node: Node
 
-    def run(self) -> None:
+        # (provided in new API versions)
+        # available and valid in `if_call_module`
+        self.callee_module_path: str
+
+    def run(self):
         for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
             self.current_module = root
             self.current_graph = graph
+            self.current_module_index = i
 
             # Before traversing, we fix the nodes by copying them into a list,
             # in case the customized handler modifies the `graph.nodes` view.
             for node in list(graph.nodes):
                 self.current_node = node
                 self.for_each_node()
+
+        return self
 
     def for_each_node(self) -> _T:
         """
@@ -128,13 +147,14 @@ class EasierInterpreter(Generic[_T]):
                     "Currently esr.Modules should have been inlined"
                 )
 
+            self.callee_module_path = submod_path
             val = self.if_call_module(callee)
 
         elif node.op == FX.OUTPUT:
             val = self.if_output()
 
         else:
-            assert False, "unreachable"
+            assert False, f"Unexpected FX Node op {node.op}"
 
         return val
 
@@ -212,6 +232,26 @@ class EasierInterpreter(Generic[_T]):
         pass
 
 
+class SubmodNameAllocator:
+    def __init__(self, prefix: str) -> None:
+        self.id = 0
+        self.prefix = self.purify_attr_name(prefix)
+
+    def purify_attr_name(self, s: str) -> str:
+        s = s.replace('.', '_')  # common part as the hint, keep the delimiter
+
+        chars = set(string.ascii_letters + string.digits + "_")
+        s = ''.join([c for c in s if c in chars])
+        return s
+
+    def alloc_name(self, root: torch.nn.Module, hint: str = "") -> str:
+        while True:
+            name = f'{self.prefix}{self.id}{self.purify_attr_name(hint)}'
+            self.id += 1
+            if not hasattr(root, name):
+                return name
+
+
 def normalize_selector_call_into_args(*args: _T, **kwargs: _T) -> _T:
     """
     Similar to `fx_normalize_function_variant_into_kwargs`,
@@ -259,6 +299,214 @@ def vector_index_of(
     assert torch.equal(tests[org_indexes], to_find), "some not found"
 
     return org_indexes
+
+
+def zipsort_using_order(order: torch.Tensor, to_sort: torch.Tensor,
+                        to_follow: torch.Tensor, stable=True):
+    """
+    All arguments must be int tensors.
+
+    Equals:
+    ```
+    sort(zip(to_sort, to_follow), key=lambda (s,f): order.index(s))
+    ```
+    """
+
+    # TODO in extreme cases, if on some rank there is no element at all,
+    # calls like `order.max()` will throw. Check spenc robustness on empty size.
+
+    # TODO size (upperbound,) may be too huge, we can bincount `order` first
+    upperbound = int(order.max()) + 1
+    orderable_map = torch.full([upperbound], fill_value=upperbound)
+    orderable_map[order] = torch.arange(order.shape[0])
+
+    orderables = orderable_map[to_sort]
+    assert int(orderables.max()) < upperbound
+
+    _, pos = torch.sort(orderables, stable=stable)
+
+    arg_sorted = to_sort[pos]
+
+    # TODO if we already return pos, we can index to_follow outside this call
+    follow_sorted = to_follow[pos]
+
+    return arg_sorted, follow_sorted, pos
+
+
+def get_selector_reducer_idx_partition(
+    module: Union[esr.Selector, esr.Reducer]
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """
+    Get the evenly partitioned Selector/Reducer.idx on this rank.
+    Will partially load the partition for the first time.
+
+    The loaded idx tensor is always on CPU.
+
+    Remarks:
+    -   when the loading occurs, calls to this function must be collective;
+    -   this function cannot be called after module.idx is rewritten in any way.
+    """
+    assert module.easier_index_status in ['placeholder', 'partially_loaded']
+    if module.easier_index_status == 'placeholder':
+        partial_idx, pstart, pend = \
+            module.easier_data_loader.partially_load_by_rank()
+        module.idx = partial_idx
+        module.easier_idx_part_range = (pstart, pend)
+        module.easier_index_status = 'partially_loaded'
+
+    assert module.easier_idx_part_range is not None
+
+    return module.idx, module.easier_idx_part_range
+
+
+def get_selector_reducer_idx_partition_pair(
+    module: Union[esr.Selector, esr.Reducer]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Selector can be seen as an one-to-many relation, and Reducer can be seen
+    as a many-to-one relation.
+
+    The `Selector/Reducer.idx: torch.Tensor` always describe the "many" side,
+    and given that the loaded `.idx` partition is evenly partitioned,
+    the "one" side is simply a `arange` tensor.
+
+    The results are always on CPU
+    """
+
+    idx_part, (idx_part_start, idx_part_end) = \
+        get_selector_reducer_idx_partition(module)
+    related_idx_part = torch.arange(idx_part_start, idx_part_end)
+
+    if isinstance(module, esr.Selector):
+        return idx_part, related_idx_part
+    elif isinstance(module, esr.Reducer):
+        return related_idx_part, idx_part
+    else:
+        assert False, "Must be a Selector or Reducer"
+
+
+def get_selectors_reducers_in_ir_order(
+    modules: Sequence[esr.Module], graphs: Sequence[Graph]
+) -> Dict[
+    Union[esr.Selector, esr.Reducer],
+    'OrderedSet[Tuple[int, str]]'
+]:
+    """
+    The resultant collection is ordered as those Selector/Reducer instances
+    appear in the IR, therefore guaranteed to be the same on all workers.
+
+    Returns:
+    -   dict keys: the instances in the IR order
+    -   dict values: the module index in the parameter `modules` list and
+            attribute paths of the instances.
+    """
+    class _Getter(EasierInterpreter):
+        def __init__(self, modules, graphs):
+            super().__init__(modules, graphs)
+            self.invocations: Dict[
+                Union[esr.Selector, esr.Reducer],
+                OrderedSet[Tuple[int, str]]  # mod idx, path
+            ] = {}
+
+        def if_call_module(self, submod: Module):
+            if isinstance(submod, (esr.Selector, esr.Reducer)):
+                calls = self.invocations.setdefault(
+                    submod,
+                    OrderedSet()  # a submod may be called multiple times
+                )
+                calls.add((self.current_module_index, self.callee_module_path))
+
+    return _Getter(modules, graphs).run().invocations
+
+
+def get_selectors_reducers_as_submods(
+    modules: Sequence[esr.Module]
+) -> Dict[Union[esr.Selector, esr.Reducer], List[Tuple[int, str]]]:
+    """
+    Get all Selector/Reducer instances
+    in an order that's the same on all worker.
+
+    Unlike `get_selectors_reducers_in_ir_order`, instances not referenced in
+    IR will be returned.
+
+    Returns:
+    -   dict keys: the instances in a node-consistent order
+    -   dict values: the module index in the parameter `modules` list and
+            attribute paths of the instances.
+    """
+    #                         instance,  root, rooti, name
+    named_submods: List[Tuple[Any, esr.Module, int, str]] = []
+    for i, root in enumerate(modules):
+        for name, m in root.named_modules(remove_duplicate=False):
+            if isinstance(m, (esr.Selector, esr.Reducer)):
+                named_submods.append((m, root, i, name))
+
+    # sort the list (containing duplicates) by (rooti,name)
+    named_submods.sort(key=lambda m_r_i_n: m_r_i_n[2:4])
+
+    submods: Dict[
+        Union[esr.Selector, esr.Reducer],
+        List[Tuple[int, str]]
+    ] = {}
+    for submod, root, rooti, name in named_submods:
+        refs = submods.setdefault(submod, [])
+        refs.append((rooti, name))
+
+    return submods
+
+
+def get_easier_tensors_as_parameters(
+    modules: Sequence[esr.Module]
+) -> Dict[esr.Tensor, List[Tuple[int, str]]]:
+    """
+    Get all easier.Tensor instances
+    in an order that's the same on all worker.
+
+    Unlike `get_selectors_reducers_in_ir_order`,
+    some easier.Tensor may be involved in an EASIER session while
+    not referenced in the IR, we need to pick those instances too.
+
+    Returns:
+    -   dict keys: the easier.Tensor instances in a node-consistent order
+    -   dict values: the module index in the parameter `modules` list and
+            attribute paths of the instances.
+            This dict-value list is also in IR order.
+    """
+    #                         tensor,     root,       rooti, name
+    named_tensors: List[Tuple[esr.Tensor, esr.Module, int, str]] = []
+    for rooti, root in enumerate(modules):
+        for name, p in root.named_parameters(recurse=True):
+            if isinstance(p, esr.Tensor):
+                named_tensors.append((p, root, rooti, name))
+
+    # sort the list (containing duplicates) by (rooti,name)
+    named_tensors.sort(key=lambda p_r_i_n: p_r_i_n[2:4])
+
+    tensors: Dict[esr.Tensor, List[Tuple[int, str]]] = {}
+    for tensor, root, rooti, name in named_tensors:
+        refs = tensors.setdefault(tensor, [])
+        refs.append((rooti, name))
+
+    return tensors
+
+
+def get_sub_easier_modules(
+    top_modules: Sequence[esr.Module]
+) -> 'OrderedSet[esr.Module]':
+    """
+    Recursively get all sub easier.Modules into an OrderedSet.
+    """
+    modules = OrderedSet()
+    for module in top_modules:
+        if not isinstance(module, esr.Module):
+            raise EasierJitException(
+                f"Instance of {module.__class__} cannot be jitted")
+
+        for m in module.modules():
+            if isinstance(m, esr.Module):
+                modules.add(m)
+
+    return modules
 
 
 # torch.fx constants
@@ -329,6 +577,132 @@ def fx_normalize_function_variant_into_kwargs(
     return pair.kwargs
 
 
+#
+# Serializable IR objects
+# designed to be:
+# - determined and simple for persistence,
+# - dataflow-focused, easy to equate.
+#
+# (currently only serializable by `pickle.dumps`, not `json.dumps`)
+@dataclasses.dataclass
+class IRNodeRef:
+    node_list_idx: int  # not truly dataflow-graph-based
+    hint_name: str
+
+    def __eq__(self, value: object) -> bool:
+        if not isinstance(value, IRNodeRef):
+            return False
+        return self.node_list_idx == value.node_list_idx
+
+
+# A oversimplified redefinition of IR grammar.
+# TODO strictly speaking slice, range, dtype, etc. can be top-level args,
+# but now we simply take all of them nestedly positionable.
+IRArg: TypeAlias = Union[
+    None,
+    bool, int, float, str,
+    slice, range, 'ellipsis',
+    torch.dtype,
+    IRNodeRef,
+    List['IRArg'], Tuple['IRArg', ...]
+]
+
+
+@dataclasses.dataclass
+class IRNode:
+    hint_name: str  # not involved in __eq__
+    op: str  # fx.Node.op domains
+    target: Union[str, Callable]  # Callable ok for pickle
+    args: Tuple[IRArg, ...]
+    kwargs: Dict[str, IRArg]
+
+    def __eq__(self, value: object) -> bool:
+        if not isinstance(value, IRNode):
+            return False
+        return (
+            self.op, self.target, self.args, self.kwargs
+        ) == (
+            value.op, value.target, value.args, value.kwargs
+        )
+
+
+def fx_graph_to_serializable_ir(fx_graph: Graph) -> List[IRNode]:
+    nodes_idxes: Dict[Node, int] = dict(
+        (n, i) for i, n in enumerate(fx_graph.nodes))
+
+    def _node_ref_or_plain(x):
+        return IRNodeRef(nodes_idxes[x], x.name) if isinstance(x, Node) else x
+
+    ir = []
+    for fx_node in nodes_idxes:
+        ir_args = tree_map(fx_node.args, _node_ref_or_plain)
+        ir_kwargs = {k: _node_ref_or_plain(v)
+                     for k, v in fx_node.kwargs.items()}
+        ir_node = IRNode(
+            hint_name=fx_node.name,
+            op=fx_node.op,
+            target=fx_node.target,
+            args=ir_args,  # type: ignore
+            kwargs=ir_kwargs  # type: ignore
+        )
+        ir.append(ir_node)
+
+    return ir
+
+
+def serializable_ir_to_fx_graph(ir: List[IRNode]) -> Graph:
+    g = Graph()
+    fx_nodes = []
+
+    def _fx_node_or_plain(x):
+        return fx_nodes[x.node_list_idx] if isinstance(x, IRNodeRef) else x
+
+    for ir_node in ir:
+        fx_args = tree_map(ir_node.args, _fx_node_or_plain)
+        fx_kwargs = {k: _fx_node_or_plain(v)
+                     for k, v in ir_node.kwargs.items()}
+        fx_node = g.create_node(
+            op=ir_node.op,
+            target=ir_node.target,
+            args=fx_args,  # type: ignore
+            kwargs=fx_kwargs,  # type: ignore
+            # NOTE Graph.create_node accepts a name param but might do some
+            # decoration on that candidate name, causing deserialized names
+            # no longer match the serialized names.
+            # Therefore we force to override the names.
+            name=ir_node.hint_name
+        )
+        fx_nodes.append(fx_node)
+
+    return g
+
+
+#
+# About directly pickle fx.Graph:
+# - remove all object-reference-path to tensor data:
+#   - Graph.owning_module
+#   - Node.meta -> TensorGroup.tdef -> Selector.idx/Tensor.data etc.
+# - changes of Graph private fields may invalidate the pickle archive.
+#
+
+def pickle_ir(ir: List[IRNode]) -> numpy.ndarray:
+    """
+    Currently we (de)serialize IRNodes by pickle into a byte array.
+
+    This simpilifies how we handle recursive structures of IR, in contrast to
+    JSON serialization or manually create the whole IR infrastructure
+    (although we eventually will create that).
+    """
+    u8_array = numpy.frombuffer(pickle.dumps(ir), dtype=numpy.uint8)
+    return u8_array
+
+
+def unpickle_ir(u8_array: numpy.ndarray) -> List[IRNode]:
+    assert u8_array.dtype == numpy.uint8
+    ir = pickle.loads(u8_array.tobytes())
+    return ir
+
+
 def tree_map(x, func):
     if isinstance(x, (list, tuple)):  # cover subtypes of list etc. too
         return type(x)(tree_map(a, func) for a in x)
@@ -356,7 +730,7 @@ class OrderedSet(MutableSet[_T]):
             OrderedDict.fromkeys(inits, ()) \
             if inits is not None else OrderedDict()
 
-    def __contains__(self, x: _T) -> bool:
+    def __contains__(self, x: _T) -> bool:  # type: ignore
         return x in self._odict
 
     def __iter__(self) -> Iterator[_T]:
@@ -404,7 +778,8 @@ class DisjointSet(Generic[_T]):
         """
         In the order an element is first-time pass into `union`
         """
-        root_to_set: dict[_T, OrderedSet[_T]] = defaultdict(OrderedSet)
+        root_to_set: dict[_T, OrderedSet[_T]] = \
+            defaultdict(OrderedSet)  # type: ignore
         for x in self._rank.keys():
             root = self._find(x)
             root_to_set[root].add(x)
