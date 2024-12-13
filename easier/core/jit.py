@@ -308,7 +308,7 @@ def compile(
         modules, graphs = passes.propagate_metadata(modules, graphs)
         modules, graphs = passes.group_tensors(modules, graphs)
 
-        modules, graphs = passes.analyze_data_dependency(modules, graphs)
+        # modules, graphs = passes.analyze_data_dependency(modules, graphs)
 
         modules, graphs = passes.partition_tensor_groups(modules, graphs)
         modules, graphs = passes.encode_sparsity(modules, graphs)
