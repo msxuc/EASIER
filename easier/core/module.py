@@ -7,8 +7,6 @@ import torch.types
 from typing_extensions import TypeAlias
 import os
 import dataclasses
-import json
-import enum
 
 # REMARK
 # Because of our custom definition of `easier.sum` function,
@@ -20,19 +18,19 @@ from typing_extensions import Literal
 
 import torch
 from torch import nn
+from torch import fx
 
 import h5py
 
 from easier.core.runtime.dist_env import get_cpu_dist_env
 from easier.core.runtime.data_loader import \
-    DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
-    ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
-from easier.core.utils import logger
+    ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
+    FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
+from easier.core.utils import logger, get_random_str
 
 
 if TYPE_CHECKING:
-    from easier.core.passes.dataflow_distribution.tensor_partition import \
-        ElemPart
+    from easier.core.passes.tensor_partition import ElemPart
     from easier.core.passes.tensor_grouping import EasierTensorGroup
 
 
@@ -100,6 +98,54 @@ def ones(size, dtype=None, device=None):
     return full(size, 1, dtype=dtype, device=device)
 
 
+@overload
+def arange(end, dtype=None, device=None): ...
+@overload
+def arange(start, end, step=1, dtype=None, device=None): ...
+
+
+def arange(*args, **kwargs):
+    def _end_matcher(end, dtype, device):
+        return (0, end, 1, dtype, device)
+
+    def _start_end_matcher(start, end, step, dtype, device):
+        return (start, end, step, dtype, device)
+
+    def _resolve():
+        try:
+            return _end_matcher(*args, **kwargs)
+        except TypeError:
+            pass
+
+        try:
+            return _start_end_matcher(*args, **kwargs)
+        except TypeError:
+            pass
+
+        raise TypeError(f'Unexpected arguments {args} to easier.arange')
+
+    start, end, step, dtype, device = _resolve()
+
+    for arg in [start, end, step]:
+        if not isinstance(arg, (int, float)):
+            raise TypeError(
+                'argument to easier.arange must be integer or floating-point')
+
+    promoted_value = start + end + step
+    if isinstance(promoted_value, int):
+        default_dtype = torch.int64
+    elif isinstance(promoted_value, float):
+        default_dtype = torch.float64
+    else:
+        raise TypeError(
+            'argument to easier.arange must be integer or floating-point')
+
+    if dtype is None:
+        dtype = default_dtype
+
+    return ArangeTensorLoader(start, end, step, dtype, device)
+
+
 def _resolve_data_loader(arg) -> DataLoaderBase:
     if isinstance(arg, DataLoaderBase):
         return arg
@@ -113,7 +159,7 @@ def _resolve_data_loader(arg) -> DataLoaderBase:
     elif isinstance(arg, torch.Tensor):
         return InMemoryTensorLoader(arg)
     else:
-        raise TypeError()
+        raise TypeError(f"Unknown data type {type(arg)}")
 
 
 def _validate_idx(dl: DataLoaderBase, cls_name: str, n: Optional[int]):
@@ -193,19 +239,36 @@ def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
     return synced.to(device=tensor.easier_data_loader.device)
 
 
+IdxStatus: TypeAlias = Literal['placeholder', 'partially_loaded', 'rewritten']
+
+
 class Selector(nn.Module):
-    def __init__(self, idx: Union[torch.Tensor, DataLoaderBase]) -> None:
+    def __init__(self, idx: Union[torch.Tensor, DataLoaderBase], **kwargs):
         super().__init__()
+
+        # not going to be shown on the interface.
+        if kwargs.get('easier_noncollective_idx', False) is True:
+            # Both _resolve_data_loader() and _validate_idx() require to
+            # be run collectively. In certain cases like EASIER-injected
+            # reordering Selectors we need to skip those collective steps.
+            assert isinstance(idx, torch.Tensor)
+            assert not (
+                isinstance(idx, Tensor) or hasattr(idx, ATTRIBUTE_PLACEHOLDER)
+            )
+            self.idx = idx
+            self.easier_index_status = 'rewritten'
+            # Let related passes to fill other JIT-only fields.
+
+            return
 
         idx_dl = _resolve_data_loader(idx)
         _validate_idx(idx_dl, 'Selector', None)
         self.easier_data_loader = idx_dl
         idx_ph: torch.Tensor = idx_dl.get_placeholder()
 
-        self.idx: torch.Tensor
-        self.register_buffer('idx', idx_ph)
+        self.idx: torch.Tensor = idx_ph
 
-        self.easier_index_ready = False
+        self.easier_index_status: IdxStatus = 'placeholder'
 
         # ======
         # Fields filled during JIT compilation
@@ -223,8 +286,8 @@ class Selector(nn.Module):
         self.runtime_halos_recv_lengths: List[int]
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        if not self.easier_index_ready:
-            raise RuntimeError()
+        if self.easier_index_status != 'rewritten':
+            raise RuntimeError("Selector.idx not ready, run compile() first")
 
         return tensor[self.idx]
 
@@ -250,13 +313,14 @@ class Reducer(nn.Module):
         self.easier_data_loader = idx_dl
         idx_ph: torch.Tensor = idx_dl.get_placeholder()
 
-        self.idx: torch.Tensor
-        self.register_buffer('idx', idx_ph)
+        self.idx: torch.Tensor = idx_ph
 
-        self.easier_index_ready = False
+        self.easier_index_status: IdxStatus = 'placeholder'
 
         self.n = n
         self.reduce = reduce
+
+        self.set_fullness()
 
         # ======
         # Fields filled during JIT compilation
@@ -266,6 +330,8 @@ class Reducer(nn.Module):
         # only needed in dist_pass.
         self.easier_idx_part_range: Optional[Tuple[int, int]] = None
 
+        self.easier_reordering_selector_idx: Optional[torch.Tensor] = None
+
         # `self.idx` is required to be registerd as a "buffer" so it's moveable
         # in non-JIT mode.
         # In contrast, halo indexes are only moved and moved once to
@@ -273,10 +339,73 @@ class Reducer(nn.Module):
         self.runtime_halos_local_idxes: List[torch.Tensor]
         self.runtime_halos_recv_lengths: List[int]
 
+    def set_fullness(self):
+        """
+        Calculate and collectively set the score for fullness of
+        the original definition of the Reducer.
+        """
+        dist_env = get_cpu_dist_env()
+
+        if dist_env.rank == 0:
+            nwrites = 0
+
+            # Each time we count output elements with global IDs that fall in
+            # the pack, in case the pack gets too big;
+            # For each such pack, traverse all .idx data and "set the bit" and
+            # count "bits".
+
+            bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
+            bitpack_n, remainder = divmod(self.n, bitpack_maxlen)
+            if remainder > 0:
+                bitpack_n += 1
+
+            # TODO use real bitmap and popcount instead of *bool*pack.
+            for bitpack_i in range(bitpack_n):
+                bitpack_min = bitpack_i * bitpack_maxlen
+                bitpack_max = builtins.min(
+                    (bitpack_i + 1) * bitpack_maxlen, self.n)
+
+                bitpack = torch.zeros(
+                    [bitpack_max - bitpack_min], dtype=torch.bool)
+
+                for chunk in self.easier_data_loader.partially_load_by_chunk(
+                    # load_by_chunk requires to run on rank-0
+                    1024 * 1024 * 128
+                ):
+                    in_bitpack = torch.logical_and(
+                        chunk >= bitpack_min, chunk < bitpack_max)
+                    bitpack[chunk[in_bitpack] - bitpack_min] = 1
+
+                bitpack_nnz = int(torch.count_nonzero(bitpack))
+                nwrites += bitpack_nnz
+
+            [nwrites] = dist_env.broadcast_object_list(0, [nwrites])
+        else:
+            [nwrites] = dist_env.broadcast_object_list(0)
+
+        self.easier_fullness: float = float(nwrites) / float(self.n)
+
+    def set_is_full(self):
+        """
+        Calculate and locally set the flag for if the local Reducer is full.
+
+        Remark:
+        The is_full flag can only be calculated after distribution rewriting
+        or after fully index loading.
+        """
+        assert self.easier_index_status == 'rewritten', \
+            "Reducer.idx must have been rewritten or loaded"
+
+        unique_idx = self.idx.unique(sorted=True)
+
+        self.easier_is_full: bool = \
+            unique_idx.shape[0] == self.n and \
+            unique_idx[0] == 0 and unique_idx[-1] == (self.n - 1)
+
     def forward(self, tensor: torch.Tensor,
                 *, out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if not self.easier_index_ready:
-            raise RuntimeError()
+        if self.easier_index_status != 'rewritten':
+            raise RuntimeError("Reducer.idx not ready, run compile() first")
 
         shape = tensor.shape
 
@@ -305,7 +434,7 @@ class Tensor(nn.Parameter):
 
     def __new__(cls,
                 data: Union[torch.Tensor, DataLoaderBase],
-                dist: Literal['partition', 'replicate'],
+                mode: Literal['partition', 'replicate'],
                 requires_grad: bool = False) -> "Tensor":
         dl = _resolve_data_loader(data)
         data_ph: torch.Tensor = dl.get_placeholder()
@@ -319,7 +448,7 @@ class Tensor(nn.Parameter):
 
     def __init__(self,
                  data: Union[torch.Tensor, DataLoaderBase],
-                 dist: Literal['partition', 'replicate'],
+                 mode: Literal['partition', 'replicate'],
                  requires_grad: bool = False) -> None:
         # ======
         # Fields filled during __new__
@@ -330,16 +459,15 @@ class Tensor(nn.Parameter):
 
         # TODO names like `is_partition` are potentially conflict to pytorch,
         # will `easier_is_partition` with namespace be better?
-        self.is_partition = dist == 'partition'
-        self.is_replica = dist == 'replicate'
+        self.is_partition = mode == 'partition'
+        self.is_replica = mode == 'replicate'
 
         # ======
         # Fields filled during JIT compilation
 
         # Only distributed tensors have tensor groups
-        # (and they must be used i.e. be referenced by `get_attr` Nodes),
-        # so this field can have default value None, unlike Selector or Reducer.
-        self.easier_tensor_group: 'Optional[EasierTensorGroup]' = None
+        # (no matter if they are referenced by `get_attr` Nodes),
+        self.easier_tensor_group: 'EasierTensorGroup'
 
         # Only tensors that are distributed and used has this field set.
         self.elempart: 'Optional[ElemPart]' = None
@@ -356,7 +484,7 @@ class Tensor(nn.Parameter):
         content, outside the scope for compiled easier.Module.forward().
         """
         if not self.easier_data_ready:
-            raise RuntimeError()
+            raise RuntimeError("Tensor data is not ready, run compile() first")
         self.data.__setitem__(indices, val)
         return self
 
@@ -383,6 +511,11 @@ class Tensor(nn.Parameter):
     def save(self, h5_file_path, h5_dataset_path, **h5_file_kwargs) -> None:
         cpu_dist_env = get_cpu_dist_env()
         if cpu_dist_env.rank == 0:
+
+            h5_file_path = os.path.expanduser(h5_file_path)
+
+            os.makedirs(os.path.dirname(h5_file_path), exist_ok=True)
+
             np_dtype = torch_dtype_to_numpy_dtype(self.dtype)
             orig_shape = self.easier_data_loader.shape
 
@@ -471,58 +604,24 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
             h5d[(chunk_size*i):(chunk_size*i+chuck_size_i)] = h5d_slice
 
 
-@dataclasses.dataclass
-class JitConfig:
-    """
-    JIT configuration for this rank and this local machine.
-    """
-    world_size: int
-    rank: int
-    local_rank: int
-
-
-def _get_current_jit_config():
-    cpu_dist_env = get_cpu_dist_env()
-    config = JitConfig(
-        world_size=cpu_dist_env.world_size,
-        rank=cpu_dist_env.rank,
-        local_rank=cpu_dist_env.local_rank,
-    )
-    return config
-
-
-class _StopLoadingJITCache(Exception):
-    pass
-
-
-class JitDump:
-    """
-    Across multiple loaded esr.Modules, redundant Tensor/ElemPart instances
-    may be deserialized.
-    When entering dist_pass (e.g. when relating them to EasierTensorGroup),
-    deduplicate those instances, e.g., arbitrarily take an instance.
-    """
-
-    def __init__(self) -> None:
-        self.tensor_dumps: Dict[str, torch.Tensor] = {}
-        self.elempart_dumps: Dict[str, Tuple[torch.Tensor, List[int]]] = {}
-        self.selector_reducer_dumps: Dict[
-            str,
-            #     idx,          halo_lidxes,    halo_lengths,  reducer_n
-            Tuple[torch.Tensor, List[torch.Tensor], List[int], Optional[int]]
-        ] = {}
-
-
 class Module(nn.Module):
 
     def __init__(self):
         super().__init__()
 
-        self.easier_loaded_cache: Optional[JitDump] = None
+        # Already pruned for pickle
+        self.easier_raw_graph: Optional[fx.graph.Graph] = None
 
         # ======
         # Fields filled during JIT compilation
-        self.easier_jit_backend: Literal['torch', 'cpu', 'gpu', 'none']
+
+        # Only filled on top modules i.e. inputs to esr.compile()
+        self.easier_jit_backend: Literal[
+            'torch', 'cpu', 'gpu', 'none', None
+        ] = None
+
+        # Each Module shares the ElemPart dict of all Modules in JIT session.
+        self.easier_elemparts: 'Dict[EasierTensorGroup, ElemPart]'
 
     def forward(self):
         pass
@@ -531,397 +630,6 @@ class Module(nn.Module):
         raise TypeError(
             "easier.Module does not support .to() method,"
             " consider defining a new easier.Module instance.")
-
-    def dump(self, dump_dir: str) -> None:
-        """
-        Dump `easier.Tensor` data to rank-0, and internal JIT configurations to
-        local directory.
-        The dumped data is not for users to inspect.
-
-        Users may dump only a subset of initially compiled `easier.Module`s.
-
-        Args:
-        -   dump_dir:
-                Machine-local dir to store dumped data for this module.
-                Many ranks on the same machine can share the same dir,
-                as long as they are dumped in the same session and for the same
-                timepoint.
-
-        Usage:
-        ```
-        m1, m2, mro = Model1(), Model2(), ModelRunOnce()
-        [m1, m2, mro] = easier.compile([m1, m2, mro])
-
-        mro()
-        m1()
-        m1.submod()
-        m2()
-        m2.submod()
-
-        # don't call mro.dump()
-        m1.dump('/mnt/checkpoint1/')
-        m2.dump('/mnt/checkpoint2/')
-        ```
-
-        Remarks:
-        `easier.Tensor` data to dump is essentially:
-        -   Partitioned `easier.Tensor` contents
-            These contents will be collected to rank-0 and stored
-            in the original order.
-
-            On the other hand, even without `easier.Module.load()`,
-            these dumped data can be used to initialize `easier.Tensor`s
-            in the same EASIER program, just like users are running new EASIER
-            sessions.
-
-        -   Replicated `easier.Tensor` contents
-            Only get dumped on rank-0
-
-        and `easier.Tensor` data will be dumped to `${dump_dir}/tensor.hdf5`
-        on rank-0, each `easier.Tensor` will become a HDF5 dataset whose name
-        is the path of the `easier.Tensor` within this `easier.Module`;
-        JIT configurations will be dumped to `${dump_dir}/jit_{rank}.hdf5`.
-        """
-        # Besides esr.Tensor data, we store dist_pass states:
-        # - rewritten idx
-        # - elempart.idx
-        # on each local machine and for each rank
-        # into `${dump_dir}/jit_${rank}.hdf5`
-        #
-        # When loading from this dump_dir,
-        # we will try to store and reuse the rewritten index.
-        #
-        # If it's improper to reuse (e.g. world_size changes),
-        # we invoke dist_pass again, taking `tensor.hdf5` on rank-0 and
-        # using the original index DataLoader specified in EASIER programs.
-        os.makedirs(dump_dir, exist_ok=True)
-
-        cpu_dist_env = get_cpu_dist_env()
-        rank = cpu_dist_env.rank
-        log_info0: Callable[[str], None] = \
-            logger.info if rank == 0 else logger.debug
-
-        cls_name = self.__class__.__name__
-
-        # Within this esr.Module, deduplicate multi-reference esr.Tensor etc.
-        memo = {}
-
-        def _dump_tensor_once(jit_f: Optional[h5py.File],
-                              tensor_attrpath: str, tensor: Tensor):
-            """
-            On rank-0, save full data in the original order.
-            On each rank, save the partition/replica locally
-
-            MEMO RECORD:
-            [('TENSOR', address of esr.Tensor)] => (rep. Module, tensor path)
-            # kv-pair value is only for debug purpose.
-
-            Write logs that each esr.Tensor instance:
-            -   is dumped as what attribute within this esr.Module;
-            -   is skipped because it's referenced by multiple attributes
-                and has already been dumped;
-            -   besides the (representative) attribute name,
-                an esr.Tensor also has a unique memory address as a Python obj,
-                the address can auxiliarly help users identify the esr.Tensor
-                instance.
-            """
-            t_addr = id(tensor)
-            memo_key = ('TENSOR', t_addr)
-            if memo_key not in memo:
-                # The relation/topology how an instance is shared among
-                # multiple modules is the same for all ranks.
-                memo[memo_key] = (self, tensor_attrpath)
-
-                # Full data, original order, on rank-0 only
-                tensor_fpath = os.path.join(dump_dir, 'tensor.hdf5')
-                tensor.save(tensor_fpath, tensor_attrpath)
-
-                # When dumping with JIT cache, parition/replica are dumped
-                # even the dumped contents always appear in tensor.hdf5.
-                # The dataset names "tensor/ATTRPATH" also serve as keys
-                # where the data will be written to.
-                # I.e. tensor.hdf5 play no role in JIT-cache-loading.
-                if jit_f is not None:
-                    jit_f.create_dataset(
-                        f'tensor/{tensor_attrpath}',
-                        data=tensor.data.to('cpu')
-                    )
-
-                # Print tensor dumping events as INFO on rank-0 only.
-                log_info0(
-                    'Dump Tensor'
-                    f' {cls_name}.{tensor_attrpath} (at 0x{t_addr:016x})'
-                )
-            else:
-                (recorded_mod, recorded_path) = memo[memo_key]
-                recorded_cls_name = recorded_mod.__class__.__name__
-                log_info0(
-                    'Skip dumping Tensor'
-                    f' {cls_name}.{tensor_attrpath} (at 0x{t_addr:016x})'
-                    f'\n\tdumped as {recorded_cls_name}.{recorded_path}'
-                )
-
-        def _dump_elempart_once(jit_f: h5py.File, elempart: 'ElemPart',
-                                bound_tensor_attrpath: str):
-            """
-            ElemParts (both the mesh partition results and the relation to
-            esr.Tensors) need to be saved, to support post-loading
-            `esr.Tensor.save()` calls.
-
-            Many tensors may be bound with the same elempart;
-            those tensors may be scattered among Modules, or have different
-            attr paths, too.
-
-            But no matter what attr paths the tensors bound to elempart have,
-            the set of ElemPart instances a Module has is fixed.
-
-            MEMO RECORD:
-            [('ELEMPART', address of ElemPart)] => (rep. Module, tensor path)
-            """
-            ep_addr = id(elempart)
-            memo_key = ('ELEMPART', ep_addr)
-            if memo_key not in memo:
-                memo[memo_key] = (self, bound_tensor_attrpath)
-
-                # We simply identify the elempart with name derived from the
-                # (arbitrarily) first-seen esr.Tensor, to which the elempart
-                # is bound.
-                # Because we can locate that esr.Tensor (even, in different
-                # executed/dumped/loaded sessions) firstly by Tensor attrpath,
-                # then by the equivalence relation of Tensor instances.
-                jit_f.create_dataset(
-                    f'elempart/{bound_tensor_attrpath}/idx',
-                    data=elempart.idx)
-                jit_f.create_dataset(
-                    f'elempart/{bound_tensor_attrpath}/lengths',
-                    data=elempart.lengths)
-
-                logger.debug(
-                    'Dump ElemPart bound to '
-                    f' {cls_name}.{bound_tensor_attrpath}')
-
-        def _dump_selector_reducer_once(jit_f: h5py.File,
-                                        mod: Union[Selector, Reducer],
-                                        mod_attrpath: str):
-            mod_addr = id(mod)
-            memo_key = ('DIST_PASS', mod_addr)
-            if memo_key not in memo:
-                memo[memo_key] = (self, mod_attrpath)
-
-                jit_f.create_dataset(
-                    f'dist_pass/{mod_attrpath}/idx',
-                    data=mod.idx.to('cpu')
-                )
-
-                for w, local_idx in enumerate(mod.runtime_halos_local_idxes):
-                    # local_idx tensor will be empty, but not None
-                    jit_f.create_dataset(
-                        f'dist_pass/{mod_attrpath}/halo_local_idxes/{w}',
-                        data=local_idx.to('cpu')
-                    )
-
-                jit_f.create_dataset(
-                    f'dist_pass/{mod_attrpath}/halo_recv_lengths',
-                    data=mod.runtime_halos_recv_lengths
-                )
-
-                if isinstance(mod, Reducer):
-                    jit_f.get(
-                        f'dist_pass/{mod_attrpath}'
-                    ).attrs['reducer_n'] = str(mod.n)
-
-                logger.debug(f'Dump S/R {cls_name}.{mod_attrpath}')
-
-        def _dump_jit_config(jit_f: h5py.File):
-            config = _get_current_jit_config()
-            config_str = json.dumps(dataclasses.asdict(config))
-            jit_f.attrs['jit_config'] = config_str
-
-        if self.easier_jit_backend == 'none':
-            # Don't even create jit_RANK.hdf5 for backend=='none'.
-            for attr_path, param in self.named_parameters(recurse=True):
-                if isinstance(param, Tensor):
-                    if not param.easier_data_ready:
-                        raise RuntimeError(
-                            f'{cls_name}.{attr_path}'
-                            ' easier.Tensor not compiled yet')
-
-                    _dump_tensor_once(None, attr_path, param)
-            return
-
-        jit_fpath = os.path.join(dump_dir, f'jit_{rank}.hdf5')
-        with h5py.File(jit_fpath, 'w') as jit_f:
-
-            _dump_jit_config(jit_f)
-
-            for attr_path, param in self.named_parameters(recurse=True):
-                if isinstance(param, Tensor):
-                    if not param.easier_data_ready:
-                        raise RuntimeError(
-                            f'{cls_name}.{attr_path}'
-                            ' easier.Tensor not compiled yet')
-
-                    _dump_tensor_once(jit_f, attr_path, param)
-
-                    # jit-none/fully-loaded and replica don't have this.
-                    if param.elempart is not None:
-                        _dump_elempart_once(jit_f, param.elempart, attr_path)
-
-            for mod_path, mod in self.named_modules():
-                if isinstance(mod, (Selector, Reducer)):
-                    if not mod.easier_index_ready:
-                        raise RuntimeError(
-                            f'{cls_name}.{mod_path} {mod.__class__.__name__}'
-                            ' not compiled yet')
-
-                    _dump_selector_reducer_once(jit_f, mod, mod_path)
-
-    def load(self, dump_dir: str):
-        """
-        Load dumped easier.Tensor data from rank-0, and JIT configurations from
-        machine local directory, before calling `easier.compile()`.
-
-        Usage:
-        ```
-        m1 = Model1()
-        m2 = Model2()
-
-        m1.load('/mnt/checkpoint1/')
-        m2.load('/mnt/checkpoint2/')
-        [jitted1, jitted2] = easier.compile([m1, m2])
-        ```
-
-        The `esr.Module`s to load should still be constructed and initialized
-        first. This means any data source they read should be ready
-        (e.g. HDF5 data files should be accessible on rank-0).
-
-        During `easier.compile()`, if any of the loaded JIT configurations
-        do not match the current JIT settings
-        (e.g. `jit_{rank}.hdf5` not existing; world size changes;
-        ranks permuted), these configurations will be ignored.
-        `easier.compile()` will generate new JIT configurations.
-        """
-        if self.easier_loaded_cache is not None:
-            raise RuntimeError()
-
-        # We didn't dedup data across esr.Modules getting dumped,
-        # so shared esr.Tensors etc. will have their data being overwritten.
-        # But that's ok, the loaded data are the same.
-
-        cpu_dist_env = get_cpu_dist_env()
-        rank = cpu_dist_env.rank
-        cls_name = self.__class__.__name__
-
-        def _stop_if(rank_should_stop: bool, debug_msg: str) -> None:
-            """
-            Collectively decide if to stop reusing JIT cache.
-            """
-            if rank_should_stop:
-                logger.debug(debug_msg)
-
-            all_stop = cpu_dist_env.all_gather_into_tensor(
-                torch.tensor([rank_should_stop], dtype=torch.int64)
-            ).sum().item() > 0
-
-            if all_stop:
-                if cpu_dist_env.is_host:
-                    logger.info(
-                        f'Dumped JIT configurations for {cls_name} will not'
-                        f' be loaded (reason: {debug_msg})')
-
-                raise _StopLoadingJITCache()
-
-        tensor_fpath = os.path.join(dump_dir, 'tensor.hdf5')
-        if rank == 0:
-            if not os.path.isfile(tensor_fpath):
-                logger.error('tensor.hdf5 does not exist.')
-                cpu_dist_env.abort()  # will skip barrier()
-        cpu_dist_env.barrier()
-
-        try:
-            cache = JitDump()
-
-            # Try loading JIT cache.
-            #
-            # It's ok that JIT cache is unavailable,
-            # then just use tensor.hdf5 only and re-compile.
-            # But all ranks should agree on the same result of whether to reuse
-            # JIT cache or none.
-            jit_fpath = os.path.join(dump_dir, f'jit_{rank}.hdf5')
-            jit_cache_not_exist = not os.path.isfile(jit_fpath)
-            _stop_if(
-                jit_cache_not_exist, 'jit_RANK.hdf5 does not exist.')
-
-            with h5py.File(jit_fpath, 'r') as jit_f:
-                config_str = str(jit_f.attrs['jit_config'])
-                loaded_config = JitConfig(**json.loads(config_str))
-                cur_config = _get_current_jit_config()
-                config_not_match = loaded_config != cur_config
-                _stop_if(
-                    config_not_match,
-                    f'Dumped JIT configurations for {cls_name} do not match.')
-
-                #
-                # All checks passed
-                #
-
-                tensor_grp = cast(Union[h5py.Group, dict],
-                                  jit_f.get('tensor', {}))
-                for tensor_attrpath, tensor_dataset in tensor_grp.items():
-                    cache.tensor_dumps[tensor_attrpath] = torch.from_numpy(
-                        tensor_dataset[...])
-
-                elempart_grp = cast(
-                    Union[h5py.Group, dict], jit_f.get('elempart', {}))
-                for bound_tensor_attrpath, subgrp in elempart_grp.items():
-                    elempart_idx = torch.from_numpy(subgrp['idx'][...])
-                    # [xxx][...] returns a np.array
-                    elempart_lengths = subgrp['lengths'][...].tolist()
-                    cache.elempart_dumps[bound_tensor_attrpath] = (
-                        elempart_idx, elempart_lengths)
-
-                distpass_grp = cast(
-                    Union[h5py.Group, dict], jit_f.get('dist_pass', {}))
-                for mod_attrpath, subgrp in distpass_grp.items():
-                    mod_idx = torch.from_numpy(subgrp['idx'][...])
-                    halo_local_idxes = []
-                    for w in range(loaded_config.world_size):
-                        halo_local_idx = torch.from_numpy(
-                            subgrp['halo_local_idxes'][str(w)][...])
-                        halo_local_idxes.append(halo_local_idx)
-                    halo_recv_lengths = \
-                        subgrp['halo_recv_lengths'][...].tolist()
-
-                    if 'reducer_n' in subgrp.attrs:
-                        reducer_n = int(subgrp.attrs['reducer_n'])
-                    else:
-                        reducer_n = None
-
-                    cache.selector_reducer_dumps[mod_attrpath] = (
-                        mod_idx, halo_local_idxes, halo_recv_lengths,
-                        reducer_n)
-
-            self.easier_loaded_cache = cache
-
-        except _StopLoadingJITCache:
-            self.easier_loaded_cache = None  # TODO can load again if failed?
-
-        # No matter jit_RANK.hdf5 is loaded or matched, always rebind
-        # esr.Tensors' data_loader.
-        # NOTE tensor.hdf5 is only on rank-0
-        if rank == 0:
-            with h5py.File(tensor_fpath, 'r') as tensor_f:
-                attrpaths = list(tensor_f.keys())
-                cpu_dist_env.broadcast_object_list(0, attrpaths)
-        else:
-            attrpaths = cpu_dist_env.broadcast_object_list(0)
-        for tensor_attrpath in attrpaths:
-            t = cast(Tensor, self.get_parameter(tensor_attrpath))
-            # tensor_attrpath e.g. 'a.b.c' will be the dataset name
-            old_dl = t.easier_data_loader
-            t.easier_data_loader = H5DataLoader(
-                tensor_fpath, tensor_attrpath,
-                dtype=old_dl.dtype, device=old_dl.device)
 
 
 def _allreduce(op, tensor: torch.Tensor, *args, **kwargs):

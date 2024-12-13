@@ -1,9 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from dataclasses import dataclass
-from typing_extensions import OrderedDict
+from typing_extensions import Literal, OrderedDict, TypeAlias
+import functools
+import more_itertools
 
 import torch
 from torch.fx.graph import Graph
@@ -19,16 +21,22 @@ from easier.core.passes.tensor_grouping import \
     EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
-    normalize_reducer_call_into_args, normalize_selector_call_into_args
+    get_selector_reducer_idx_partition_pair, \
+    normalize_reducer_call_into_args, normalize_selector_call_into_args, \
+    get_easier_tensors_as_parameters
 from easier.core.runtime.dist_env import \
     get_cpu_dist_env, get_mpi_communicator
 from easier.core.utils import EasierJitException, logger
 
 
+# METIS adj weights are ints
+METIS_ADJWGT_REDUCER: int = 10
+
+
 def parallel_partition_graph(
     world_size: int, rank: int,
     subadjmat_height: int, adjmat_width: int, vtxdist: torch.Tensor,
-    local_rowids: torch.Tensor, local_colids: torch.Tensor
+    rowcolids_and_causes: List[Tuple[torch.Tensor, torch.Tensor, bool]]
 ):
     """
     Args:
@@ -39,20 +47,49 @@ def parallel_partition_graph(
             i.e. the adjmat_height.
     """
 
-    assert local_rowids.ndim == local_colids.ndim == 1
-    assert local_rowids.shape == local_rowids.shape
+    # NOTE
+    # - `csr_matrix` sums up duplicated matrix cells during construction
+    # - `csr_matrix` automatically choose int32/int64 for its `indptr` and
+    #   `indices` ndarrays regarding upperbounds of the height and the weight.
+    # - `parmetis.part_kway` can call 32bit/64bit underlying native library
+    #   depending on its `xadj` argument i.e. `graph.indptr`.
+    #   Other arguments, including weights, will be casted to that int type.
+    selector_graph = scipy.sparse.csr_matrix(
+        (subadjmat_height, adjmat_width), dtype=np.int32)
+    reducer_graph = scipy.sparse.csr_matrix(
+        (subadjmat_height, adjmat_width), dtype=np.int32)
 
-    local_rowids = local_rowids.detach().cpu().numpy()
-    local_colids = local_colids.detach().cpu().numpy()
+    # Edge weights in the adjmat are:
+    # - if involved in Selectors, no matter how many times, weights are 1
+    # - each time involved in Reducers, those weights are increased by 10,
+    #   no matter how many edges there are.
+    for (commpair_rowids, commpair_colids, by_reducer) in rowcolids_and_causes:
+        assert commpair_rowids.ndim == commpair_colids.ndim == 1
+        assert commpair_rowids.shape == commpair_rowids.shape
 
-    # The value to construct the CSR matrix doesn't matter,
-    # as long as it's not zero.
-    csr_data = np.ones((local_rowids.shape[0],))
+        commpair_rowids = commpair_rowids.detach().cpu().numpy()
+        commpair_colids = commpair_colids.detach().cpu().numpy()
 
-    graph = scipy.sparse.csr_matrix(
-        (csr_data, (local_rowids, local_colids)),
-        shape=(subadjmat_height, adjmat_width)
-    ).tolil()
+        csr_ones = np.ones((commpair_rowids.shape[0],), dtype=np.int32)
+        commpair_graph = scipy.sparse.csr_matrix(
+            (csr_ones, (commpair_rowids, commpair_colids)),  # sum up dups
+            shape=(subadjmat_height, adjmat_width)
+        )
+
+        if by_reducer:
+            # Clamp potentially summed up elements,
+            # so that this adjmat for some reducer, as a whole,
+            # has a single non-1 weight value.
+            commpair_graph = commpair_graph.minimum(1)
+            commpair_graph = commpair_graph * METIS_ADJWGT_REDUCER
+
+            # It's efficient to add if both are in CSR format.
+            reducer_graph = reducer_graph + commpair_graph
+
+        else:
+            selector_graph = selector_graph + commpair_graph
+
+    graph = (selector_graph.minimum(1) + reducer_graph).tolil()
     # scipy warns against `setdiag` on CSR. LIL format is recommended instead.
 
     # ParMETIS require the diagonal (relatively to the global adjmat)
@@ -67,7 +104,8 @@ def parallel_partition_graph(
     #   the result of`AllGather(local_membership)` is the result of
     #   non-distributed version of graph partitioning.
     ncuts, local_membership = parmetis.part_kway(
-        world_size, graph.indptr, graph.indices, vtxdist, comm)
+        world_size, graph.indptr, graph.indices, vtxdist, comm,
+        adjwgt=graph.data)
 
     local_membership = torch.tensor(local_membership)
 
@@ -82,17 +120,25 @@ class CommPair:
     dst_tensor_group: EasierTensorGroup
     dst_idx_partition: torch.Tensor
 
+    caused_by_reducer: bool
+
     def get_symmetric_pair(self):
         return CommPair(
             src_tensor_group=self.dst_tensor_group,
             src_idx_partition=self.dst_idx_partition,
             dst_tensor_group=self.src_tensor_group,
-            dst_idx_partition=self.src_idx_partition
+            dst_idx_partition=self.src_idx_partition,
+
+            # The original source, communication direction is irrelevant.
+            caused_by_reducer=self.caused_by_reducer
         )
 
 
 class CommPairCollector(EasierInterpreter):
-    def __init__(self, modules: Sequence[esr.Module], graphs: Sequence[Graph]):
+    def __init__(
+        self,
+        modules: Sequence[esr.Module], graphs: Sequence[Graph]
+    ):
         super().__init__(modules, graphs)
 
         self.visited = set()
@@ -112,43 +158,32 @@ class CommPairCollector(EasierInterpreter):
             self.tensor_group_to_matedge_offsets[tensor_group] = offset
             self.accum_n += tensor_group.n
 
-    def if_call_module(self, module: Module):
-        if module in self.visited:
+    def if_call_module(self, submod: Module):
+        if submod in self.visited:
             # We assume the TensorGroup equivalency based on module instance
             return
 
         node = self.current_node
 
-        if isinstance(module, esr.Selector):
-            assert module.easier_idx_part_range is not None, \
-                "Selector.idx must have been partially loaded by rank"
-            partial_idx = module.idx
-            pstart, pend = module.easier_idx_part_range
-
-            src_idx = partial_idx
-            dst_idx = torch.arange(pstart, pend)
+        if isinstance(submod, esr.Selector):
             input_node = normalize_selector_call_into_args(
                 *node.args, **node.kwargs)
 
-        elif isinstance(module, esr.Reducer):
-            assert module.easier_idx_part_range is not None, \
-                "Reducer.idx must have been partially loaded by rank"
-            partial_idx = module.idx
-            pstart, pend = module.easier_idx_part_range
+            caused_by_reducer = False
 
-            # 1-by-1 read input, randomly write output
-            src_idx = torch.arange(pstart, pend)
-            dst_idx = partial_idx
+        elif isinstance(submod, esr.Reducer):
             input_node, _out_node = normalize_reducer_call_into_args(
                 *node.args, **node.kwargs)
 
+            caused_by_reducer = True
+
         else:
             raise EasierJitException(
-                f'{type(module)} is not supported to appear in'
+                f'{type(submod)} is not supported to appear in'
                 ' tensor grouping'
             )
 
-        self.visited.add(module)
+        self.visited.add(submod)
         assert isinstance(input_node, Node)
         # For Reducer, even `out=` parameter is given, the Node itself
         # has metadata as output too.
@@ -160,8 +195,11 @@ class CommPairCollector(EasierInterpreter):
 
         self._init_tensor_group_offset(src_tensor_group)
         self._init_tensor_group_offset(dst_tensor_group)
+
+        src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
         self.comm_pairs.append(CommPair(src_tensor_group, src_idx,
-                                        dst_tensor_group, dst_idx))
+                                        dst_tensor_group, dst_idx,
+                                        caused_by_reducer))
 
 
 def partition_tensor_groups_with_adjmat(
@@ -236,8 +274,9 @@ def partition_tensor_groups_with_adjmat(
     # TODO currently we collect all data then exchange them between workers,
     # therefore there is expected to be a memory peak. We may need to
     # send and free data in stream to decrease the memory peak.
-    rowids_for_commpairs: List[torch.Tensor] = []
-    colids_for_commpairs: List[torch.Tensor] = []
+
+    # [(concat_rowidx, concat_colidx, caused_by_reducer)]
+    rowcolids_for_commpairs: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
 
     for comm_pair in comm_pairs:
         row_tensor_group = comm_pair.src_tensor_group
@@ -288,17 +327,18 @@ def partition_tensor_groups_with_adjmat(
         adjmat_colids_tensors = \
             dist_env.all_to_all(adjmat_colids_to_send)
 
-        rowids_for_commpairs.extend(subadjmat_rowids_tensors)
-        colids_for_commpairs.extend(adjmat_colids_tensors)
+        # concat all recieved row/col ids
+        # and the result is not ordered or uniqued.
+        rowcolids_for_commpairs.append((
+            torch.concat(subadjmat_rowids_tensors),
+            torch.concat(adjmat_colids_tensors),
+            comm_pair.caused_by_reducer
+        ))
     # endfor comm_pairs
 
     #
     # Invoke ParMETIS
     #
-
-    # concat all recieved row/col ids and the result is not ordered or uniqued.
-    rowids = torch.concat(rowids_for_commpairs)
-    colids = torch.concat(colids_for_commpairs)
 
     # e.g. [0, N, 2N, ..., min(accum_n, wN)]
     vtxdist = torch.arange(world_size + 1) * per_worker_n
@@ -309,17 +349,51 @@ def partition_tensor_groups_with_adjmat(
     ncuts, local_membership = parallel_partition_graph(
         world_size, rank,
         subadjmat_height=subadjmat_height, adjmat_width=accum_n,
-        vtxdist=vtxdist, local_rowids=rowids, local_colids=colids)
+        vtxdist=vtxdist,
+        rowcolids_and_causes=rowcolids_for_commpairs)
 
     return local_membership
 
 
 @dataclass
+class ElemPartArangeIdx:
+    """
+    Stands for an "orphan" TensorGroup that's not involved in Selector/Reducer,
+    even not in the `easier.Module.forward()` scope to `easier.compile()`.
+    Such orphan TensorGroups still need a partition.
+    Evenly partitioning would suffice.
+
+    This dataclass serves as a descriptor for such simple cases, and will
+    save data transfer and serialization.
+    """
+    # basically, arguments to torch.arange
+    start: int
+    end: int
+
+
+@dataclass
 class ElemPart:
-    # Only for this worker. Expected to be ordered
-    idx: torch.Tensor
+
+    # Only for this worker.
+    idx_desc: Union[torch.Tensor, ElemPartArangeIdx]
+
     # All lengths are replicated on all workers
     lengths: List[int]
+
+    hint: str = "NOHINT"
+
+    @functools.cached_property
+    def idx(self) -> torch.Tensor:
+        if isinstance(self.idx_desc, ElemPartArangeIdx):
+            return torch.arange(self.idx_desc.start, self.idx_desc.end)
+        else:
+            return self.idx_desc
+
+    def __hash__(self) -> int:
+        return id(self)
+
+    def __eq__(self, other: object) -> bool:
+        return id(self) == id(other)
 
 
 def synchronize_partition_result(
@@ -351,7 +425,7 @@ def synchronize_partition_result(
     subadjmat_rowid_lb = per_worker_n * rank
     subadjmat_rowid_ub = min(per_worker_n * (rank + 1), accum_n)
 
-    synced_elempart: Dict[EasierTensorGroup, ElemPart] = {}
+    synced_elemparts: Dict[EasierTensorGroup, ElemPart] = {}
 
     # `local_membership` is the partition result for this local sub adjmat,
     # which represents rows within `[rowid_lb, rowid_ub)` of adjmat
@@ -402,43 +476,55 @@ def synchronize_partition_result(
 
         assert torch.equal(elempart.unique(sorted=True), elempart.sort()[0])
 
-        synced_elempart[tensor_group] = ElemPart(elempart, elempart_lengths)
+        elempart_i = len(synced_elemparts)
+        elempart_hint = get_elempart_hint(elempart_i, tensor_group)
+
+        synced_elemparts[tensor_group] = ElemPart(
+            elempart, elempart_lengths, hint=elempart_hint
+        )
 
     # endfor tensor_groups
 
-    return synced_elempart
+    return synced_elemparts
 
 
-def insert_noncomm_elemparts(modules: Sequence[esr.Module],
-                             elemparts: Dict[EasierTensorGroup, ElemPart]):
+def insert_naive_elemparts(
+    modules: Sequence[esr.Module],
+    nonnaive_elemparts: Dict[EasierTensorGroup, ElemPart]
+):
+    """
+    A naive ElemPart, or a naive partition, is an evenly distributed partition
+    taking no communication structure into consideration at all.
+
+    Such an ElemPart/partition is usually assigned to an EasierTensorGroup
+    that's not involved in communication at all;
+    Or when the global partition mode is specified as 'naive'.
+
+    This method will traverse all esr.Tensors and their EasierTensorGroup
+    in a consistent order, for any esr.Tensor that's not assigned with a better
+    ElemPart/partition, i.e. not in `nonnaive: dict`, assign a naive
+    ElemPart for it.
+    """
     dist_env = get_cpu_dist_env()
     world_size = dist_env.world_size
     rank = dist_env.rank
 
-    named_dtensor: List[Tuple[str, esr.Tensor, esr.Module]] = []
-    for i, root in enumerate(modules):
-        for name, p in root.named_parameters(prefix=str(i), recurse=True):
-            if isinstance(p, esr.Tensor) and p.is_partition:
-                named_dtensor.append((name, p, root))
-    named_dtensor.sort(key=lambda tp: tp[0])
+    named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
+        get_easier_tensors_as_parameters(modules)
 
-    for name, p, root in named_dtensor:
+    all_elemparts = dict(nonnaive_elemparts)
+
+    for p, roots_attrs in named_dtensor.items():
+        if not p.is_partition:
+            continue
+
+        rooti, name = roots_attrs[0]
+        root = modules[rooti]
         tensor_group = p.easier_tensor_group
-
-        if tensor_group is None:
-            # In TensorGrouping we only set group on distributed esr.Tensors
-            # that are referenced by `get_attr` Nodes.
-            # Such Tensors may still contain data to use outside of JIT,
-            # we give each of them an individual singleton Group.
-            logger.warning("Distributed esr.Tensor at "
-                           f"{root.__class__.__name__}.{name} is never used"
-                           " in easier.Module")
-            tensor_group = EasierTensorGroup(OrderedSet([p]), n=p.shape[0])
-            p.easier_tensor_group = tensor_group
 
         # No matter it's not involved in communication or not referenced,
         # give it an evenly partitioned ElemPart.
-        if tensor_group not in elemparts:
+        if tensor_group not in all_elemparts:
             n = tensor_group.n
 
             per_worker_n = n // world_size
@@ -459,31 +545,63 @@ def insert_noncomm_elemparts(modules: Sequence[esr.Module],
             ]
             lengths[-1] += residue
 
-            elemparts[tensor_group] = ElemPart(
-                torch.arange(start, end), lengths)
+            elempart_i = len(all_elemparts)
+            elempart_hint = get_arange_elempart_hint(elempart_i, tensor_group)
+
+            all_elemparts[tensor_group] = ElemPart(
+                ElemPartArangeIdx(start, end),
+                lengths,
+                hint=elempart_hint
+            )
+
+    return all_elemparts
+
+
+def get_elempart_hint(elempart_i: int, tensor_group: EasierTensorGroup):
+    return f'{elempart_i}:{tensor_group.hint}'
+
+
+def get_arange_elempart_hint(elempart_i: int, tensor_group: EasierTensorGroup):
+    return f'{elempart_i}:{tensor_group.hint}:arange'
 
 
 def partition_tensor_groups(
     modules: List[esr.Module], graphs: List[Graph]
-) -> Dict[EasierTensorGroup, ElemPart]:
+):
     comm_pairs_collector = CommPairCollector(modules, graphs)
     comm_pairs_collector.run()
 
-    elemparts: Dict[EasierTensorGroup, ElemPart]
+    # TODO Currently, because we always collect all comm-related pairs,
+    # we only have Tensor ElemParts being naive ElemParts, but in the future
+    # with partition_mode='naive', we need to ensure that purely intermediate
+    # TensorGroups of Selectors/Reducers should have naive ElemParts too.
+    # We need to collect all IR TensorGroups (some have METIS ElemParts,
+    # some have naive ElemParts) first.
+
+    # On-IR and comm-related ElemParts
+    ir_comm_elemparts: Dict[EasierTensorGroup, ElemPart]
     if len(comm_pairs_collector.comm_pairs) > 0:
         local_membership = partition_tensor_groups_with_adjmat(
             comm_pairs_collector.tensor_group_to_matedge_offsets,
             comm_pairs_collector.accum_n,
             comm_pairs_collector.comm_pairs)
 
-        elemparts = synchronize_partition_result(
+        ir_comm_elemparts = synchronize_partition_result(
             comm_pairs_collector.tensor_group_to_matedge_offsets,
             comm_pairs_collector.accum_n,
             local_membership)  # type: ignore
     else:
-        elemparts = {}
+        ir_comm_elemparts = {}
 
-    # Partition "orphan" esr.Tensors that are never involved in communication.
-    insert_noncomm_elemparts(modules, elemparts)
+    # Besides IR-and-comm ElemParts, we still have some TensorGroups unbound:
+    # - TensorGroups on IR, but not involved in communication (purely "Mapped")
+    # - Distributed tensors not referenced in IR at all ("orphan tensors"),
+    #   these esr.Tensors may still get collected or saved,
+    #   where we need valid elemparts to reconstruct their full data.
+    elemparts = insert_naive_elemparts(modules, ir_comm_elemparts)
 
-    return elemparts
+    assert None not in elemparts.values()
+    for root in modules:
+        root.easier_elemparts = elemparts  # type: ignore
+
+    return modules, graphs

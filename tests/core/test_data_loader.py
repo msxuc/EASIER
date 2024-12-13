@@ -12,7 +12,8 @@ import tempfile
 import os
 
 from easier.core.runtime.data_loader import \
-    DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader
+    DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
+    ArangeTensorLoader
 
 from ..utils import mpirun_singlenode, get_random_str
 
@@ -211,4 +212,76 @@ class TestFulledLoader:
 
     def test_load_by_index(self, dtype: torch.dtype, device_type: str):
         mpirun_singlenode(2, worker__test_load_full_by_index,
+                          (dtype, device_type))
+
+
+def worker__test_load_arange_by_rank(local_rank: int, world_size: int,
+                                     dtype: torch.dtype, device_type: str):
+    dl = ArangeTensorLoader(0, 34, 2,
+                            dtype=dtype, device=torch.device(device_type))
+    assert dl.dtype == dtype
+    assert dl.device.type == device_type
+    assert dl.shape == (17,)
+
+    tensor, start, end = dl.partially_load_by_rank()
+
+    assert tensor.dtype == dtype
+    assert tensor.device.type == 'cpu'  # by rank always CPU
+
+    assert start == local_rank * 8
+    assert end == (8 if local_rank == 0 else 17)
+    assert torch.equal(torch.arange(
+        start * 2, end * 2, 2, dtype=dtype), tensor)
+
+
+def worker__test_load_arange_by_index(local_rank: int, world_size: int,
+                                      dtype: torch.dtype, device_type: str):
+
+    dl = ArangeTensorLoader(0, 34, 2,
+                            dtype=dtype, device=torch.device(device_type))
+    assert dl.dtype == dtype
+    assert dl.device.type == device_type
+    assert dl.shape == (17,)
+
+    idx = torch.arange(5) * 2 + local_rank
+    tensor = dl.partially_load_by_index(idx)
+
+    assert tensor.dtype == dtype
+    assert tensor.device.type == 'cpu'  # by rank always CPU
+
+    assert torch.equal(idx.to(dtype) * 2, tensor)
+
+
+@pytest.mark.parametrize('dtype',
+                         [torch.int64, torch.float64], ids=['i64', 'f64'])
+@pytest.mark.parametrize('device_type', [
+    'cpu',
+    # no device IDs, all workers use cuda:0.
+    pytest.param('cuda', marks=have_cuda)
+])
+class TestArangeLoader:
+    def test_load_chunk(self, dtype: torch.dtype, device_type: str):
+        dl = ArangeTensorLoader(0, 34, 2,
+                                dtype=dtype, device=torch.device(device_type))
+        assert dl.dtype == dtype
+        assert dl.device.type == device_type
+        assert dl.shape == (17,)
+
+        it = dl.partially_load_by_chunk(7)
+        chunks = list(it)
+
+        for chunk in chunks:
+            assert chunk.dtype == dtype
+            assert chunk.device == torch.device('cpu')
+
+        assert torch.equal(torch.arange(0, 14, 2, dtype=dtype), chunks[0])
+        assert torch.equal(torch.arange(14, 28, 2, dtype=dtype), chunks[1])
+        assert torch.equal(torch.arange(28, 34, 2, dtype=dtype), chunks[2])
+
+    def test_load_by_rank(self, dtype: torch.dtype, device_type: str):
+        mpirun_singlenode(2, worker__test_load_arange_by_rank,
+                          (dtype, device_type))
+
+    def test_load_by_index(self, dtype: torch.dtype, device_type: str):
+        mpirun_singlenode(2, worker__test_load_arange_by_index,
                           (dtype, device_type))

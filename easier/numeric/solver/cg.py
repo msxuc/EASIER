@@ -73,9 +73,6 @@ class Update(esr.Module):
         self.p[:] = p1
 
 
-CGCallbackType: TypeAlias = Literal['step', 'update']
-
-
 class CG(esr.Module):
     """Conjugate Gradient"""
 
@@ -91,21 +88,21 @@ class CG(esr.Module):
         self.M = M if M else lambda x: x
 
         self.r = esr.Tensor(esr.zeros(x.shape, dtype=x.dtype,
-                            device=x.device), dist='partition')
+                            device=x.device), mode='partition')
         self.z = esr.Tensor(esr.zeros(x.shape, dtype=x.dtype,
-                            device=x.device), dist='partition')
+                            device=x.device), mode='partition')
         self.p = esr.Tensor(esr.zeros(x.shape, dtype=x.dtype,
-                            device=x.device), dist='partition')
+                            device=x.device), mode='partition')
 
         self.rzsum = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.rnorm = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.bnorm = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
 
         self.init = Init(A, b, x, self.M, self.r, self.z, self.p, self.bnorm)
         self.step = Step(A, x, self.r, self.z, self.p, self.rnorm, self.rzsum)
@@ -115,12 +112,7 @@ class CG(esr.Module):
               rtol: float = 1e-5,
               atol: Optional[float] = None,
               maxiter: Optional[int] = None,
-              debug_iter: Optional[int] = None,
-              callback: Optional[Callable[
-                  ['CG', CGCallbackType, int],
-                  'CG']
-              ] = None,
-              callback_type: Sequence[CGCallbackType] = []
+              debug_iter: Optional[int] = None
               ) -> Dict[str, Any]:
         name = self.__class__.__name__
         self.init()
@@ -136,18 +128,12 @@ class CG(esr.Module):
                     f"{name} residual {float(self.rnorm)}"
                     f" at the {iters}-th iteration")
 
-            if callback is not None and 'step' in callback_type:
-                self = callback(self, 'step', iters)
-
             if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
                (maxiter is not None and iters >= maxiter):
                 break
             iters += 1
 
             self.update()
-
-            if callback is not None and 'update' in callback_type:
-                self = callback(self, 'update', iters)
 
         esr.logger.info(
             f"{name} solver completed with residual {float(self.rnorm)}" +

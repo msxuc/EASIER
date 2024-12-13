@@ -166,7 +166,7 @@ class View:
             assert isinstance(self.src, Node) or self.is_multi_result_item()
 
         else:
-            assert False, 'unreachable'
+            assert False, "Invalid View.ViewType"
 
     def is_multi_result_item(self):
         return isinstance(self.src, tuple) and len(self.src) == 2 \
@@ -191,7 +191,7 @@ class View:
             return View(self.type, self.src)
 
         else:
-            assert False, 'unreachable'
+            assert False, "Invalid View.ViewType"
 
     def derive_new_undetermined_view(self, derived_from_node: Node) -> 'View':
         # All resultant cases are undetermined.
@@ -205,7 +205,7 @@ class View:
             return View(ViewType.UNDETERMINED, self.src)
 
         else:
-            assert False, 'unreachable'
+            assert False, "Invalid View.ViewType"
 
 
 @dataclass

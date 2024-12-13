@@ -31,7 +31,7 @@ class TestMetadataPropagation:
                 super().__init__()
                 self.s = Selector(torch.LongTensor([1, 2, 3, 4]))
                 self.r = Reducer(torch.LongTensor([6, 7, 8, 9]), 22)
-                self.v = Tensor(torch.zeros([11, 3]), dist='partition')
+                self.v = Tensor(torch.zeros([11, 3]), mode='partition')
 
             def forward(self):
                 e = self.s(self.v)
@@ -61,9 +61,9 @@ class TestMetadataPropagation:
                 def __init__(self):
                     super().__init__()
                     self.v = Tensor(torch.zeros([11, 2, 3, 4]),
-                                    dist='partition')
+                                    mode='partition')
                     self.t = Tensor(torch.zeros([5, 6, 7], dtype=torch.int32),
-                                    dist='replicate')
+                                    mode='replicate')
 
                 def forward(self):
                     f(self.v, self.t)
@@ -117,9 +117,9 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v1 = Tensor(torch.zeros([11, 2, 3, 4]),
-                                     dist='partition')
+                                     mode='partition')
                     self.v2 = Tensor(torch.zeros([11, 1, 1, 1]),
-                                     dist='partition')
+                                     mode='partition')
 
                 def forward(self):
                     f(self.v1, self.v2)
@@ -143,7 +143,7 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v = Tensor(torch.zeros(
-                        [11, 2, 3, 4], dtype=torch.int32), dist='partition')
+                        [11, 2, 3, 4], dtype=torch.int32), mode='partition')
 
                 def forward(self):
                     f(self.v)
@@ -167,9 +167,9 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v = esr.Tensor(torch.zeros(
-                        [11, 2, 3, 4], dtype=torch.int32), dist='partition')
+                        [11, 2, 3, 4], dtype=torch.int32), mode='partition')
                     self.t = esr.Tensor(torch.zeros(
-                        [11, 2, 3, 4], dtype=torch.int32), dist='replicate')
+                        [11, 2, 3, 4], dtype=torch.int32), mode='replicate')
 
                 def forward(self):
                     v = self.v
@@ -220,9 +220,9 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v1 = Tensor(torch.zeros([11, 2, 3, 4]),
-                                     dist='partition')
+                                     mode='partition')
                     self.v2 = Tensor(torch.zeros([11, 1, 1, 1]),
-                                     dist='partition')
+                                     mode='partition')
 
                 def forward(self):
                     f(self.v1 == self.v2, self.v1, self.v2)
@@ -252,11 +252,11 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v1 = Tensor(torch.zeros([11, 8, 3, 4]),
-                                     dist='partition')
+                                     mode='partition')
                     self.v2 = Tensor(torch.zeros([11, 1, 4, 5]),
-                                     dist='partition')
-                    self.t1 = Tensor(torch.zeros(3, 4), dist='replicate')
-                    self.t2 = Tensor(torch.zeros(4, 5), dist='replicate')
+                                     mode='partition')
+                    self.t1 = Tensor(torch.zeros(3, 4), mode='replicate')
+                    self.t2 = Tensor(torch.zeros(4, 5), mode='replicate')
 
                 def forward(self):
                     f(self.v1, self.v2, self.t1, self.t2)
@@ -295,11 +295,11 @@ class TestRules:
                 def __init__(self):
                     super().__init__()
                     self.v1 = Tensor(torch.zeros([11, 8, 3, 4]),
-                                     dist='partition')
+                                     mode='partition')
                     self.v2 = Tensor(torch.zeros([11, 9, 4, 5]),
-                                     dist='partition')
-                    self.t1 = Tensor(torch.zeros(3, 4), dist='replicate')
-                    self.t2 = Tensor(torch.zeros(4, 3), dist='replicate')
+                                     mode='partition')
+                    self.t1 = Tensor(torch.zeros(3, 4), mode='replicate')
+                    self.t2 = Tensor(torch.zeros(4, 3), mode='replicate')
 
                 def forward(self):
                     f(self.v1, self.v2, self.t1, self.t2)
