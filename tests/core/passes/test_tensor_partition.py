@@ -10,7 +10,7 @@ import torch
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.runtime.dist_env import DistEnv
-from easier.core.passes.dataflow_distribution.tensor_partition import \
+from easier.core.passes.tensor_partition import \
     CommPair, partition_tensor_groups_with_adjmat, parallel_partition_graph, \
     synchronize_partition_result, get_cpu_dist_env
 from easier.core.passes.tensor_grouping import \
@@ -46,9 +46,9 @@ def get_call_arg0(call: 'mock.call_object'):  # type: ignore
 
 def test_partition_tensor_groups(mock_mpi_dist_env):
     fake_defset = frozenset()
-    g5 = EasierTensorGroup(fake_defset, n=9)
-    g6 = EasierTensorGroup(fake_defset, n=26)
-    g7 = EasierTensorGroup(fake_defset, n=8)
+    g5 = EasierTensorGroup(fake_defset, 9,  'g5')  # type: ignore
+    g6 = EasierTensorGroup(fake_defset, 26, 'g6')  # type: ignore
+    g7 = EasierTensorGroup(fake_defset, 8,  'g7')  # type: ignore
 
     def run(comm_pairs: List[CommPair]):
         # `comm_pairs` can just be one-direction communication.
@@ -109,15 +109,18 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
         run([
             CommPair(  # Select G7 to G7 itself
                 g7, vec(6, 2, 5),
-                g7, vec(0, 1, 2)  # Select dst is 1-1, total num is 8
+                g7, vec(0, 1, 2),   # Select dst is 1-1, total num is 8
+                False
             ),
             CommPair(  # Select G6 to G7, covering all 3 workers
                 g6, vec(22, 3, 11),
                 g7, vec(0, 1, 2),
+                False
             ),
             CommPair(  # Reduce G5 to G6
                 g5, vec(0, 1, 2),
-                g6, vec(13, 5, 21)
+                g6, vec(13, 5, 21),
+                caused_by_reducer=True
             )
         ])
 
@@ -199,15 +202,18 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
         run([
             CommPair(  # G7 to G7 itself
                 g7, vec(1, 1, 1),
-                g7, vec(3, 4, 5)
+                g7, vec(3, 4, 5),
+                False
             ),
             CommPair(  # Select G6 to G7, covering all 3 workers
                 g6, vec(8, 9, 4),
                 g7, vec(3, 4, 5),
+                False
             ),
             CommPair(  # Reduce G5 to G6
                 g5, vec(3, 4, 5),
-                g6, vec(6, 6, 6)
+                g6, vec(6, 6, 6),
+                True
             )
         ])
 
@@ -285,15 +291,18 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
         run([
             CommPair(  # G7 to G7 itself
                 g7, vec(0, 4),
-                g7, vec(6, 7)
+                g7, vec(6, 7),
+                False
             ),
             CommPair(  # Select G6 to G7, covering all 3 workers
                 g6, vec(20, 21),
                 g7, vec(6, 7),
+                False
             ),
             CommPair(  # Reduce G5 to G6
                 g5, vec(6, 7, 8),
-                g6, vec(20, 21, 20)
+                g6, vec(20, 21, 20),
+                True
             )
         ])
 
@@ -336,9 +345,9 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
     mock_mpi_dist_env.world_size = world_size
 
     fake_defset = frozenset()
-    g5 = EasierTensorGroup(fake_defset, n=9)
-    g6 = EasierTensorGroup(fake_defset, n=26)
-    g7 = EasierTensorGroup(fake_defset, n=8)
+    g5 = EasierTensorGroup(fake_defset, 9,  'g5')  # type: ignore
+    g6 = EasierTensorGroup(fake_defset, 26, 'g6')  # type: ignore
+    g7 = EasierTensorGroup(fake_defset, 8,  'g7')  # type: ignore
 
     def run(local_membership: torch.Tensor):
         return synchronize_partition_result(

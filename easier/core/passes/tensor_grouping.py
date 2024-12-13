@@ -19,7 +19,7 @@ from easier.core.utils import \
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, \
+    EasierInterpreter, OrderedSet, get_easier_tensors_as_parameters, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     FX, DisjointSet, tree_map
 
@@ -29,7 +29,7 @@ KEY__TENSORGROUPING_GROUP = "easier_tensorGrouping_group"
 
 # The objects that define the (layout of) tensors, and we are constructing
 # equivalency between them:
-# - The esr.Tensors are `.dist=='partition'` only
+# - The esr.Tensors are `.mode=='partition'` only
 # - esr.Reducer/Selector instances are representing the groups of their results
 EasierTensorDef: TypeAlias = Union[esr.Tensor, esr.Reducer, esr.Selector]
 
@@ -38,6 +38,8 @@ EasierTensorDef: TypeAlias = Union[esr.Tensor, esr.Reducer, esr.Selector]
 class EasierTensorGroup:
     tensor_defs: OrderedSet[EasierTensorDef]
     n: int
+
+    hint: str
 
     def __hash__(self) -> int:
         return id(self)
@@ -54,9 +56,13 @@ def _get_tensordef_batch_size(tensordef: EasierTensorDef):
     elif isinstance(tensordef, esr.Reducer):
         n = tensordef.n
     else:
-        assert False, "unreachable"
+        assert False, "Must be a Selector or Reducer or Tensor"
 
     return n
+
+
+def _get_group_hint(root, attrpath):
+    return root.__class__.__name__ + "." + attrpath
 
 
 class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
@@ -84,6 +90,8 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         self.group_dset: DisjointSet[EasierTensorDef] = \
             DisjointSet(equal=lambda x, y: x is y)
 
+        self.defhints: Dict[EasierTensorDef, str] = {}
+
     def set_equivalent(self, defs: Sequence[Optional[EasierTensorDef]]
                        ) -> Optional[EasierTensorDef]:
         """
@@ -105,6 +113,15 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
     def for_each_node(self):
         tensordef: Optional[EasierTensorDef] = super().for_each_node()
         self.node2def[self.current_node] = tensordef
+
+        if tensordef is not None:
+            self.defhints.setdefault(
+                tensordef,
+                _get_group_hint(
+                    self.current_module,
+                    str(self.current_node.target)
+                )
+            )
 
     def if_get_attr(self, submod_path, attr_name, attr_val
                     ) -> Optional[EasierTensorDef]:
@@ -207,7 +224,9 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
         tdef0, *_ = defset
         grp = EasierTensorGroup(
             tensor_defs=defset,
-            n=_get_tensordef_batch_size(tdef0))
+            n=_get_tensordef_batch_size(tdef0),
+            hint=tensor_grouper.defhints[tdef0]
+        )
         for tdef in defset:
             def2grp[tdef] = grp
 
@@ -215,7 +234,32 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
             # Replica tensors will have this field being its default value None
             tdef.easier_tensor_group = grp
 
+    # In TensorGrouper we only set group on distributed esr.Tensors
+    # that are referenced by `get_attr` Nodes.
+    # But some Tensors may still contain data to use outside of JIT,
+    # we give each of them an individual singleton Group
+    # (and later a naive group partition).
+    named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
+        get_easier_tensors_as_parameters(modules)
+    for p, roots_attrs in named_dtensor.items():
+        if not p.is_partition:
+            continue
+        rooti, name = roots_attrs[0]
+        root = modules[rooti]
+
+        if not hasattr(p, 'easier_tensor_group'):
+
+            logger.warning("Distributed esr.Tensor at "
+                           f"{root.__class__.__name__}.{name} is never used"
+                           " in easier.Module")
+            tensor_group = EasierTensorGroup(
+                OrderedSet([p]), n=p.shape[0],
+                hint=_get_group_hint(root, name)
+            )
+            p.easier_tensor_group = tensor_group
+
     # Store the TensorGroup into Node.meta
+
     class NodeMetaAssigner(EasierInterpreter):
         def for_each_node(self):
             node = self.current_node
@@ -238,3 +282,26 @@ def get_node_tensor_group(node: Node) -> Optional[EasierTensorGroup]:
     """
     grp = node.meta[KEY__TENSORGROUPING_GROUP]
     return grp
+
+
+def get_tensor_groups_relation(
+    current_node: Node, submod: Union[esr.Selector, esr.Reducer]
+):
+    args = current_node.args
+    kwargs = current_node.kwargs
+
+    if isinstance(submod, esr.Reducer):
+        input_node, opt_inplace_out_node = \
+            normalize_reducer_call_into_args(*args, **kwargs)
+    elif isinstance(submod, esr.Selector):
+        input_node = normalize_selector_call_into_args(*args, **kwargs)
+    else:
+        assert False, "Must be a Selector or Reducer"
+
+    assert isinstance(input_node, Node)
+
+    dataflow_input_grp = get_node_tensor_group(input_node)
+    assert dataflow_input_grp is not None
+    dataflow_output_grp = submod.easier_tensor_group
+
+    return dataflow_input_grp, dataflow_output_grp

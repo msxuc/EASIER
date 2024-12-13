@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Callable, Iterable, List, Optional, Tuple, Union, cast
+from typing import List, Optional, Sequence
 from typing_extensions import Literal, TypeAlias
 import typing
 
@@ -29,8 +29,9 @@ class HaloExchanger(torch.nn.Module):
                  input_elempart_length: int,  # for Selector
                  runtime_halos_lidxes: List[torch.Tensor],
                  runtime_recv_lengths: List[int],
-                 element_tensor_shape: Tuple[int, ...],
-                 dtype: torch.dtype) -> None:
+                 dtype: torch.dtype,
+                 parent_primitive: str
+                 ) -> None:
         super().__init__()
 
         self.is_for_selector = is_for_selector
@@ -43,19 +44,72 @@ class HaloExchanger(torch.nn.Module):
 
         self.runtime_recv_lengths = runtime_recv_lengths
 
-        self.element_tensor_shape = element_tensor_shape
         self.chunk_dtype = dtype
 
-        self.init_buffers()
+        # The attribute path of the Selector/Reducer
+        # (may be a nested path, if user calls S/R in a sub-esr.Module)
+        # this HaloExchanger is inserted for.
+        # Would always pick the `target: str` from the S/R callsite Nodes
+        # i.e. the path is always regarded to the esr.Module this
+        # HaloExchanger instance will be added to.
+        self.parent_primitive = parent_primitive
+
+        self.analyze_halo_properties()
+
+        # Callers should check this flag, only if it's needed,
+        # call `this.init_buffers()`
+        self.is_needed: bool
 
         # The size of the list is `world_size`.
         # If no communication is needed, the item is None.
+        # `recv_buffers[this_rank]` is always None.
         self.recv_buffers: List[Optional[torch.Tensor]]
-        self.chunk_len: int
-        self.chunk_v: torch.Tensor
+        self.total_recv_length: int
+        self.total_send_length: int
+        self.chunk_v: Optional[torch.Tensor]
 
-    def init_buffers(self):
-        element_tensor_shape = self.element_tensor_shape
+        self._buffer_inited = False
+
+    def analyze_halo_properties(self):
+        # In certain cases we should avoid preallocation or avoid inserting
+        # HaloExchanger at all:
+        # - Selector/Reducer has no sends/recvs:
+        #       Avoid inserting HaloExchanger
+        # - Selector has no recvs:
+        #       Avoid preallocation of recv_buffers and chunk
+
+        dist_env = get_runtime_dist_env()
+
+        self.total_recv_length = sum(
+            halo_len for u, halo_len in enumerate(self.runtime_recv_lengths)
+            if u != dist_env.rank
+        )
+
+        self.total_send_length = sum(
+            lidx.shape[0] for t, lidx in enumerate(self.runtime_halos_lidxes)
+            if t != dist_env.rank
+        )
+
+        self.is_needed = not (
+            self.total_recv_length == 0 and self.total_send_length == 0
+        )
+
+    def assert_is_needed(self):
+        assert self.is_needed, \
+            "Selector or Reducer, that has no recvs and no sends," \
+            " shouldn't have HaloExchanger at all." \
+            " Avoid adding HaloExchanger in dataflow_distribution pass."
+
+    def init_buffers(self, element_tensor_shape: tuple):
+        self.assert_is_needed()
+        assert not self._buffer_inited
+
+        if self.is_for_selector and self.total_recv_length == 0:
+            # For Selector having no recvs, we don't use chunk but directly
+            # go on with the input tensor.
+            self.chunk_v = None
+            return
+
         dtype = self.chunk_dtype
 
         def _get_buffer_shape(batchsize: int):
@@ -78,15 +132,15 @@ class HaloExchanger(torch.nn.Module):
             else:
                 local_size = \
                     self.runtime_halos_lidxes[dist_env.rank].shape[0]
+
+                # Specifically for Selector,
+                # we don't slice input tensor for local halo of Selector,
+                # but directly take the local input elempart (or not).
                 if self.is_for_selector:
-                    # Don't preallocate buffer for local halo of Selector,
-                    # but directly take the local input elempart (or not).
                     if local_size > 0:
                         local_size = self.input_elempart_length
-                    else:
-                        local_size = 0
 
-                # Reducer will already concat the local halo.
+                # recv_buffers[dist_env.rank] is always None.
 
         assert local_size >= 0
 
@@ -97,15 +151,19 @@ class HaloExchanger(torch.nn.Module):
         #
         # WARNING But if the HaloExchanger instance is called twice,
         # the 2nd writing may invalidate the 1st result.
-        self.chunk_len = sum(
-            buf.shape[0] for buf in self.recv_buffers
-            if buf is not None
-        ) + local_size
         self.chunk_v = torch.empty(
-            size=_get_buffer_shape(self.chunk_len),
+            size=_get_buffer_shape(self.total_recv_length + local_size),
             dtype=dtype, device=device)
 
+        self._buffer_inited = True
+
     def forward(self, local: torch.Tensor) -> torch.Tensor:
+        self.assert_is_needed()
+
+        if not self._buffer_inited:
+            self.init_buffers(tuple(local.shape[1:]))
+        assert self._buffer_inited
+
         dist_env = get_runtime_dist_env()
         p2p_ops = []
 
@@ -115,6 +173,11 @@ class HaloExchanger(torch.nn.Module):
                 if lidx.shape[0] > 0:
                     isend = dist_env.def_isend(local[lidx], u, tag=u)
                     p2p_ops.append(isend)
+
+        # When Selector has no recvs,
+        # don't bother writing a chunk, but directly return the input tensor.
+        if self.chunk_v is None:
+            return local
 
         recv_buffers: List[torch.Tensor] = []
         for u in range(dist_env.world_size):
@@ -140,7 +203,7 @@ class HaloExchanger(torch.nn.Module):
         for req in dist_env.batch_isend_irecv(p2p_ops):
             req.wait()
 
-        if self.chunk_len > 0:
+        if self.total_recv_length > 0:
             torch.concat(recv_buffers, out=self.chunk_v)
         return self.chunk_v
 

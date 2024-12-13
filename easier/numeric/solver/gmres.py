@@ -59,7 +59,7 @@ class InitW(esr.Module):
         self.w = w
         self.j = esr.Tensor(
             torch.tensor(0, dtype=torch.int32, device=V.device),
-            dist='replicate')
+            mode='replicate')
 
     def forward(self):
         self.w[:] = self.A(self.M(self.V[:, ..., self.j]))
@@ -74,7 +74,7 @@ class SumW(esr.Module):
         self.h = h
         self.i = esr.Tensor(
             torch.tensor(0, dtype=torch.int32, device=V.device),
-            dist='replicate')
+            mode='replicate')
 
     def forward(self):
         self.h[:] = esr.sum(self.V[:, ..., self.i] * self.w).sum()
@@ -100,7 +100,7 @@ class UpdateW(esr.Module):
         self.h = h
         self.i = esr.Tensor(
             torch.tensor(0, dtype=torch.int32, device=V.device),
-            dist='replicate')
+            mode='replicate')
 
     def forward(self):
         self.w.sub_(self.h * self.V[:, ..., self.i])
@@ -115,7 +115,7 @@ class UpdateV(esr.Module):
         self.h = h
         self.i = esr.Tensor(
             torch.tensor(0, dtype=torch.int32, device=V.device),
-            dist='replicate')
+            mode='replicate')
 
     def forward(self):
         self.V[:, ..., self.i] = self.w / self.h
@@ -137,9 +137,6 @@ class UpdateX(esr.Module):
         self.x.add_(self.M(dx))
 
 
-GMRESCallbackType: TypeAlias = Literal['rnorm', 'restart', 'update_x']
-
-
 class GMRES(esr.Module):
     """General Minimal Residule"""
 
@@ -156,35 +153,35 @@ class GMRES(esr.Module):
         self.M = M if M else lambda x: x
         self.restart = restart
 
-        self.r = esr.Tensor(torch.zeros_like(x), dist='partition')
+        self.r = esr.Tensor(torch.zeros_like(x), mode='partition')
         self.rnorm = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.update_rnorm = UpdateRnorm(A, b, x, self.r, self.rnorm)
 
         self.bnorm = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.init = Init(self.b, self.bnorm)
 
         self.H = esr.Tensor(torch.zeros(
             (restart + 1, restart), device=x.device, dtype=x.dtype),
-            dist='replicate')
+            mode='replicate')
         self.B = esr.Tensor(torch.zeros(
             (restart + 1, 1), device=x.device, dtype=x.dtype),
-            dist='replicate')
+            mode='replicate')
 
         V_shape = x.shape + (restart,)
         self.V = esr.Tensor(torch.zeros(
-            V_shape, dtype=x.dtype, device=x.device), dist='partition')
+            V_shape, dtype=x.dtype, device=x.device), mode='partition')
         self.init_V = InitV(self.r, self.rnorm, self.V)
 
-        self.w = esr.Tensor(torch.zeros_like(x), dist='partition')
+        self.w = esr.Tensor(torch.zeros_like(x), mode='partition')
         self.init_w = InitW(A, self.M, self.V, self.w)
 
         self.h = esr.Tensor(
             torch.tensor([0.0], dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.sum_w = SumW(self.V, self.w, self.h)
         self.update_w = UpdateW(self.V, self.w, self.h)
         self.norm_w = NormW(self.w, self.h)
@@ -192,7 +189,7 @@ class GMRES(esr.Module):
 
         self.y = esr.Tensor(
             torch.zeros((restart, 1), dtype=x.dtype, device=x.device),
-            dist='replicate')
+            mode='replicate')
         self.update_x = nn.ModuleList(
             [UpdateX(self.x, self.V, self.M, self.y, i)
              for i in range(1, restart + 1)])
@@ -219,12 +216,7 @@ class GMRES(esr.Module):
               rtol: float = 1e-5,
               atol: Optional[float] = None,
               maxiter: Optional[int] = None,
-              debug_iter: Optional[int] = None,
-              callback: Optional[Callable[
-                  ['GMRES', GMRESCallbackType, int],
-                  'GMRES']
-              ] = None,
-              callback_type: Sequence[GMRESCallbackType] = []
+              debug_iter: Optional[int] = None
               ) -> Dict[str, Any]:
         name = self.__class__.__name__
         self.init()
@@ -239,9 +231,6 @@ class GMRES(esr.Module):
                 esr.logger.info(
                     f"{name} residual {float(self.rnorm)}"
                     f" at the {iters}-th iteration")
-
-            if callback is not None and 'rnorm' in callback_type:
-                self = callback(self, 'rnorm', iters)
 
             if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
                (maxiter is not None and iters >= maxiter):
@@ -264,18 +253,12 @@ class GMRES(esr.Module):
                 elif j < self.restart - 1:
                     self._update_V(j + 1)
 
-            if callback is not None and 'restart' in callback_type:
-                self = callback(self, 'restart', iters)
-
             u, s, vt = torch.linalg.svd(self.H[:j + 2], full_matrices=False)
             self.y[:] = vt.transpose(0, 1) @ \
                 torch.diag_embed(1 / torch.clamp(s, min=1e-8)) @ \
                 u.transpose(0, 1) @ self.B[:j + 2]
 
             self.update_x[j]()
-
-            if callback is not None and 'update_x' in callback_type:
-                self = callback(self, 'update_x', iters)
 
         esr.logger.info(
             f"{name} solver completed with residual {float(self.rnorm)}" +

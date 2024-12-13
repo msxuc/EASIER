@@ -3,7 +3,7 @@
 
 from unittest.mock import patch
 import torch
-from torch.fx import GraphModule
+from torch.fx.graph_module import GraphModule
 import pytest
 import tempfile
 import os
@@ -39,14 +39,14 @@ class Model(esr.Module):
         self.selector_dst = esr.Selector(eqn.dst)
 
         self.vertex_tensor = esr.Tensor(
-            torch.randn((nv, nf)).to(device=device), dist='partition')
+            torch.randn((nv, nf)).to(device=device), mode='partition')
         self.edge_tensor = esr.Tensor(torch.randn(
-            (ne, nf)).to(device=device), dist='partition')
+            (ne, nf)).to(device=device), mode='partition')
         self.tensor = esr.Tensor(torch.randn(
-            (1, nf)).to(device=device), dist='replicate')
+            (1, nf)).to(device=device), mode='replicate')
 
-        self.out1 = esr.Tensor(torch.empty(nf).to(
-            device=device), dist='replicate')
+        self.out1 = esr.Tensor(torch.zeros(nf).to(
+            device=device), mode='replicate')
 
     def forward(self):
         dst = self.selector_dst(self.vertex_tensor)
@@ -107,9 +107,9 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
     class M(esr.Module):
         def __init__(self):
             super().__init__()
-            self.v = esr.Tensor(torch.ones(10), dist='partition')
+            self.v = esr.Tensor(torch.ones(10), mode='partition')
             self.s = esr.Reducer(torch.tensor([1, 2, 3]), n)
-            self.v2 = esr.Tensor(torch.ones(13), dist='partition')
+            self.v2 = esr.Tensor(torch.ones(13), mode='partition')
 
         def forward(self):
             self.v[:] = self.v + 3

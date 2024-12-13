@@ -14,9 +14,9 @@ def fully_load_data(t: easier.Tensor):
 
 
 def fully_load_idx(m: Union[easier.Selector, easier.Reducer]):
-    assert not m.easier_index_ready
+    assert m.easier_index_status == 'placeholder'
     m.idx = m.easier_data_loader.fully_load(None)
-    m.easier_index_ready = True
+    m.easier_index_status = 'rewritten'
 
 
 class TestSelector:
@@ -85,19 +85,19 @@ class TestJitNoneBackendUsage:
             def __init__(self) -> None:
                 super().__init__()
                 self.v = easier.Tensor(
-                    torch.rand(3, 3, dtype=torch.float16), dist='partition')
+                    torch.rand(3, 3, dtype=torch.float64), mode='partition')
                 self.reducer = easier.Reducer(
                     torch.tensor([1, 2, 2, 0], dtype=torch.int64), n)
                 self.e = easier.Tensor(
-                    torch.rand(4, 3, dtype=torch.float16), dist='partition')
+                    torch.rand(4, 3, dtype=torch.float64), mode='partition')
                 self.r = easier.Tensor(
-                    torch.rand(1, 3), dist='replicate')
+                    torch.rand(1, 3), mode='replicate')
 
         m = M()
         [m] = easier.compile([m], backend='none')
 
-        assert m.v.dtype == torch.float16
-        assert m.e.dtype == torch.float16
+        assert m.v.dtype == torch.float64
+        assert m.e.dtype == torch.float64
         assert m.r.dtype == torch.float32
 
         assert m.reducer.idx.dtype == torch.int64
@@ -112,14 +112,14 @@ class TestJitNoneBackendUsage:
                 super().__init__()
                 self.v = easier.Tensor(
                     torch.rand(3, 3, dtype=torch.float64).cuda(),
-                    dist='partition')
+                    mode='partition')
                 self.reducer = easier.Reducer(
                     torch.tensor([1, 2, 2, 0], dtype=torch.int64).cuda(), n)
                 self.e = easier.Tensor(
                     torch.rand(4, 3, dtype=torch.float64).cuda(),
-                    dist='partition')
+                    mode='partition')
                 self.r = easier.Tensor(
-                    torch.rand(1, 3).cuda(), dist='replicate')
+                    torch.rand(1, 3).cuda(), mode='replicate')
 
         m = M()
         [m] = easier.compile([m], backend='none')
@@ -141,11 +141,11 @@ class TestJitNoneBackendUsage:
             def __init__(self) -> None:
                 super().__init__()
                 self.v = easier.Tensor(
-                    torch.rand(3, 3, dtype=torch.float64), dist='partition')
+                    torch.rand(3, 3, dtype=torch.float64), mode='partition')
                 self.e = easier.Tensor(
-                    torch.rand(4, 3, dtype=torch.float64), dist='partition')
+                    torch.rand(4, 3, dtype=torch.float64), mode='partition')
                 self.r = easier.Tensor(
-                    torch.rand(9, 3, dtype=torch.float64), dist='replicate')
+                    torch.rand(9, 3, dtype=torch.float64), mode='replicate')
 
         m = M()
         [m] = easier.compile([m], backend='none')
