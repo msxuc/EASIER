@@ -4,10 +4,11 @@
 
 ---
 
-# What is EASIER
+# What is EASIER?
 
+**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers)
+is a domain specific language, compiler and runtime for efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
 Manufacturing engineers and natural science researchers have long suffered from ad-hoc implementations of scientific computing tasks and their hand-craft deployment on clusters.
-EASIER is a domain specific language, compiler and runtime for efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
 
 ## Setup the development environment
 
