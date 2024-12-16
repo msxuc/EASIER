@@ -1,5 +1,10 @@
-<h1> EASIER: Efficient Auto-scalable Scientific Infrastructure
-for Engineers and Researchers</h1>
+<div align="center">
+  <img width="500px" src="tutorial/logo.png"/>
+</div>
+
+---
+
+# What is EASIER
 
 Manufacturing engineers and natural science researchers have long suffered from ad-hoc implementations of scientific computing tasks and their hand-craft deployment on clusters.
 EASIER is a domain specific language, compiler and runtime for efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
