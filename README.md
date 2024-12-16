@@ -6,9 +6,21 @@
 
 # What is EASIER?
 
-**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers)
-is a domain specific language, compiler and runtime for efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
-Manufacturing engineers and natural science researchers have long suffered from ad-hoc implementations of scientific computing tasks and their hand-craft deployment on clusters.
+Manufacturing engineers and natural science researchers have long struggled with ad-hoc implementations of physical simulations and manual deployment on large clusters, preventing them from fully focusing on their products and scientific research.
+**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a domain specific language for
+
+, just-in-time compiler, and high-performance runtime to make development and deployment of physical simulations as easy as that of large language models.
+
+
+
+# Getting Started
+
+Manufacturing engineers and natural science researchers have long struggled with ad-hoc implementations of physical simulations and manual deployment on large-scale clusters, which prevents them from fully focusing on their products and research. **EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a domain-specific language, compiler, and runtime that simplifies the development and deployment of physical simulations, similar to large language models. This saves R&D costs for industries and research labs.
+
+scientific computing tasks and their hand-craft deployment on clusters.
+
+
+ efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
 
 ## Setup the development environment
 
