@@ -46,7 +46,7 @@ class BadDumpFormatException(Exception):
 
     Such specific errors will only be reported to users currently,
     and EASIER will stop loading and compile from the scratch.
-    
+
     TODO format can be corrupted in many detailed ways, such as
     1) bad H5, 2) bad H5 path, 3) unexcepted/missed fields, 4) bad value, etc.
     We only handle a few of the most significant cases.

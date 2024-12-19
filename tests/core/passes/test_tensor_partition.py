@@ -460,6 +460,7 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
     assert_tensor_list_equal(get_call_arg0(next(it)),
                              [g7_w2_to_w0, g7_w2_to_w1, g7_w2_to_w2])
 
+
 def test_naive_mode():
     class M(easier.Module):
         def __init__(self):
@@ -481,7 +482,9 @@ def test_naive_mode():
     g = EasierTracer().trace(m)
     [m], [g] = passes.propagate_metadata([m], [g])  # type: ignore
     [m], [g] = passes.group_tensors([m], [g])  # type: ignore
-    [m], [g] = passes.partition_tensor_groups([m], [g], 'naive')  # type: ignore
+    [m], [g] = passes.partition_tensor_groups(
+        [m], [g], 'naive'
+    )  # type: ignore
     m: M
 
     grpv = m.v.easier_tensor_group

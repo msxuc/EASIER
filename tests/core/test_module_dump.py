@@ -74,7 +74,6 @@ class Model2(esr.Module):
         self.tensor2[:] = res * 1.5
 
 
-
 def _equal_jitted_selector(s1: esr.Selector, s2: esr.Selector):
     assert torch.equal(s1.idx, s2.idx)
     assert s1.easier_index_status == s2.easier_index_status == 'rewritten'
@@ -177,6 +176,7 @@ def worker__test_jitted_shared(
         getattr(jm1a, 'reordering_selector1reducer_src'),
         getattr(jm1b, 'reordering_selector1reducer_src'),
     )
+
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',
