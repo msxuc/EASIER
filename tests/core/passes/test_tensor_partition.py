@@ -357,7 +357,8 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
         return synchronize_partition_result(
             {g5: 0, g6: 9, g7: 9 + 26},  # type: ignore
             9 + 26 + 8,  # per_work=[15, 15, 13]
-            local_membership
+            local_membership,
+            'metis'
         )
 
     g5_w0_to_w0 = vec(0, 1, 6)
@@ -497,3 +498,4 @@ def test_naive_mode():
 
     for k, v in m.easier_elemparts.items():
         assert isinstance(v.idx_desc, ElemPartArangeIdx)
+        assert v.partition_mode == 'naive'
