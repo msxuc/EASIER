@@ -387,6 +387,12 @@ class ElemPart:
     # All lengths are replicated on all workers
     lengths: List[int]
 
+    # The global config for how ElemParts are calculated.
+    # Such "mode" is independent of ElemPartArangeIdx above, which is the
+    # resultant partition for a non-communication TensorGroup, and, may be,
+    # the optimized description for a TensorGroup involved in communication.
+    partition_mode: Literal['metis', 'naive']
+
     hint: str
 
     @functools.cached_property
@@ -406,7 +412,8 @@ class ElemPart:
 def synchronize_partition_result(
     tensor_group_to_matedge_offsets: OrderedDict[EasierTensorGroup, int],
     accum_n: int,
-    local_membership: torch.Tensor
+    local_membership: torch.Tensor,
+    partition_mode: Literal['metis', 'naive']
 ) -> Dict[EasierTensorGroup, ElemPart]:
     """
     Synchronize ParMETIS-partition results ("elempart") into each TensorGroup.
@@ -487,7 +494,10 @@ def synchronize_partition_result(
         elempart_hint = get_elempart_hint(elempart_i, tensor_group)
 
         synced_elemparts[tensor_group] = ElemPart(
-            elempart, elempart_lengths, hint=elempart_hint
+            elempart,
+            elempart_lengths,
+            partition_mode=partition_mode,
+            hint=elempart_hint
         )
 
     # endfor tensor_groups
@@ -498,7 +508,8 @@ def synchronize_partition_result(
 def insert_naive_elemparts(
     modules: Sequence[esr.Module],
     ir_tensor_groups: OrderedSet[EasierTensorGroup],
-    nonnaive_elemparts: Dict[EasierTensorGroup, ElemPart]
+    nonnaive_elemparts: Dict[EasierTensorGroup, ElemPart],
+    partition_mode: Literal['metis', 'naive']
 ):
     """
     A naive ElemPart, or a naive partition, is an evenly distributed partition
@@ -570,6 +581,7 @@ def insert_naive_elemparts(
             all_elemparts[tensor_group] = ElemPart(
                 ElemPartArangeIdx(start, end),
                 lengths,
+                partition_mode=partition_mode,
                 hint=elempart_hint
             )
 
@@ -611,7 +623,9 @@ def partition_tensor_groups(
         comm_elemparts = synchronize_partition_result(
             comm_pairs_collector.tensor_group_to_matedge_offsets,
             comm_pairs_collector.accum_n,
-            local_membership)  # type: ignore
+            local_membership,
+            partition_mode
+        )
     else:
         comm_elemparts = {}
 
@@ -621,7 +635,7 @@ def partition_tensor_groups(
     #   these esr.Tensors may still get collected or saved,
     #   where we need valid elemparts to reconstruct their full data.
     elemparts = insert_naive_elemparts(
-        modules, ir_tensor_groups, comm_elemparts
+        modules, ir_tensor_groups, comm_elemparts, partition_mode
     )
 
     for root in modules:

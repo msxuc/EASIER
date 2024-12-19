@@ -27,7 +27,7 @@ def vec(*longs):
 
 
 def ElemPart(idx, lengths):
-    return _EP_raw(idx, lengths, "NOHINT")
+    return _EP_raw(idx, lengths, 'metis', 'NOHINT')
 
 
 def test_break_reducer_cycle():
