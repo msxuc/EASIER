@@ -392,7 +392,7 @@ class ElemPart:
 
     # The global config for how ElemParts are calculated,
     # and such "mode" is independent of ElemPartArangeIdx above.
-    # (EPArangeIdx is for non-communication TensorGroups, no matter in 
+    # (EPArangeIdx is for non-communication TensorGroups, no matter in
     # partition mode 'metis' or 'naive'. And EPArangeIdx can even serve as
     # an optimized description for a TensorGroup involved in communication)
     #
