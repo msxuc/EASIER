@@ -493,7 +493,6 @@ class ElemPartInfo(JsonBase):
     but does not save bindings for primitives.
     """
     hint: str
-    partition_mode: Literal['metis', 'naive']
 
     elempart_type: Literal[None, 'arange']  # Python None equals JSON null
     h5_group_basepath: str  # e.g. '/elemparts/0:EP:hint'
@@ -504,6 +503,12 @@ class ElemPartInfo(JsonBase):
     parameter_bindings: List[Tuple[int, str]]
 
     lengths: List[int]
+
+    # These fields are dedicated to validation:
+    #
+    # The globally specified `partition_mode` argument to `compile()`,
+    # independent from how a single ElemPart is partitioned/calculated.
+    partition_mode: Literal['metis', 'naive']
 
 
 def dump_elemparts(
@@ -561,11 +566,11 @@ def dump_elemparts(
 
         ep_info = ElemPartInfo(
             hint=elempart.hint,
-            partition_mode=elempart.partition_mode,
             elempart_type=elempart_type,
             h5_group_basepath=grp_basepath,
             parameter_bindings=binding_paths,
-            lengths=elempart.lengths
+            lengths=elempart.lengths,
+            partition_mode=elempart.partition_mode
         )
         result.append(ep_info)
 
