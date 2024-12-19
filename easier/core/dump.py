@@ -41,16 +41,18 @@ from easier.core.utils import logger, get_random_str, EasierJitException
 
 class BadDumpFormatException(Exception):
     """
-    Indicates the input dump file is bad or
+    Indicates the input dump file is corrupted or
     incompatible with the current version of dump/load subprocedure.
 
     Such specific errors will only be reported to users currently,
     and EASIER will stop loading and compile from the scratch.
-
-    TODO format can be corrupted in many detailed ways, such as
-    1) bad H5, 2) bad H5 path, 3) unexcepted/missed fields, 4) bad value, etc.
-    We only handle a few of the most significant cases.
     """
+    # TODO file can be corrupted in many detailed ways, such as
+    # 1) bad H5, 2) bad H5 path, 3) unexcepted/missed field, 4) bad value, etc.
+    # Some will leads to SkipLoadDump handler, while for some others we'd better
+    # treat them as fatal exceptions.
+    #
+    # Now, we only handle a few of the most significant cases.
     pass
 
 
