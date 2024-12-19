@@ -179,7 +179,7 @@ class ReorderingSelectorInserter(EasierInterpreter):
                 reordering_selector.runtime_halos_recv_lengths = \
                     [0] * world_size
                 reordering_selector.easier_index_status = 'rewritten'
-
+                
                 self.reordering_selector_cache[submod] = reordering_selector
 
             # although we could further unify the module attribute name to

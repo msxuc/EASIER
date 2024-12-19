@@ -354,12 +354,17 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
     g7 = EasierTensorGroup(fake_defset, 8,  'g7')  # type: ignore
 
     def run(local_membership: torch.Tensor):
-        return synchronize_partition_result(
+        r = synchronize_partition_result(
             {g5: 0, g6: 9, g7: 9 + 26},  # type: ignore
             9 + 26 + 8,  # per_work=[15, 15, 13]
             local_membership,
             'metis'
         )
+        for k, v in r.items():
+            assert isinstance(v.idx_desc, torch.Tensor)
+            assert v.partition_mode == 'metis'
+
+        return r
 
     g5_w0_to_w0 = vec(0, 1, 6)
     g5_w0_to_w1 = vec(2, 3, 7)
