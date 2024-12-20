@@ -874,10 +874,10 @@ def load_dumps(
 
     except _SkipLoadingDump as skip:
         fail_reason = skip.args[0]
-        logger.warning('\n'.join([
+        logger.warning(''.join([
             "Skip loading dump and will compile from scratch.",
-            f"Because: {fail_reason}." if fail_reason is not None else "",
-            "Please set EASIER_LOG_LEVEL=DEBUG for details"
+            f" Because: {fail_reason}." if fail_reason is not None else "",
+            "\nPlease set EASIER_LOG_LEVEL=DEBUG for details"
         ]))
         return None
 
