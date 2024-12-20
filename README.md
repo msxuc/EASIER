@@ -9,6 +9,11 @@
 Manufacturing engineers and natural science researchers have long struggled with ad-hoc implementations of physical simulations and manual deployment on large clusters, preventing them from fully focusing on their products and scientific research.
 **EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a domain specific language for
 
+**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is an open-source parallel programming language for scientific computing at scale.
+It is embedded in PyTorch and uses just-in-time (JIT) compiler to automatically scale scientific computing tasks, especially physical simulations,
+
+Taichi Lang is an open-source, imperative, parallel programming language for high-performance numerical computation. It is embedded in Python and uses just-in-time (JIT) compiler frameworks, for example LLVM, to offload the compute-intensive Python code to the native GPU or CPU instructions.
+
 , just-in-time compiler, and high-performance runtime to make development and deployment of physical simulations as easy as that of large language models.
 
 
