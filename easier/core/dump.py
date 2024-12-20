@@ -217,7 +217,9 @@ def _get_current_global_config():
     return config
 
 
-def _coll_check(expect: bool, ex_ctor: Type[Exception], ex_msg: str):
+def _coll_check(
+    expect: bool, ex_ctor: Type[Exception], ex_msg: Optional[str] = None
+):
     """
     Collectively decide if:
     -   arguments to `.load()` is wrong; cache format is interrupted
@@ -827,63 +829,56 @@ def load_dumps(
     jit_dir = os.path.join(dump_dir, 'jit')
 
     try:
-        valid_format = True
-        if rank == 0:
-            try:
-                jit_fpath0 = os.path.join(jit_dir, 'jit_0.hdf5')
-                with h5py.File(jit_fpath0, 'r') as jit_f0:
-                    dump_info = _deserialize_json_dataset(
-                        jit_f0, H5_DATASET_DUMP_INFO, EasierDump
-                    )
-            except BadDumpFormatException as bad_format:
-                logger.debug(str(bad_format.args[0]))
-                valid_format = False
+        def _rank0_checks() -> Optional[str]:
+            """
+            Do multiple stages of checks, on rank-0 only.
+            Return early for any issue detected and return failure reason.
+            """
+            jit_fpath0 = os.path.join(jit_dir, 'jit_0.hdf5')
+            with h5py.File(jit_fpath0, 'r') as jit_f0:
+                dump_info = _deserialize_json_dataset(
+                    jit_f0, H5_DATASET_DUMP_INFO, EasierDump
+                )
 
-        _coll_check(
-            valid_format,
-            _SkipLoadingDump,
-            'Dump is incompatible or is corrupted'
-        )
-
-        if rank == 0:
             cur_global_config = _get_current_global_config()
             global_config_is_same = \
                 dump_info.global_config == cur_global_config
-
             if not global_config_is_same:
                 logger.debug(
                     f'{dump_info.global_config} => {cur_global_config}'
                 )
-        else:
-            global_config_is_same = True
+                return "Compilation environment changes"
 
-        _coll_check(
-            global_config_is_same,
-            _SkipLoadingDump,
-            'Compilation environment changes.'
-        )
-
-        if rank == 0:
-            # We have validate graphs are same SPMD in jit.py, so we only
+            # We have validated graphs are same SPMD in jit.py, so we only
             # do loading-time validation on rank-0.
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_valid = rank0_validates_dumps(
                     modules, raw_graphs, jit_f0, dump_info, partition_mode
                 )
-        else:
-            dump_valid = True
+            if not dump_valid:
+                return "Dump does not match user programs"
 
-        _coll_check(
-            dump_valid,
-            _SkipLoadingDump,
-            "Dump does not match user programs."
-        )
+            return None
+        # end def _check_rank0()
+
+        if rank == 0:
+            try:
+                fail_reason = _rank0_checks()
+            except BadDumpFormatException as bad_format:
+                logger.debug(str(bad_format.args[0]))
+                fail_reason = "Dump is incompatible or is corrupted"
+        else:
+            fail_reason = None
+
+        _coll_check(fail_reason == None, _SkipLoadingDump, fail_reason)
+
     except _SkipLoadingDump as skip:
-        logger.warning(
-            "Skip loading dump and will compile from scratch,"
-            f" because: {skip.args[0]}"
-            '\nPlease set EASIER_LOG_LEVEL=DEBUG for details'
-        )
+        fail_reason = skip.args[0]
+        logger.warning('\n'.join([
+            "Skip loading dump and will compile from scratch.",
+            f"Because: {fail_reason}." if fail_reason is not None else "",
+            "Please set EASIER_LOG_LEVEL=DEBUG for details"
+        ]))
         return None
 
     # After basic global and session checks finish, scatter rank-based dumps
