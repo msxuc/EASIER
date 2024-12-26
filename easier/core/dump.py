@@ -689,9 +689,6 @@ class HaloExchangerInfo(JsonBase):
     # properties to reconstruct HaloXchg instance
     input_elempart_length: int
 
-    # torch.dtype is not serializable by default
-    dtype_str: str  # 'int64' 'float64' etc. without 'torch.' namespace
-
 
 @dataclasses.dataclass
 class ModuleInfo(JsonBase):
@@ -715,10 +712,8 @@ class HaloXchgBindingsCollector(EasierInterpreter):
             self.halo_exchangers_bindings[self.callee_module_path] = \
                 HaloExchangerInfo(
                     bound_prim_path=submod.parent_primitive,
-                    input_elempart_length=submod.input_elempart_length,
-                    # str() == 'torch.int64' => 'int64'
-                    dtype_str=str(submod.chunk_dtype).split('.')[1]
-            )
+                    input_elempart_length=submod.input_elempart_length
+                )
 
 
 class ConstantsCollector(EasierInterpreter):
@@ -1243,7 +1238,6 @@ def load_modules(
                 input_elempart_length=haloxhcg_info.input_elempart_length,
                 runtime_halos_lidxes=prim.runtime_halos_local_idxes,
                 runtime_recv_lengths=prim.runtime_halos_recv_lengths,
-                dtype=getattr(torch, haloxhcg_info.dtype_str),
                 parent_primitive=haloxhcg_info.bound_prim_path
             )
             assert inst.is_needed

@@ -11,8 +11,6 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-from easier.core.passes.metadata_propagation.metadata import \
-    EasierTensorMeta, Role, get_node_meta
 
 from easier.core.utils import \
     logger, EasierJitException
@@ -67,10 +65,17 @@ def _get_group_hint(root, attrpath):
 
 class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
     """
-    Each Node is interpreted to at most one single TensorDef.
+    A TensorDef is an instance of partitioned esr.Tensor or a Node for the
+    intermediate result of Selectors/Reducer.
+    Multiple TensorDefs are yet to be equivalent and forms a TensorGroup,
+    all components in that TensorGroup will share the same partition.
 
+    Each Node is interpreted to at most one single TensorDef.
     That is, even if the Node is a multiple-output operation,
-    all its output distributed tensors belong to the same TensorGroup.
+    all its output distributed tensors are equally seen as the same TensorDef
+    and will belong to the same TensorGroup.
+
+    Replicated Nodes do not have TensorDef or TensorGroup.
     """
 
     def __init__(self, modules: Sequence[esr.Module], graphs: Sequence[Graph]):
@@ -79,11 +84,13 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         # Inputs to Selector/Reducer are equivalent based on the
         # instances of Selector/Reducer modules. Even those inputs
         # never meet each other in batched operations.
-        # And we only store one such Node as the representative.
-        self.selector_input_equiv: Dict[torch.nn.Module, EasierTensorDef] = {}
-        self.reducer_input_equiv: Dict[torch.nn.Module, EasierTensorDef] = {}
+        # And we only store one such TensorDef as the representative.
+        self.input_equiv: Dict[
+            Union[esr.Selector, esr.Reducer],
+            EasierTensorDef
+        ] = {}
 
-        # Some Nodes, like those for replicas, do not have a _TensorDef
+        # Having TensorDef bound or not is essentially a Role indicator.
         self.node2def: Dict[Node, Optional[EasierTensorDef]] = {}
 
         # The equivalency explicitly excludes None (i.e. replica Nodes)
@@ -95,14 +102,25 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
     def set_equivalent(self, defs: Sequence[Optional[EasierTensorDef]]
                        ) -> Optional[EasierTensorDef]:
         """
-        Set equivalency over TensorGroups (i.e. the non-Nones).
+        Set equivalency over TensorDefs (i.e. the non-Nones).
 
-        Return an arbitrary TensorGroup within the equivalent set, or None if
-        no TensorGroups are input.
+        Will check if those TensorDefs have the same batch sizes.
+
+        Return an arbitrary TensorDef within the equivalent set, or None if
+        no TensorDefs are input.
         """
         dset: List[EasierTensorDef] = list(
             filter(lambda d: d is not None, defs)
         )  # type: ignore
+
+        batch_sizes = set(map(_get_tensordef_batch_size, dset))
+        if len(batch_sizes) > 1:  # may be 0 if no distributed defs
+            hint_op_name = str(self.current_node.target)
+            raise EasierJitException(
+                # TODO hint the name
+                f"Input distributed tensors to {hint_op_name}" 
+                " do not have the smae batch size"
+            )
 
         self.group_dset.union(*dset)
         if len(dset) > 0:
@@ -130,28 +148,21 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         else:
             return None
 
-    def if_function_or_method(self, op_callable):
-        # Only if the resultant metadata (even part of the multi-output)
-        # indicates it's distributed do we
-        # assume the output TensorGroup equivalency.
-        output_roles: Set[Role] = set()
+    def if_function_or_method(self, op_callable) -> Optional[EasierTensorDef]:
+        input_defs = [
+            self.node2def[arg] for arg in self.current_node.all_input_nodes
+        ]
+        # It's ok to pass Nones (i.e. Replicas) to `set_equivalent`.
+        # The resultant representative rep_input_def is not None, if any input
+        # is distributed. Otherwise it's None, meaning inputs are replica.
+        rep_input_def = self.set_equivalent(input_defs)
 
-        def _collect_output_roles(x):
-            assert isinstance(x, EasierTensorMeta)
-            output_roles.add(x.role)
+        if op_callable in esr.easier_aggregators:
+            # esr.sum etc. results are always replica, no TensorDef.
             return None
-        node_meta = get_node_meta(self.current_node)
-        _ = tree_map(node_meta, _collect_output_roles)
-
-        if Role.PARTITION in output_roles:
-            # We must explicitly exclude e.g. replica Nodes otherwise we are
-            # building wrong equivalency.
-            input_defs = [self.node2def[arg]
-                          for arg in self.current_node.all_input_nodes]
-            # And it's ok to pass Nones to `set_equivalent`.
-            return self.set_equivalent(input_defs)
         else:
-            return None
+            return rep_input_def  # follow whatever TensorDef of the inputs
+
 
     def if_call_module(self, module: torch.nn.Module):
         args = self.current_node.args
@@ -161,7 +172,6 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         if isinstance(module, esr.Selector):
             input_node = \
                 normalize_selector_call_into_args(*args, **kwargs)
-            in_equivs = self.selector_input_equiv
 
         elif isinstance(module, esr.Reducer):
             input_node, opt_inplace_out_node = \
@@ -169,8 +179,6 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
 
             if isinstance(opt_inplace_out_node, Node):
                 inplace_out_def = self.node2def[opt_inplace_out_node]
-
-            in_equivs = self.reducer_input_equiv
 
         else:
             raise EasierJitException(
@@ -180,25 +188,37 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
 
         assert isinstance(input_node, Node)
         input_def = self.node2def[input_node]
-        assert input_def is not None
 
-        if module in in_equivs:
-            prev_input_tensordef = in_equivs[module]
-            self.set_equivalent([prev_input_tensordef, input_def])
+        if input_def is None:
+            raise EasierJitException("CANNOT call on replica")
+        in_size = _get_tensordef_batch_size(input_def)
 
-            # Check input batch shape consistency
-            # (mainly for Selector)
-            imeta: EasierTensorMeta = get_node_meta(input_node)  # type: ignore
-            n = _get_tensordef_batch_size(prev_input_tensordef)
-            if n != imeta.shape[0]:
+        if isinstance(module, esr.Selector):
+            if not (module.idx_max < in_size):
+                raise EasierJitException("BAD Selecotr input")
+        if isinstance(module, esr.Reducer):
+            if in_size != module.idx.shape[0]:
+                raise EasierJitException("BAD Reducer input")
+
+        if module in self.input_equiv:
+            # Inputs are put into the same TensorGroup even those input
+            # tensors never meet in a batched/Mapped op.
+            prev_input_tensordef = self.input_equiv[module]
+
+            # Check input batch size consistency for Selectors
+            # (input sizes for Reducer have been indirectly checked above)
+            prev_in_szie = _get_tensordef_batch_size(prev_input_tensordef)
+            if prev_in_szie != in_size:
                 raise EasierJitException(
-                    f"A tensor with batch size {imeta.shape[0]} is passed to"
+                    f"A tensor with batch size {in_size} is passed to"
                     f" {module.__class__.__name__}"
                     f" at {self.current_node.target} which was previously"
-                    f" taking tensors with batch size {n} as input")
+                    f" taking tensors with batch size {prev_in_szie} as input")
+
+            self.set_equivalent([prev_input_tensordef, input_def])
 
         else:
-            in_equivs[module] = input_def
+            self.input_equiv[module] = input_def
 
         # module instance itself is always the TensorDef for call_module Nodes
         self.set_equivalent([module, inplace_out_def])
@@ -212,7 +232,9 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
     -   if they are operands to the same batched operation.
     -   if they are inputs/ouputs of the same Selector/Reducer instance.
 
-    NOTE this pass must be run after metadata propagation.
+    Also:
+    -   check if Role transition is correct.
+    -   check if all Selector/Reducer.idx.shape[0] are compatible.
     """
     tensor_grouper = TensorGrouper(modules, graphs)
     tensor_grouper.run()
