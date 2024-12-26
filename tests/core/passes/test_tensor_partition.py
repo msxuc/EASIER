@@ -485,7 +485,6 @@ def test_naive_mode():
 
     m = M()
     g = EasierTracer().trace(m)
-    [m], [g] = passes.propagate_metadata([m], [g])  # type: ignore
     [m], [g] = passes.group_tensors([m], [g])  # type: ignore
     [m], [g] = passes.partition_tensor_groups(
         [m], [g], 'naive'

@@ -314,26 +314,21 @@ def compile(
         graphs = loaded_graphs
     else:
         # passes
-        modules, graphs = passes.propagate_metadata(modules, graphs)
         modules, graphs = passes.group_tensors(modules, graphs)
 
         # After bind_reducer, new Selector instances and Nodes are inserted,
         # they will form new TensorGroups.
         modules, graphs = passes.bind_reducer(modules, graphs)
-        modules, graphs = passes.propagate_metadata(modules, graphs)
         modules, graphs = passes.group_tensors(modules, graphs)
 
-        modules, graphs = passes.analyze_data_dependency(modules, graphs)
+        # modules, graphs = passes.analyze_data_dependency(modules, graphs)
 
         modules, graphs = passes.partition_tensor_groups(
             modules, graphs, partition_mode
         )
         modules, graphs = passes.encode_sparsity(modules, graphs)
 
-        # After distribution, do another metadata propagaton
-        # to infer partitioned tensor shapes.
         modules, graphs = passes.distribute_dataflow(modules, graphs)
-        modules, graphs = passes.propagate_metadata(modules, graphs)
 
         # modules, graphs = passes.fuse_dataflow(modules, graphs)
 

@@ -12,11 +12,6 @@ from torch.fx.node import Node
 from easier.core.jit import EasierTracer
 
 from easier.core.module import Selector, Reducer, Tensor
-from easier.core.passes.metadata_propagation.metadata import \
-    INT32, EasierTensorMeta, EasierTensorMeta, \
-    Role, ScalarType
-from easier.core.passes.metadata_propagation.utils import \
-    Validation as V
 from easier.core.passes.tensor_grouping import \
     EasierTensorDef, EasierTensorGroup, get_node_tensor_group
 from easier.core import passes
@@ -67,7 +62,6 @@ def test_tensor_grouping__simple():
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
     [jm], [graph] = passes.group_tensors([m], [graph])
 
     g0 = set([m.v1, m.v3])
@@ -112,7 +106,6 @@ def test_tensor_grouping__simple():
     _assert(v3,         g0,     'v3')
     # This shares the same Selector instance with `s55_33(v1)`, so Group-3
     _assert(s55_33_eI,  g3,     's55_33')
-    assert V.assert_non_structured(sum).role == Role.REPLICA
     assert get_node_tensor_group(sum) is None
     _assert(add_eII,    g3,     operator.add)
 
@@ -143,7 +136,6 @@ def test_tensor_grouping__cross_graph():
     m1, m2 = M1(), M2()
     g1 = EasierTracer().trace(m1)
     g2 = EasierTracer().trace(m2)
-    [jm1, jm2], [g1, g2] = passes.propagate_metadata([m1, m2], [g1, g2])
     [jm1, jm2], [g1, g2] = passes.group_tensors([m1, m2], [g1, g2])
 
     g = set([v1, v2, v3])
