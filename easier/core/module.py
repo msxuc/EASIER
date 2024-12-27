@@ -206,12 +206,15 @@ def _validate_idx_dataloader(module: Union['Selector', 'Reducer']):
             # Aborting one rank-0 will kill all processes and surpass barriers.
             cpu_dist_env.abort()
 
-        [idxmax] = cpu_dist_env.broadcast_object_list(0, [idxmax])
 
     else:  # rank != 0
-        [idxmax] = cpu_dist_env.broadcast_object_list(0)
+        idxmax = -1  # does not matter
 
-    module.idx_max = idxmax
+    # NOTE this bcast() also serves as a collective barrier.
+    [idxmax] = cpu_dist_env.broadcast_object_list(0, [idxmax])
+
+    if isinstance(module, Selector):
+        module.idx_max = idxmax
 
 
 
@@ -264,6 +267,9 @@ class Selector(nn.Module):
             )
             self.idx = idx
             self.easier_index_status = 'rewritten'
+
+            # self.idx_max is not needed for noncollective Selectors
+
             # Let related passes to fill other JIT-only fields.
 
             return
@@ -275,7 +281,8 @@ class Selector(nn.Module):
 
         self.idx: torch.Tensor = idx_ph
 
-        # Collectively figured out in _validate_idx_dataloader
+        # The maximum index of the original idx data loader,
+        # collectively figured out in _validate_idx_dataloader
         self.idx_max: int
 
         self.easier_index_status: IdxStatus = 'placeholder'
@@ -299,6 +306,9 @@ class Selector(nn.Module):
         if self.easier_index_status != 'rewritten':
             raise RuntimeError("Selector.idx not ready, run compile() first")
 
+        # NOTE at backend==none runtime,
+        # bad cases like `not(self.idx_max < tensor.shape[0])` will be
+        # thrown and reported by the tensor indexing operation.
         return tensor[self.idx]
 
     def to(self, *args, **kwargs):
@@ -327,9 +337,6 @@ class Reducer(nn.Module):
         idx_ph: torch.Tensor = idx_dl.get_placeholder()
 
         self.idx: torch.Tensor = idx_ph
-
-        # Collectively figured out in _validate_idx_dataloader
-        self.idx_max: int
 
         self.easier_index_status: IdxStatus = 'placeholder'
 

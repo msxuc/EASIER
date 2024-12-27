@@ -99,8 +99,11 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
 
         self.defhints: Dict[EasierTensorDef, str] = {}
 
-    def set_equivalent(self, defs: Sequence[Optional[EasierTensorDef]]
-                       ) -> Optional[EasierTensorDef]:
+    def set_equivalent(
+        self,
+        defs: Sequence[Optional[EasierTensorDef]],
+        def_srcs_hint: Optional[str] = None
+    ) -> Optional[EasierTensorDef]:
         """
         Set equivalency over TensorDefs (i.e. the non-Nones).
 
@@ -115,11 +118,14 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
 
         batch_sizes = set(map(_get_tensordef_batch_size, dset))
         if len(batch_sizes) > 1:  # may be 0 if no distributed defs
-            hint_op_name = str(self.current_node.target)
             raise EasierJitException(
-                # TODO hint the name
-                f"Input distributed tensors to {hint_op_name}" 
-                " do not have the smae batch size"
+                "Distributed tensors do not have the same length"
+                " for their first dimensions"
+                + (
+                    f": {def_srcs_hint}"
+                    if def_srcs_hint is not None
+                    else ""
+                )
             )
 
         self.group_dset.union(*dset)
@@ -141,8 +147,9 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
                 )
             )
 
-    def if_get_attr(self, submod_path, attr_name, attr_val
-                    ) -> Optional[EasierTensorDef]:
+    def if_get_attr(
+        self, submod_path, attr_name, attr_val
+    ) -> Optional[EasierTensorDef]:
         if isinstance(attr_val, esr.Tensor) and attr_val.is_partition:
             return self.set_equivalent([attr_val])
         else:
@@ -190,38 +197,46 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         input_def = self.node2def[input_node]
 
         if input_def is None:
-            raise EasierJitException("CANNOT call on replica")
+            raise EasierJitException(
+                f"{type(module)} cannot be called on replicated tensors"
+            )
         in_size = _get_tensordef_batch_size(input_def)
 
         if isinstance(module, esr.Selector):
             if not (module.idx_max < in_size):
-                raise EasierJitException("BAD Selecotr input")
+                raise EasierJitException(
+                    "Selector.idx is out of bounds for the"
+                    " input distributed tensor"
+                )
         if isinstance(module, esr.Reducer):
             if in_size != module.idx.shape[0]:
-                raise EasierJitException("BAD Reducer input")
+                raise EasierJitException(
+                    "The length of the first dimension of the"
+                    " input distributed tensor to Reducer does not match"
+                    " the length of of Reducer.idx"
+                )
 
         if module in self.input_equiv:
             # Inputs are put into the same TensorGroup even those input
             # tensors never meet in a batched/Mapped op.
             prev_input_tensordef = self.input_equiv[module]
 
-            # Check input batch size consistency for Selectors
-            # (input sizes for Reducer have been indirectly checked above)
-            prev_in_szie = _get_tensordef_batch_size(prev_input_tensordef)
-            if prev_in_szie != in_size:
-                raise EasierJitException(
-                    f"A tensor with batch size {in_size} is passed to"
-                    f" {module.__class__.__name__}"
-                    f" at {self.current_node.target} which was previously"
-                    f" taking tensors with batch size {prev_in_szie} as input")
-
-            self.set_equivalent([prev_input_tensordef, input_def])
+            self.set_equivalent(
+                [prev_input_tensordef, input_def],
+                def_srcs_hint=
+                    "Input tensors at different calls to the same operator"
+                    f" {self.current_node.target}"
+            )
 
         else:
             self.input_equiv[module] = input_def
 
         # module instance itself is always the TensorDef for call_module Nodes
-        self.set_equivalent([module, inplace_out_def])
+        # and the batch size of the optional `out` is checked in `set_equiv()`
+        self.set_equivalent(
+            [module, inplace_out_def],
+            def_srcs_hint="Reducer itself and its out argument"
+        )
 
         return module
 

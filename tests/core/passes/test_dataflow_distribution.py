@@ -120,7 +120,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_length is None
+        assert haloxchg.chunk_length == 8
 
     assert getattr_v.op == FX.GET_ATTR
     assert call_selector.op == FX.CALL_MODULE
