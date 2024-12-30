@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from .syntax_check import check_syntax
 from .tensor_grouping import group_tensors
 from .reducer_binding import bind_reducer
 from .tensor_partition import partition_tensor_groups

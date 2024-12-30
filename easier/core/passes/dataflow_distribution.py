@@ -80,6 +80,9 @@ class HaloExchangerInserter(EasierInterpreter):
         self.haloxchg_name_allocator = SubmodNameAllocator('haloexchanger')
 
     def if_call_module(self, submod: torch.nn.Module):
+        if isinstance(submod, esr.Module):  # nested esr.Module calls
+            return
+
         root = self.current_module
         node = self.current_node
 
@@ -227,9 +230,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
     """
 
     def if_call_function(self, function):
-        if function not in [
-            esr.sum, esr.prod, esr.norm, esr.max, esr.min
-        ]:
+        if function not in esr.easier_aggregators:
             return
 
         node = self.current_node
