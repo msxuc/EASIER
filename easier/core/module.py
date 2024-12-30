@@ -206,7 +206,6 @@ def _validate_idx_dataloader(module: Union['Selector', 'Reducer']):
             # Aborting one rank-0 will kill all processes and surpass barriers.
             cpu_dist_env.abort()
 
-
     else:  # rank != 0
         idxmax = -1  # does not matter
 
@@ -215,7 +214,6 @@ def _validate_idx_dataloader(module: Union['Selector', 'Reducer']):
 
     if isinstance(module, Selector):
         module.idx_max = idxmax
-
 
 
 def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
@@ -496,7 +494,6 @@ class Tensor(nn.Parameter):
         # Only tensors that are distributed and used has this field set.
         self.elempart: 'Optional[ElemPart]' = None
 
-
     def __repr__(self) -> str:
         if self.is_replica:
             if not self.easier_data_ready:
@@ -510,7 +507,6 @@ class Tensor(nn.Parameter):
             else:
                 repr_str = ''
             return 'Managed partitioned easier.Tensor' + repr_str
-
 
     def __setitem__(self, indices, val) -> 'Tensor':
         """
