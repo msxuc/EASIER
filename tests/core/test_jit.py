@@ -140,14 +140,17 @@ def test_nested_easier_modules():
             self.v = esr.Tensor(torch.ones(10), mode='partition')
             self.s = esr.Selector(torch.arange(10))
             self.r = esr.Reducer(torch.arange(10), 10)
+
         def forward(self):
             self.v[:] = self.r(self.s(self.v))
+
     class Outer(esr.Module):
         def __init__(self):
             super().__init__()
             self.inner = Inner()
             self.s = esr.Selector(torch.arange(10))
             self.r = esr.Reducer(torch.arange(10), 10)
+
         def forward(self):
             k = self.s(self.inner.v)
             self.inner()

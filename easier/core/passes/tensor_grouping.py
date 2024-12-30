@@ -170,7 +170,6 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         else:
             return rep_input_def  # follow whatever TensorDef of the inputs
 
-
     def if_call_module(
         self, module: torch.nn.Module
     ) -> Optional[EasierTensorDef]:
@@ -228,9 +227,10 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
 
             self.set_equivalent(
                 [prev_input_tensordef, input_def],
-                def_srcs_hint=
+                def_srcs_hint=(
                     "Input tensors at different calls to the same operator"
                     f" {self.current_node.target}"
+                )
             )
 
         else:

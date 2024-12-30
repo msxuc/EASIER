@@ -41,7 +41,6 @@ class SyntaxChecker(EasierInterpreter):
                     f"Unexpected function call to {function}"
                 )
 
-
     def if_call_module(self, submod: nn.Module):
         if isinstance(submod, _EsrMod.Module):
             # Ok to have nodes of calls to nested esr.Module, which prevents
@@ -58,7 +57,7 @@ class SyntaxChecker(EasierInterpreter):
                 )
 
         elif isinstance(submod, (_EsrMod.Selector, _EsrMod.Reducer)):
-            pass 
+            pass
 
         else:
             raise EasierJitException(
@@ -66,12 +65,12 @@ class SyntaxChecker(EasierInterpreter):
                 " torch.nn.functional function instead"
             )
 
-
     def if_output(self):
         if self.current_node.args != (None,):
             raise EasierJitException(
                 "easier.Module.forward() cannot have return value"
             )
+
 
 def check_syntax(modules, graphs):
     """

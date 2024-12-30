@@ -63,7 +63,7 @@ class HaloExchanger(torch.nn.Module):
         # Both send and recv lengths do not count the local-to-local comm.
         self.total_recv_length: int
         self.total_send_length: int
-        
+
         # None means we don't need to concat into the chunk.
         self.chunk_length: Optional[int]
 
