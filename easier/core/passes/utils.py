@@ -27,8 +27,6 @@ import easier.core.module as esr
 from easier.core.runtime.dist_env import DistEnv, get_cpu_dist_env
 from easier.core.utils import EasierJitException
 
-if TYPE_CHECKING:
-    from easier.core.passes.tensor_partition import ElemPart
 
 _T = TypeVar("_T")
 

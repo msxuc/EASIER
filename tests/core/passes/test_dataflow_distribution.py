@@ -12,7 +12,7 @@ from torch.fx.node import Node
 from easier.core import passes
 from easier.core.jit import EasierTracer
 from easier.core.passes.tensor_grouping import EasierTensorGroup
-from easier.core.passes.tensor_partition import ElemPart as _EP_raw
+from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.runtime.dist_env import DistEnv
 from easier.core.module import Selector, Reducer

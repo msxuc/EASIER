@@ -14,7 +14,7 @@ from easier.core.jit import EasierTracer
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.runtime.dist_env import DistEnv
-from easier.core.passes.tensor_partition import \
+from easier.core.passes.tensor_group_partition import \
     CommPair, partition_tensor_groups_with_adjmat, parallel_partition_graph, \
     synchronize_partition_result, get_cpu_dist_env, ElemPartArangeIdx
 from easier.core.passes.tensor_grouping import \

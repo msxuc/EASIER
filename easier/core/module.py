@@ -30,7 +30,7 @@ from easier.core.utils import logger, get_random_str
 
 
 if TYPE_CHECKING:
-    from easier.core.passes.tensor_partition import ElemPart
+    from easier.core.passes.tensor_group_partition import ElemPart
     from easier.core.passes.tensor_grouping import EasierTensorGroup
 
 

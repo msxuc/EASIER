@@ -11,7 +11,6 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-from easier.core.passes.tensor_partition import ElemPart
 from easier.core.passes.metadata_propagation.metadata import \
     EasierTensorMeta, Role, get_node_meta
 
