@@ -24,7 +24,7 @@ import easier.core.module as esr
 from easier.core.module import Module, Selector, Reducer
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.tensor_group_partition import \
-    ElemPart, partition_tensor_groups, insert_naive_elemparts
+    ElemPart
 from easier.core.passes.metadata_propagation.metadata import \
     EasierTensorMeta, Role, convert_scalar_type_to_torch_dtype, \
     set_node_meta, get_node_meta
@@ -179,7 +179,7 @@ class ReorderingSelectorInserter(EasierInterpreter):
                 reordering_selector.runtime_halos_recv_lengths = \
                     [0] * world_size
                 reordering_selector.easier_index_status = 'rewritten'
-                
+
                 self.reordering_selector_cache[submod] = reordering_selector
 
             # although we could further unify the module attribute name to

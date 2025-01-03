@@ -358,11 +358,9 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
             {g5: 0, g6: 9, g7: 9 + 26},  # type: ignore
             9 + 26 + 8,  # per_work=[15, 15, 13]
             local_membership,
-            'metis'
         )
         for k, v in r.items():
             assert isinstance(v.idx_desc, torch.Tensor)
-            assert v.partition_mode == 'metis'
 
         return r
 
@@ -484,11 +482,12 @@ def test_naive_mode():
             self.r(v3, out=self.v)
 
     m = M()
+    m.partition_mode = 'naive'
     g = EasierTracer().trace(m)
     [m], [g] = passes.propagate_metadata([m], [g])  # type: ignore
     [m], [g] = passes.group_tensors([m], [g])  # type: ignore
     [m], [g] = passes.partition_tensor_groups(
-        [m], [g], 'naive'
+        [m], [g]
     )  # type: ignore
     m: M
 
@@ -506,4 +505,3 @@ def test_naive_mode():
 
     for k, v in m.easier_elemparts.items():
         assert isinstance(v.idx_desc, ElemPartArangeIdx)
-        assert v.partition_mode == 'naive'

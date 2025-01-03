@@ -509,12 +509,6 @@ class ElemPartInfo(JsonBase):
 
     lengths: List[int]
 
-    # These fields are dedicated to validation:
-    #
-    # The globally specified `partition_mode` argument to `compile()`,
-    # independent from how a single ElemPart is partitioned/calculated.
-    partition_mode: Literal['metis', 'naive']
-
 
 def dump_elemparts(
     modules: List[esr.Module], h5_ep_root: h5py.Group
@@ -575,7 +569,6 @@ def dump_elemparts(
             h5_group_basepath=grp_basepath,
             parameter_bindings=binding_paths,
             lengths=elempart.lengths,
-            partition_mode=elempart.partition_mode
         )
         result.append(ep_info)
 
@@ -703,6 +696,12 @@ class ModuleInfo(JsonBase):
 
     halo_exchangers_bindings: Dict[str, HaloExchangerInfo]
 
+    # These fields are dedicated to validation:
+    #
+    # The globally specified `partition_mode` argument to `compile()`
+    # and is also set on esr.Module itself.
+    partition_mode: Literal['metis', 'naive']
+
 
 class HaloXchgBindingsCollector(EasierInterpreter):
     def __init__(self, modules, graphs) -> None:
@@ -785,7 +784,8 @@ def dump_modules(
         mod_info = ModuleInfo(
             h5_group_basepath=grp_basepath,
             constant_names=list(const_coll.constant_values.keys()),
-            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings
+            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings,
+            partition_mode=mod.partition_mode
         )
         results.append(mod_info)
 
@@ -809,8 +809,7 @@ def _get_data_loader_repr(data_loader: DataLoaderBase) -> Tuple[
 def load_dumps(
     modules: List[esr.Module],
     dump_dir: str,
-    raw_graphs: List[Graph],
-    partition_mode: Literal['metis', 'naive']
+    raw_graphs: List[Graph]
 ) -> Optional[List[Graph]]:
     """
     This is not a user API.
@@ -854,7 +853,7 @@ def load_dumps(
             # do loading-time validation on rank-0.
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_valid = rank0_validates_dumps(
-                    modules, raw_graphs, jit_f0, dump_info, partition_mode
+                    modules, raw_graphs, jit_f0, dump_info
                 )
             if not dump_valid:
                 return "Dump does not match user programs"
@@ -991,7 +990,6 @@ def rank0_validates_dumps(
     raw_graphs: List[Graph],
     h5root: h5py.Group,
     dump_info: EasierDump,
-    partition_mode: Literal['metis', 'naive']
 ) -> bool:
     """
     Rank-0 validates its own dump (i.e. 'jit_0.hdf5').
@@ -1028,11 +1026,11 @@ def rank0_validates_dumps(
     if ir_changes:
         return False
 
-    for ep_info in dump_info.elemparts:
-        if ep_info.partition_mode != partition_mode:
+    for mod, mod_info in zip(modules, dump_info.modules):
+        if mod_info.partition_mode != mod.partition_mode:
             logger.debug(
                 "Partition mode changes:"
-                f" {ep_info.partition_mode} => {partition_mode}"
+                f" {mod_info.partition_mode} => {mod.partition_mode}"
             )
             return False
 
@@ -1145,7 +1143,6 @@ def load_elemparts(
             idx_desc=idx_desc,
             lengths=ep_info.lengths,
             hint=ep_info.hint,
-            partition_mode=ep_info.partition_mode
         )
 
         for rooti, tensorpath in ep_info.parameter_bindings:
