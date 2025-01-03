@@ -4,7 +4,7 @@
 from .syntax_check import check_syntax
 from .tensor_grouping import group_tensors
 from .reducer_binding import bind_reducer
-from .tensor_partition import partition_tensor_groups
+from .tensor_group_partition import partition_tensor_groups
 from .sparse_encoding import encode_sparsity
 from .dataflow_distribution import distribute_dataflow
 # from .dataflow_fusion import fuse_dataflow

@@ -31,7 +31,8 @@ from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
-from easier.core.passes.tensor_partition import ElemPart, ElemPartArangeIdx
+from easier.core.passes.tensor_group_partition import \
+    ElemPart, ElemPartArangeIdx
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.dataflow_distribution import \
     ConstantTensorMover, load_replicated_tensors_from_source, \
