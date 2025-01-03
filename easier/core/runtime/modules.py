@@ -134,7 +134,8 @@ class HaloExchanger(torch.nn.Module):
 
         if self.chunk_v != None:
             prev_subshape = tuple(self.chunk_v.shape[1:])
-            if prev_subshape == element_tensor_shape:
+            if prev_subshape == element_tensor_shape \
+            and self.chunk_v.dtype == dtype:
                 return
 
         def _get_buffer_shape(batchsize: int):
