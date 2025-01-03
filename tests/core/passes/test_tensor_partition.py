@@ -464,7 +464,7 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
                              [g7_w2_to_w0, g7_w2_to_w1, g7_w2_to_w2])
 
 
-def test_naive_mode():
+def test_evenly_mode():
     class M(easier.Module):
         def __init__(self):
             super().__init__()
@@ -482,7 +482,7 @@ def test_naive_mode():
             self.r(v3, out=self.v)
 
     m = M()
-    m.partition_mode = 'naive'
+    m.partition_mode = 'evenly'
     g = EasierTracer().trace(m)
     [m], [g] = passes.propagate_metadata([m], [g])  # type: ignore
     [m], [g] = passes.group_tensors([m], [g])  # type: ignore

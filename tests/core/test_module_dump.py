@@ -102,14 +102,14 @@ def worker__test_jitted_dump(
 
     m = Model(3, model_dev)  # type: ignore
 
-    jm1, = esr.compile([m], 'torch', partition_mode='naive')  # type: ignore
+    jm1, = esr.compile([m], 'torch', partition_mode='evenly')  # type: ignore
     esr.dump([jm1], dumpdir)
     jm1: Model
 
     torch.manual_seed(2345)
     m = Model(3, model_dev)  # type: ignore
     jm2, = esr.compile(
-        [m], 'torch', load_dir=dumpdir, partition_mode='naive'  # type: ignore
+        [m], 'torch', load_dir=dumpdir, partition_mode='evenly'  # type: ignore
     )
     jm2: Model
 
@@ -140,10 +140,10 @@ def worker__test_jitted_shared(
 
     m1 = Model(3, model_dev)  # type: ignore
     m2 = Model2(m1, 3)
-    # Only naive partition, cause reordering Selectors to appear.
+    # Only evenly partition, cause reordering Selectors to appear.
     jm1a, jm2a = esr.compile(
-        [m1, m2], 'torch', partition_mode='naive'  # type: ignore
-    )
+        [m1, m2], 'torch', partition_mode='evenly'
+    )  # type: ignore
     esr.dump([jm1a, jm2a], dumpdir)
     jm1a: Model
     jm2a: Model2
@@ -152,8 +152,8 @@ def worker__test_jitted_shared(
     m1 = Model(3, model_dev)  # type: ignore
     m2 = Model2(m1, 3)
     jm1b, jm2b = esr.compile(
-        [m1, m2], 'torch', load_dir=dumpdir, partition_mode='naive'  # type: ignore
-    )
+        [m1, m2], 'torch', load_dir=dumpdir, partition_mode='evenly'
+    )  # type: ignore
     jm1b: Model
     jm2b: Model2
 

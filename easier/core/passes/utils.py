@@ -383,7 +383,7 @@ def get_selector_reducer_idx_partition_pair(
         assert False, "Must be a Selector or Reducer"
 
 
-def get_selectors_reducers_in_ir_order(
+def get_selectors_reducers(
     modules: Sequence[esr.Module], graphs: Sequence[Graph]
 ) -> Dict[
     Union[esr.Selector, esr.Reducer],
@@ -417,52 +417,15 @@ def get_selectors_reducers_in_ir_order(
     return _Getter(modules, graphs).run().invocations
 
 
-def get_selectors_reducers_as_submods(
-    modules: Sequence[esr.Module]
-) -> Dict[Union[esr.Selector, esr.Reducer], List[Tuple[int, str]]]:
-    """
-    Get all Selector/Reducer instances
-    in an order that's the same on all worker.
-
-    Unlike `get_selectors_reducers_in_ir_order`, instances not referenced in
-    IR will be returned.
-
-    Returns:
-    -   dict keys: the instances in a node-consistent order
-    -   dict values: the module index in the parameter `modules` list and
-            attribute paths of the instances.
-    """
-    #                         instance,  root, rooti, name
-    named_submods: List[Tuple[Any, esr.Module, int, str]] = []
-    for i, root in enumerate(modules):
-        for name, m in root.named_modules(remove_duplicate=False):
-            if isinstance(m, (esr.Selector, esr.Reducer)):
-                named_submods.append((m, root, i, name))
-
-    # sort the list (containing duplicates) by (rooti,name)
-    named_submods.sort(key=lambda m_r_i_n: m_r_i_n[2:4])
-
-    submods: Dict[
-        Union[esr.Selector, esr.Reducer],
-        List[Tuple[int, str]]
-    ] = {}
-    for submod, root, rooti, name in named_submods:
-        refs = submods.setdefault(submod, [])
-        refs.append((rooti, name))
-
-    return submods
-
-
-def get_easier_tensors_as_parameters(
+def get_easier_tensors(
     modules: Sequence[esr.Module]
 ) -> Dict[esr.Tensor, List[Tuple[int, str]]]:
     """
     Get all easier.Tensor instances
     in an order that's the same on all worker.
 
-    Unlike `get_selectors_reducers_in_ir_order`,
-    some easier.Tensor may be involved in an EASIER session while
-    not referenced in the IR, we need to pick those instances too.
+    Some easier.Tensor may be involved in an EASIER session while
+    not referenced in the IR, this method returns those instances too.
 
     Returns:
     -   dict keys: the easier.Tensor instances in a node-consistent order

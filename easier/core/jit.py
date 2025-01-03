@@ -178,7 +178,7 @@ def compile(
     backend: Literal['torch', 'cpu', 'gpu', 'none', None] = None,
     *,
     load_dir: Optional[str] = None,
-    partition_mode: Literal['metis', 'naive'] = 'metis'
+    partition_mode: Literal['metis', 'evenly'] = 'metis'
 ) -> List[esr.Module]:
     """
     Just in time compilation for a list of fx compatible easier.Modules
@@ -212,7 +212,7 @@ def compile(
             possible values are:
             - "metis": use METIS to partition, will result in less amount of
                 communication, but will make `compile()` run longer
-            - "naive": partition evenly and take less time than mode "metis"
+            - "evenly": partition evenly and take less time than mode "metis"
 
     Returns:
         GraphModule: the jitted input easier.Modules that can run on the
@@ -277,7 +277,7 @@ def compile(
     else:
         raise EasierJitException(f"Argument `jit_backend` cannot be {backend}")
 
-    if partition_mode not in ['metis', 'naive']:
+    if partition_mode not in ['metis', 'evenly']:
         raise EasierJitException(
             f"Argument `partition_mode` cannot be {partition_mode}"
         )

@@ -23,7 +23,7 @@ from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
     get_selector_reducer_idx_partition_pair, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    get_easier_tensors_as_parameters
+    get_easier_tensors
 from easier.core.runtime.dist_env import \
     get_cpu_dist_env, get_mpi_communicator
 from easier.core.utils import EasierJitException, logger
@@ -515,14 +515,14 @@ class CommTensorGroupGetter(EasierInterpreter):
             self.tensor_groups.add(dst_tensor_group)
 
 
-def assign_naive_elemparts(modules, graphs):
+def get_even_elemparts(modules, graphs):
     """
-    A naive ElemPart, or a naive partition, is an evenly distributed partition
+    An even ElemPart stands for an evenly distributed partition
     taking no communication structure into consideration at all.
 
     Such an ElemPart/partition is usually assigned to an EasierTensorGroup
     that's not involved in communication at all;
-    Or when the global partition mode is specified as 'naive'.
+    Or when the global partition mode is specified as 'evenly'.
 
     This method will:
     1.  additional to `comm_tensor_groups`,
@@ -530,7 +530,7 @@ def assign_naive_elemparts(modules, graphs):
         in a consistent order, too;
     2.  for any TensorGroup that are not assigned with a better
         ElemPart/partition, i.e. not in `comm_elemparts: dict`,
-        assign a naive ElemPart for it.
+        assign an even ElemPart for it.
     """
     dist_env = get_cpu_dist_env()
     world_size = dist_env.world_size
@@ -541,21 +541,15 @@ def assign_naive_elemparts(modules, graphs):
 
     # Some esr.Tensors are not related to esr.Selector/Reducer,
     # or may not even be referenced in esr.Modules at all,
-    # we must ensure all esr.Tensors are assigned (at least naive) an ElemPart,
+    # we must ensure all esr.Tensors are assigned an (at least even) ElemPart,
     # because these esr.Tensors may still get `.collect()` or `.save()`
     # where we need valid elemparts to reconstruct their full data.
     named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
-        get_easier_tensors_as_parameters(modules)
-
+        get_easier_tensors(modules)
     for p, roots_attrs in named_dtensor.items():
         if not p.is_partition:
             continue
-
-        rooti, name = roots_attrs[0]
-        root = modules[rooti]
-        param_tensor_group = p.easier_tensor_group
-
-        tensor_groups.add(param_tensor_group)
+        tensor_groups.add(p.easier_tensor_group)
 
     elemparts: Dict[EasierTensorGroup, ElemPart] = {}
 
@@ -595,9 +589,9 @@ def partition_tensor_groups(modules: List[esr.Module], graphs: List[Graph]):
     # TODO handle when len is 0 -- needs a global quality refinement later
     modes = set(mod.partition_mode for mod in modules)
     assert len(modes) == 1
-    partition_mode: Literal['metis', 'naive'] = modes.pop()  # type: ignore
+    partition_mode: Literal['metis', 'evenly'] = modes.pop()  # type: ignore
 
-    elemparts = assign_naive_elemparts(modules, graphs)
+    elemparts = get_even_elemparts(modules, graphs)
 
     # Overwrite with better partitions for some TensorGroups
     if partition_mode == 'metis':

@@ -24,7 +24,7 @@ import h5py
 
 import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
-    get_easier_tensors_as_parameters, get_selectors_reducers_in_ir_order, \
+    get_easier_tensors, get_selectors_reducers, \
     get_sub_easier_modules, pickle_ir, unpickle_ir, \
     fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
 from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
@@ -516,7 +516,7 @@ def dump_elemparts(
     tensors: Dict[
         esr.Tensor,
         List[Tuple[int, str]]
-    ] = get_easier_tensors_as_parameters(modules)
+    ] = get_easier_tensors(modules)
     ep_tensors: Dict[
         ElemPart,
         #   [   (bound_tensor,     [    (modi, tensor_attr) ] ]
@@ -608,7 +608,7 @@ def dump_selectors_reducers(
     submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, fw_graphs)
+    ] = get_selectors_reducers(modules, fw_graphs)
 
     for submodi, (submod, rooti_path_oset) in enumerate(submods.items()):
         # During dump, we need to save all references, so that if an
@@ -700,7 +700,7 @@ class ModuleInfo(JsonBase):
     #
     # The globally specified `partition_mode` argument to `compile()`
     # and is also set on esr.Module itself.
-    partition_mode: Literal['metis', 'naive']
+    partition_mode: Literal['metis', 'evenly']
 
 
 class HaloXchgBindingsCollector(EasierInterpreter):
@@ -1039,7 +1039,7 @@ def rank0_validates_dumps(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
 
     # All bindings, i.e. attr paths, mentioned in the IRs:
     # - if a dumped primitive binding is contained, we know it's a user-defined
@@ -1165,7 +1165,7 @@ def load_selectors_reducers(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
     all_submod_bindings: OrderedSet[Tuple[int, str]] = OrderedSet(
         itertools.chain(*jit_submods.values())
     )
