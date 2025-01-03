@@ -11,7 +11,6 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-from easier.core.passes.tensor_partition import ElemPart
 
 from easier.core.runtime.dist_env import get_cpu_dist_env
 from easier.core.utils import \

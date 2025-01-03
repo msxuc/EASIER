@@ -176,6 +176,7 @@ def _validate_nonjit_state(top_modules: List[esr.Module]):
 def compile(
     modules: List[esr.Module],
     backend: Literal['torch', 'cpu', 'gpu', 'none', None] = None,
+    *,
     dump_dir: Optional[str] = None,
     partition_mode: Literal['metis', 'naive'] = 'metis'
 ) -> List[esr.Module]:

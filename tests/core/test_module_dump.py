@@ -109,7 +109,7 @@ def worker__test_jitted_dump(
     torch.manual_seed(2345)
     m = Model(3, model_dev)  # type: ignore
     jm2, = esr.compile(
-        [m], 'torch', dumpdir, partition_mode='naive'  # type: ignore
+        [m], 'torch', dump_dir=dumpdir, partition_mode='naive'  # type: ignore
     )
     jm2: Model
 
@@ -152,8 +152,8 @@ def worker__test_jitted_shared(
     m1 = Model(3, model_dev)  # type: ignore
     m2 = Model2(m1, 3)
     jm1b, jm2b = esr.compile(
-        [m1, m2], 'torch', dumpdir, partition_mode='naive'  # type: ignore
-    )
+        [m1, m2], 'torch', dump_dir=dumpdir, partition_mode='naive'
+    )  # type: ignore
     jm1b: Model
     jm2b: Model2
 
