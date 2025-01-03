@@ -149,10 +149,6 @@ class CommPairCollector(EasierInterpreter):
             OrderedDict[EasierTensorGroup, int] = OrderedDict()
         self.accum_n = 0
 
-        # Only when not only_collect_comm_groups, collect the comm_pairs:
-        # (as collecting comm_pair requires loading the idx dataset)
-        #
-        # In IR-reference order, same for all workers.
         # Does not include the symmetric part for the communication operations.
         self.comm_pairs: List[CommPair] = []
 
@@ -484,9 +480,7 @@ def synchronize_partition_result(
         elempart_hint = get_elempart_hint(elempart_i, tensor_group)
 
         synced_elemparts[tensor_group] = ElemPart(
-            elempart,
-            elempart_lengths,
-            hint=elempart_hint
+            elempart, elempart_lengths, hint=elempart_hint
         )
 
     # endfor tensor_groups

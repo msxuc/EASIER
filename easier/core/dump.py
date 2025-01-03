@@ -568,7 +568,7 @@ def dump_elemparts(
             elempart_type=elempart_type,
             h5_group_basepath=grp_basepath,
             parameter_bindings=binding_paths,
-            lengths=elempart.lengths,
+            lengths=elempart.lengths
         )
         result.append(ep_info)
 
@@ -807,9 +807,7 @@ def _get_data_loader_repr(data_loader: DataLoaderBase) -> Tuple[
 
 
 def load_dumps(
-    modules: List[esr.Module],
-    dump_dir: str,
-    raw_graphs: List[Graph]
+    modules: List[esr.Module], dump_dir: str, raw_graphs: List[Graph]
 ) -> Optional[List[Graph]]:
     """
     This is not a user API.
@@ -1142,7 +1140,7 @@ def load_elemparts(
         elempart = ElemPart(
             idx_desc=idx_desc,
             lengths=ep_info.lengths,
-            hint=ep_info.hint,
+            hint=ep_info.hint
         )
 
         for rooti, tensorpath in ep_info.parameter_bindings:

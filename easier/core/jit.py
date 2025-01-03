@@ -308,9 +308,7 @@ def compile(
     if load_dir is not None:
         # load_dumps may return None if global config i.e. world size changes,
         # in such cases we should continue to compile from the scratch.
-        loaded_graphs = load_dumps(
-            modules, load_dir, raw_graphs
-        )
+        loaded_graphs = load_dumps(modules, load_dir, raw_graphs)
 
     if loaded_graphs is not None:
         graphs = loaded_graphs

@@ -357,7 +357,7 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
         r = synchronize_partition_result(
             {g5: 0, g6: 9, g7: 9 + 26},  # type: ignore
             9 + 26 + 8,  # per_work=[15, 15, 13]
-            local_membership,
+            local_membership
         )
         for k, v in r.items():
             assert isinstance(v.idx_desc, torch.Tensor)
