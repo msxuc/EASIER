@@ -65,10 +65,13 @@ def _get_group_hint(root, attrpath):
 
 class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
     """
-    A TensorDef is an instance of partitioned esr.Tensor or a Node for the
-    intermediate result of Selectors/Reducer.
+    A TensorDef is an instance of partitioned esr.Tensor or an instance
+    Selectors/Reducer whose resultant tensor is to be partitioned too.
     Multiple TensorDefs are yet to be equivalent and forms a TensorGroup,
     all components in that TensorGroup will share the same partition.
+
+    Mapped ops/Nodes, which has no effect on partitioning, will inherit (and
+    validate the consistency of) whatever TensorDef the inputs have.
 
     Each Node is interpreted to at most one single TensorDef.
     That is, even if the Node is a multiple-output operation,
@@ -165,6 +168,10 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         rep_input_def = self.set_equivalent(input_defs)
 
         if op_callable in esr.easier_aggregators:
+            if rep_input_def is None:
+                raise EasierJitException(
+                    f"{op_callable} cannot be called on replicated tensors"
+                )
             # esr.sum etc. results are always replica, no TensorDef.
             return None
         else:
@@ -174,7 +181,8 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         args = self.current_node.args
         kwargs = self.current_node.kwargs
 
-        inplace_out_def: Optional[EasierTensorDef] = None
+        reducer_out_def: Optional[EasierTensorDef] = None
+
         if isinstance(module, esr.Selector):
             input_node = \
                 normalize_selector_call_into_args(*args, **kwargs)
@@ -184,7 +192,7 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
                 normalize_reducer_call_into_args(*args, **kwargs)
 
             if isinstance(opt_inplace_out_node, Node):
-                inplace_out_def = self.node2def[opt_inplace_out_node]
+                reducer_out_def = self.node2def[opt_inplace_out_node]
 
         else:
             raise EasierJitException(
@@ -234,7 +242,7 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         # module instance itself is always the TensorDef for call_module Nodes
         # and the batch size of the optional `out` is checked in `set_equiv()`
         self.set_equivalent(
-            [module, inplace_out_def],
+            [module, reducer_out_def],
             def_srcs_hint="Reducer itself and its out argument"
         )
 
