@@ -18,12 +18,12 @@ from torch.nn.modules import Module
 
 import easier.core.module as esr
 from easier.core.passes.tensor_grouping import \
-    EasierTensorGroup, get_node_tensor_group
+    EasierTensorGroup, get_node_tensor_group, get_tensor_groups_relation
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
     get_selector_reducer_idx_partition_pair, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    get_easier_tensors_as_parameters
+    get_easier_tensors
 from easier.core.runtime.dist_env import \
     get_cpu_dist_env, get_mpi_communicator
 from easier.core.utils import EasierJitException, logger
@@ -138,7 +138,6 @@ class CommPairCollector(EasierInterpreter):
     def __init__(
         self,
         modules: Sequence[esr.Module], graphs: Sequence[Graph],
-        only_collect_comm_groups: bool
     ):
         super().__init__(modules, graphs)
 
@@ -150,12 +149,6 @@ class CommPairCollector(EasierInterpreter):
             OrderedDict[EasierTensorGroup, int] = OrderedDict()
         self.accum_n = 0
 
-        self.only_collect_comm_groups = only_collect_comm_groups
-
-        # Only when not only_collect_comm_groups, collect the comm_pairs:
-        # (as collecting comm_pair requires loading the idx dataset)
-        #
-        # In IR-reference order, same for all workers.
         # Does not include the symmetric part for the communication operations.
         self.comm_pairs: List[CommPair] = []
 
@@ -205,9 +198,6 @@ class CommPairCollector(EasierInterpreter):
 
         self._init_tensor_group_offset(src_tensor_group)
         self._init_tensor_group_offset(dst_tensor_group)
-
-        if self.only_collect_comm_groups:
-            return
 
         src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
         self.comm_pairs.append(CommPair(src_tensor_group, src_idx,
@@ -393,16 +383,6 @@ class ElemPart:
     # All lengths are replicated on all workers
     lengths: List[int]
 
-    # The global config for how ElemParts are calculated,
-    # and such "mode" is independent of ElemPartArangeIdx above.
-    # (EPArangeIdx is for non-communication TensorGroups, no matter in
-    # partition mode 'metis' or 'naive'. And EPArangeIdx can even serve as
-    # an optimized description for a TensorGroup involved in communication)
-    #
-    # It's only going to be archived in easier.dump() and used for validation.
-    partition_mode: Literal['metis', 'naive']
-    # TODO move this record to really session-/module-level
-
     hint: str
 
     @functools.cached_property
@@ -422,9 +402,7 @@ class ElemPart:
 def synchronize_partition_result(
     tensor_group_to_matedge_offsets: OrderedDict[EasierTensorGroup, int],
     accum_n: int,
-    local_membership: torch.Tensor,
-    # for archiving in esr.dump() only:
-    globally_specified_partition_mode: Literal['metis', 'naive']
+    local_membership: torch.Tensor
 ) -> Dict[EasierTensorGroup, ElemPart]:
     """
     Synchronize ParMETIS-partition results ("elempart") into each TensorGroup.
@@ -505,10 +483,7 @@ def synchronize_partition_result(
         elempart_hint = get_elempart_hint(elempart_i, tensor_group)
 
         synced_elemparts[tensor_group] = ElemPart(
-            elempart,
-            elempart_lengths,
-            partition_mode=globally_specified_partition_mode,
-            hint=elempart_hint
+            elempart, elempart_lengths, hint=elempart_hint
         )
 
     # endfor tensor_groups
@@ -516,87 +491,8 @@ def synchronize_partition_result(
     return synced_elemparts
 
 
-def insert_naive_elemparts(
-    modules: Sequence[esr.Module],
-    comm_tensor_groups: OrderedSet[EasierTensorGroup],
-    comm_elemparts: Dict[EasierTensorGroup, ElemPart],
-    # for archiving in esr.dump() only:
-    globally_specified_partition_mode: Literal['metis', 'naive']
-):
-    """
-    A naive ElemPart, or a naive partition, is an evenly distributed partition
-    taking no communication structure into consideration at all.
-
-    Such an ElemPart/partition is usually assigned to an EasierTensorGroup
-    that's not involved in communication at all;
-    Or when the global partition mode is specified as 'naive'.
-
-    This method will:
-    1.  additional to `comm_tensor_groups`,
-        traverse all esr.Tensor instances and collect their EasierTensorGroups
-        in a consistent order, too;
-    2.  for any TensorGroup that are not assigned with a better
-        ElemPart/partition, i.e. not in `comm_elemparts: dict`,
-        assign a naive ElemPart for it.
-    """
-    dist_env = get_cpu_dist_env()
-    world_size = dist_env.world_size
-    rank = dist_env.rank
-
-    assert set(comm_elemparts.keys()).issubset(comm_tensor_groups)
-
-    # copying the dict also helps maintain the (hint-only) ElemPart IDs
-    # which was incrementally assigned.
-    all_elemparts: Dict[EasierTensorGroup, ElemPart] = \
-        dict(comm_elemparts)
-
-    all_tensor_groups = OrderedSet(comm_tensor_groups)
-    named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
-        get_easier_tensors_as_parameters(modules)
-
-    for p, roots_attrs in named_dtensor.items():
-        if not p.is_partition:
-            continue
-
-        rooti, name = roots_attrs[0]
-        root = modules[rooti]
-        param_tensor_group = p.easier_tensor_group
-
-        all_tensor_groups.add(param_tensor_group)
-
-    for tensor_group in all_tensor_groups:
-        if tensor_group not in comm_elemparts:
-            n = tensor_group.n
-
-            per_worker_n = n // world_size
-            residue = n % world_size
-
-            # given the quantity of residue below:
-            # assert 0 <= residue < world_size
-            # we simply let the last worker have all these residual elements
-
-            start = per_worker_n * rank
-            end = start + per_worker_n
-            if rank + 1 == world_size:
-                end = n
-
-            lengths = [
-                per_worker_n
-                for w in range(world_size)
-            ]
-            lengths[-1] += residue
-
-            elempart_i = len(all_elemparts)
-            elempart_hint = get_arange_elempart_hint(elempart_i, tensor_group)
-
-            all_elemparts[tensor_group] = ElemPart(
-                ElemPartArangeIdx(start, end),
-                lengths,
-                partition_mode=globally_specified_partition_mode,
-                hint=elempart_hint
-            )
-
-    return all_elemparts
+# NOTE the two kinds of hints may have the same "elempart_i" subtext,
+# but the postfix ("arange" or empty) can still differentiate ElemParts.
 
 
 def get_elempart_hint(elempart_i: int, tensor_group: EasierTensorGroup):
@@ -607,54 +503,126 @@ def get_arange_elempart_hint(elempart_i: int, tensor_group: EasierTensorGroup):
     return f'{elempart_i}:{tensor_group.hint}:arange'
 
 
-def partition_tensor_groups(
-    modules: List[esr.Module],
-    graphs: List[Graph],
-    partition_mode: Literal['metis', 'naive'] = 'metis'
-):
-    comm_pairs_collector = CommPairCollector(
-        modules,
-        graphs,
-        only_collect_comm_groups=(partition_mode == 'naive')
-    )
-    comm_pairs_collector.run()
+class CommTensorGroupGetter(EasierInterpreter):
+    def __init__(self, modules, graphs) -> None:
+        super().__init__(modules, graphs)
 
-    comm_tensor_groups: OrderedSet[EasierTensorGroup] = OrderedSet(
-        comm_pairs_collector.tensor_group_to_matedge_offsets.keys()
-    )
+        self.tensor_groups: OrderedSet[EasierTensorGroup] = OrderedSet()
 
-    # Communication-related ElemParts
-    # (e.g. TensorGroups for esr.Tensors not involved in communication are not
-    # included)
-    comm_elemparts: Dict[EasierTensorGroup, ElemPart]
-    if len(comm_pairs_collector.comm_pairs) > 0:
-        # always check comm_pairs > 0 to exclude the real cases where
-        # there is really no communication.
-        local_membership = partition_tensor_groups_with_adjmat(
-            comm_pairs_collector.tensor_group_to_matedge_offsets,
-            comm_pairs_collector.accum_n,
-            comm_pairs_collector.comm_pairs)
+    def if_call_module(self, submod: Module):
+        if isinstance(submod, (esr.Selector, esr.Reducer)):
+            src_tensor_group, dst_tensor_group = get_tensor_groups_relation(
+                self.current_node, submod
+            )
+            self.tensor_groups.add(src_tensor_group)
+            self.tensor_groups.add(dst_tensor_group)
 
-        comm_elemparts = synchronize_partition_result(
-            comm_pairs_collector.tensor_group_to_matedge_offsets,
-            comm_pairs_collector.accum_n,
-            local_membership,
-            partition_mode
-        )
-    else:
-        comm_elemparts = {}
 
-    # Given that
-    # `partition_mode in ['metis', 'naive']` and
-    # some esr.Tensors are not related to esr.Selector/Reducer,
-    # we must ensure all esr.Tensors are assigned (at least naive) an ElemPart,
+def get_even_elemparts(modules, graphs):
+    """
+    An even ElemPart stands for an evenly distributed partition
+    taking no communication structure into consideration at all.
+
+    Such an ElemPart/partition is usually assigned to an EasierTensorGroup
+    that's not involved in communication at all;
+    Or when the global partition mode is specified as 'evenly'.
+
+    This method will:
+    1.  additional to `comm_tensor_groups`,
+        traverse all esr.Tensor instances and collect their EasierTensorGroups
+        in a consistent order, too;
+    2.  for any TensorGroup that are not assigned with a better
+        ElemPart/partition, i.e. not in `comm_elemparts: dict`,
+        assign an even ElemPart for it.
+    """
+    dist_env = get_cpu_dist_env()
+    world_size = dist_env.world_size
+    rank = dist_env.rank
+
+    group_getter = CommTensorGroupGetter(modules, graphs).run()
+    tensor_groups: OrderedSet[EasierTensorGroup] = group_getter.tensor_groups
+
+    # Some esr.Tensors are not related to esr.Selector/Reducer,
+    # or may not even be referenced in esr.Modules at all,
+    # we must ensure all esr.Tensors are assigned an (at least even) ElemPart,
     # because these esr.Tensors may still get `.collect()` or `.save()`
     # where we need valid elemparts to reconstruct their full data.
-    elemparts = insert_naive_elemparts(
-        modules, comm_tensor_groups, comm_elemparts, partition_mode
-    )
+    named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
+        get_easier_tensors(modules)
+    for p, roots_attrs in named_dtensor.items():
+        if not p.is_partition:
+            continue
+        tensor_groups.add(p.easier_tensor_group)
+
+    elemparts: Dict[EasierTensorGroup, ElemPart] = {}
+
+    for elempart_i, tensor_group in enumerate(tensor_groups):
+        n = tensor_group.n
+
+        per_worker_n = n // world_size
+        residue = n % world_size
+
+        # given the quantity of residue below:
+        # assert 0 <= residue < world_size
+        # we simply let the last worker have all these residual elements
+
+        start = per_worker_n * rank
+        end = start + per_worker_n
+        if rank + 1 == world_size:
+            end = n
+
+        lengths = [
+            per_worker_n
+            for w in range(world_size)
+        ]
+        lengths[-1] += residue
+
+        elempart_hint = get_arange_elempart_hint(elempart_i, tensor_group)
+
+        elemparts[tensor_group] = ElemPart(
+            ElemPartArangeIdx(start, end),
+            lengths,
+            hint=elempart_hint
+        )
+
+    return elemparts
+
+
+def partition_tensor_groups(modules: List[esr.Module], graphs: List[Graph]):
+    # TODO handle when len is 0 -- needs a global quality refinement later
+    modes = set(mod.partition_mode for mod in modules)
+    assert len(modes) == 1
+    partition_mode: Literal['metis', 'evenly'] = modes.pop()  # type: ignore
+
+    elemparts = get_even_elemparts(modules, graphs)
+
+    # Overwrite with better partitions for some TensorGroups
+    if partition_mode == 'metis':
+        comm_pairs_collector = CommPairCollector(modules, graphs)
+        comm_pairs_collector.run()
+
+        # Communication-related ElemParts
+        # (e.g. TensorGroups for esr.Tensors not involved in communication
+        # are not included)
+        comm_elemparts: Dict[EasierTensorGroup, ElemPart]
+        if len(comm_pairs_collector.comm_pairs) > 0:
+            # always check comm_pairs > 0 to exclude the real cases where
+            # there is really no communication.
+            local_membership = partition_tensor_groups_with_adjmat(
+                comm_pairs_collector.tensor_group_to_matedge_offsets,
+                comm_pairs_collector.accum_n,
+                comm_pairs_collector.comm_pairs)
+
+            comm_elemparts = synchronize_partition_result(
+                comm_pairs_collector.tensor_group_to_matedge_offsets,
+                comm_pairs_collector.accum_n,
+                local_membership
+            )
+            assert set(comm_elemparts.keys()).issubset(elemparts.keys())
+
+            elemparts.update(comm_elemparts)
 
     for root in modules:
-        root.easier_elemparts = elemparts  # type: ignore
+        root.easier_elemparts = elemparts
 
     return modules, graphs

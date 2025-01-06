@@ -15,7 +15,7 @@ from easier.core.passes.tensor_grouping import \
     EasierTensorDef, EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import EasierInterpreter, SubmodNameAllocator, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    get_easier_tensors_as_parameters
+    get_easier_tensors
 from easier.core.utils import logger
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
@@ -24,7 +24,7 @@ import easier.core.module as esr
 from easier.core.module import Module, Selector, Reducer
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.tensor_group_partition import \
-    ElemPart, partition_tensor_groups, insert_naive_elemparts
+    ElemPart
 
 
 class ConstantTensorMover(EasierInterpreter):
@@ -306,7 +306,7 @@ def load_partitioned_tensors_from_source(modules: List[esr.Module]):
     """
     runtime_device = get_runtime_dist_env().comm_device
 
-    for p in get_easier_tensors_as_parameters(modules):
+    for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_partition:
             assert p.elempart is not None, \
                 "ElemPart must have been bound to esr.Tensor"
@@ -325,7 +325,7 @@ def load_replicated_tensors_from_source(modules: List[esr.Module]):
 
     # This particularly cannot be done via `get_attr` handler, as a replica
     # may be accessed outside the JIT scope.
-    for p in get_easier_tensors_as_parameters(modules):
+    for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_replica:
             p.data = p.easier_data_loader.fully_load(runtime_device)
             p.easier_data_ready = True

@@ -71,7 +71,6 @@ class SyntaxChecker(EasierInterpreter):
                 "easier.Module.forward() cannot have return value"
             )
 
-
 def check_syntax(modules, graphs):
     """
     Check EASIER-specific syntax for user programs.
