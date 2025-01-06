@@ -17,7 +17,7 @@ from easier.core.utils import \
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, get_easier_tensors_as_parameters, \
+    EasierInterpreter, OrderedSet, get_easier_tensors, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     FX, DisjointSet, tree_map
 
@@ -283,9 +283,9 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
     # that are referenced by `get_attr` Nodes.
     # But some Tensors may still contain data to use outside of JIT,
     # we give each of them an individual singleton Group
-    # (and later a naive group partition).
+    # (and later an even group partition).
     named_dtensor: Dict[esr.Tensor, List[Tuple[int, str]]] = \
-        get_easier_tensors_as_parameters(modules)
+        get_easier_tensors(modules)
     for p, roots_attrs in named_dtensor.items():
         if not p.is_partition:
             continue

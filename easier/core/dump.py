@@ -24,7 +24,7 @@ import h5py
 
 import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
-    get_easier_tensors_as_parameters, get_selectors_reducers_in_ir_order, \
+    get_easier_tensors, get_selectors_reducers, \
     get_sub_easier_modules, pickle_ir, unpickle_ir, \
     fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
 from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
@@ -509,12 +509,6 @@ class ElemPartInfo(JsonBase):
 
     lengths: List[int]
 
-    # These fields are dedicated to validation:
-    #
-    # The globally specified `partition_mode` argument to `compile()`,
-    # independent from how a single ElemPart is partitioned/calculated.
-    partition_mode: Literal['metis', 'naive']
-
 
 def dump_elemparts(
     modules: List[esr.Module], h5_ep_root: h5py.Group
@@ -522,7 +516,7 @@ def dump_elemparts(
     tensors: Dict[
         esr.Tensor,
         List[Tuple[int, str]]
-    ] = get_easier_tensors_as_parameters(modules)
+    ] = get_easier_tensors(modules)
     ep_tensors: Dict[
         ElemPart,
         #   [   (bound_tensor,     [    (modi, tensor_attr) ] ]
@@ -574,8 +568,7 @@ def dump_elemparts(
             elempart_type=elempart_type,
             h5_group_basepath=grp_basepath,
             parameter_bindings=binding_paths,
-            lengths=elempart.lengths,
-            partition_mode=elempart.partition_mode
+            lengths=elempart.lengths
         )
         result.append(ep_info)
 
@@ -615,7 +608,7 @@ def dump_selectors_reducers(
     submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, fw_graphs)
+    ] = get_selectors_reducers(modules, fw_graphs)
 
     for submodi, (submod, rooti_path_oset) in enumerate(submods.items()):
         # During dump, we need to save all references, so that if an
@@ -700,6 +693,12 @@ class ModuleInfo(JsonBase):
 
     halo_exchangers_bindings: Dict[str, HaloExchangerInfo]
 
+    # These fields are dedicated to validation:
+    #
+    # The globally specified `partition_mode` argument to `compile()`
+    # and is also set on esr.Module itself.
+    partition_mode: Literal['metis', 'evenly']
+
 
 class HaloXchgBindingsCollector(EasierInterpreter):
     def __init__(self, modules, graphs) -> None:
@@ -780,7 +779,8 @@ def dump_modules(
         mod_info = ModuleInfo(
             h5_group_basepath=grp_basepath,
             constant_names=list(const_coll.constant_values.keys()),
-            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings
+            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings,
+            partition_mode=mod.partition_mode
         )
         results.append(mod_info)
 
@@ -802,10 +802,7 @@ def _get_data_loader_repr(data_loader: DataLoaderBase) -> Tuple[
 
 
 def load_dumps(
-    modules: List[esr.Module],
-    dump_dir: str,
-    raw_graphs: List[Graph],
-    partition_mode: Literal['metis', 'naive']
+    modules: List[esr.Module], dump_dir: str, raw_graphs: List[Graph]
 ) -> Optional[List[Graph]]:
     """
     This is not a user API.
@@ -849,7 +846,7 @@ def load_dumps(
             # do loading-time validation on rank-0.
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_valid = rank0_validates_dumps(
-                    modules, raw_graphs, jit_f0, dump_info, partition_mode
+                    modules, raw_graphs, jit_f0, dump_info
                 )
             if not dump_valid:
                 return "Dump does not match user programs"
@@ -986,7 +983,6 @@ def rank0_validates_dumps(
     raw_graphs: List[Graph],
     h5root: h5py.Group,
     dump_info: EasierDump,
-    partition_mode: Literal['metis', 'naive']
 ) -> bool:
     """
     Rank-0 validates its own dump (i.e. 'jit_0.hdf5').
@@ -1023,11 +1019,11 @@ def rank0_validates_dumps(
     if ir_changes:
         return False
 
-    for ep_info in dump_info.elemparts:
-        if ep_info.partition_mode != partition_mode:
+    for mod, mod_info in zip(modules, dump_info.modules):
+        if mod_info.partition_mode != mod.partition_mode:
             logger.debug(
                 "Partition mode changes:"
-                f" {ep_info.partition_mode} => {partition_mode}"
+                f" {mod_info.partition_mode} => {mod.partition_mode}"
             )
             return False
 
@@ -1038,7 +1034,7 @@ def rank0_validates_dumps(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
 
     # All bindings, i.e. attr paths, mentioned in the IRs:
     # - if a dumped primitive binding is contained, we know it's a user-defined
@@ -1139,8 +1135,7 @@ def load_elemparts(
         elempart = ElemPart(
             idx_desc=idx_desc,
             lengths=ep_info.lengths,
-            hint=ep_info.hint,
-            partition_mode=ep_info.partition_mode
+            hint=ep_info.hint
         )
 
         for rooti, tensorpath in ep_info.parameter_bindings:
@@ -1165,7 +1160,7 @@ def load_selectors_reducers(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
     all_submod_bindings: OrderedSet[Tuple[int, str]] = OrderedSet(
         itertools.chain(*jit_submods.values())
     )

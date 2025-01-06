@@ -656,6 +656,9 @@ class Module(nn.Module):
             'torch', 'cpu', 'gpu', 'none', None
         ] = None
 
+        # Only has value when jit_backend in ['torch','cpu','gpu']
+        self.partition_mode: Literal['metis', 'evenly']
+
         # Each Module shares the ElemPart dict of all Modules in JIT session.
         self.easier_elemparts: 'Dict[EasierTensorGroup, ElemPart]'
 
