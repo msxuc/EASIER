@@ -24,19 +24,37 @@ import h5py
 
 import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
-    get_easier_tensors_as_parameters, get_selectors_reducers_in_ir_order, \
+    get_easier_tensors, get_selectors_reducers, \
     get_sub_easier_modules, pickle_ir, unpickle_ir, \
     fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
 from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
-from easier.core.passes.tensor_partition import ElemPart, ElemPartArangeIdx
+from easier.core.passes.tensor_group_partition import \
+    ElemPart, ElemPartArangeIdx
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.dataflow_distribution import \
     ConstantTensorMover, load_replicated_tensors_from_source, \
     load_partitioned_tensors_from_source
 from easier.core.utils import logger, get_random_str, EasierJitException
+
+
+class BadDumpFormatException(Exception):
+    """
+    Indicates the input dump file is corrupted or
+    incompatible with the current version of dump/load subprocedure.
+
+    Such specific errors will only be reported to users currently,
+    and EASIER will stop loading and compile from the scratch.
+    """
+    # TODO file can be corrupted in many detailed ways, such as
+    # 1) bad H5, 2) bad H5 path, 3) unexcepted/missed field, 4) bad value, etc.
+    # Some will leads to SkipLoadDump handler, while for some others we'd better
+    # treat them as fatal exceptions.
+    #
+    # Now, we only handle a few of the most significant cases.
+    pass
 
 
 # For easier.core.dump module only.
@@ -103,7 +121,15 @@ def _deserialize_json_dataset(
     """
     assert dataclasses.is_dataclass(dataclass_cls)
     json_str: str = h5grp[dataset_name].asstr()[0]  # type: ignore
-    obj = json.loads(json_str, object_hook=_json_object_hook)
+
+    try:
+        obj = json.loads(json_str, object_hook=_json_object_hook)
+    except TypeError as type_error:
+        # TypeError means the parsed JSON dict does not match the
+        # parameter list of the dataclass constructor, which will occur
+        # when we add/remove fields to the JSON dataclass definition.
+        raise BadDumpFormatException(str(type_error.args[0])) from type_error
+
     assert isinstance(obj, dataclass_cls)
     return obj
 
@@ -171,7 +197,7 @@ class GlobalConfig(JsonBase):
     world_size: int
 
     # The version of the dump files.
-    version: Tuple[int, int] = (0, 1)  # v0.1
+    version: Tuple[int, int] = (0, 2)  # v0.2
 
     def __eq__(self, value) -> bool:
         if not isinstance(value, GlobalConfig):
@@ -192,7 +218,9 @@ def _get_current_global_config():
     return config
 
 
-def _coll_check(expect: bool, ex_ctor: Type[Exception], ex_msg: str):
+def _coll_check(
+    expect: bool, ex_ctor: Type[Exception], ex_msg: Optional[str] = None
+):
     """
     Collectively decide if:
     -   arguments to `.load()` is wrong; cache format is interrupted
@@ -488,7 +516,7 @@ def dump_elemparts(
     tensors: Dict[
         esr.Tensor,
         List[Tuple[int, str]]
-    ] = get_easier_tensors_as_parameters(modules)
+    ] = get_easier_tensors(modules)
     ep_tensors: Dict[
         ElemPart,
         #   [   (bound_tensor,     [    (modi, tensor_attr) ] ]
@@ -580,7 +608,7 @@ def dump_selectors_reducers(
     submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, fw_graphs)
+    ] = get_selectors_reducers(modules, fw_graphs)
 
     for submodi, (submod, rooti_path_oset) in enumerate(submods.items()):
         # During dump, we need to save all references, so that if an
@@ -668,6 +696,12 @@ class ModuleInfo(JsonBase):
 
     halo_exchangers_bindings: Dict[str, HaloExchangerInfo]
 
+    # These fields are dedicated to validation:
+    #
+    # The globally specified `partition_mode` argument to `compile()`
+    # and is also set on esr.Module itself.
+    partition_mode: Literal['metis', 'evenly']
+
 
 class HaloXchgBindingsCollector(EasierInterpreter):
     def __init__(self, modules, graphs) -> None:
@@ -750,7 +784,8 @@ def dump_modules(
         mod_info = ModuleInfo(
             h5_group_basepath=grp_basepath,
             constant_names=list(const_coll.constant_values.keys()),
-            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings
+            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings,
+            partition_mode=mod.partition_mode
         )
         results.append(mod_info)
 
@@ -792,50 +827,56 @@ def load_dumps(
     jit_dir = os.path.join(dump_dir, 'jit')
 
     try:
-        if rank == 0:
+        def _rank0_checks() -> Optional[str]:
+            """
+            Do multiple stages of checks, on rank-0 only.
+            Return early for any issue detected and return failure reason.
+            """
             jit_fpath0 = os.path.join(jit_dir, 'jit_0.hdf5')
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_info = _deserialize_json_dataset(
                     jit_f0, H5_DATASET_DUMP_INFO, EasierDump
                 )
+
             cur_global_config = _get_current_global_config()
             global_config_is_same = \
                 dump_info.global_config == cur_global_config
-
             if not global_config_is_same:
                 logger.debug(
                     f'{dump_info.global_config} => {cur_global_config}'
                 )
-        else:
-            global_config_is_same = True
+                return "Compilation environment changes"
 
-        _coll_check(
-            global_config_is_same,
-            _SkipLoadingDump,
-            'Compilation environment changes.'
-        )
-
-        if rank == 0:
-            # We have validate graphs are same SPMD in jit.py, so we only
+            # We have validated graphs are same SPMD in jit.py, so we only
             # do loading-time validation on rank-0.
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_valid = rank0_validates_dumps(
                     modules, raw_graphs, jit_f0, dump_info
                 )
-        else:
-            dump_valid = True
+            if not dump_valid:
+                return "Dump does not match user programs"
 
-        _coll_check(
-            dump_valid,
-            _SkipLoadingDump,
-            "Dump does not match user programs."
-        )
+            return None
+        # end def _check_rank0()
+
+        if rank == 0:
+            try:
+                fail_reason = _rank0_checks()
+            except BadDumpFormatException as bad_format:
+                logger.debug(str(bad_format.args[0]))
+                fail_reason = "Dump is incompatible or is corrupted"
+        else:
+            fail_reason = None
+
+        _coll_check(fail_reason == None, _SkipLoadingDump, fail_reason)
+
     except _SkipLoadingDump as skip:
-        logger.warning(
-            "Skip loading dump and will compile from scratch,"
-            f" because: {skip.args[0]}"
-            '\nPlease set EASIER_LOG_LEVEL=DEBUG for details'
-        )
+        fail_reason = skip.args[0]
+        logger.warning(''.join([
+            "Skip loading dump and will compile from scratch.",
+            f" Because: {fail_reason}." if fail_reason is not None else "",
+            "\nPlease set EASIER_LOG_LEVEL=DEBUG for details"
+        ]))
         return None
 
     # After basic global and session checks finish, scatter rank-based dumps
@@ -946,13 +987,14 @@ def rank0_validates_dumps(
     modules: List[esr.Module],
     raw_graphs: List[Graph],
     h5root: h5py.Group,
-    dump_info: EasierDump
+    dump_info: EasierDump,
 ) -> bool:
     """
     Rank-0 validates its own dump (i.e. 'jit_0.hdf5').
 
     Validate between dumps and newly initialized modules:
     -   raw IRs are equal
+    -   partition modes are equal
     -   Selector/Reducer.idx definition are equal
     If any of these criteria are not met, we need to warn users about
     the details, and break loading to compile from the scratch using the
@@ -982,6 +1024,14 @@ def rank0_validates_dumps(
     if ir_changes:
         return False
 
+    for mod, mod_info in zip(modules, dump_info.modules):
+        if mod_info.partition_mode != mod.partition_mode:
+            logger.debug(
+                "Partition mode changes:"
+                f" {mod_info.partition_mode} => {mod.partition_mode}"
+            )
+            return False
+
     # 1) We have checked the IR equality,
     # so all call_module Nodes (i.e. attr names) have valid submods bound,
     # get_s_r_in_ir_order() won't trigger e.g. AttributeError
@@ -989,7 +1039,7 @@ def rank0_validates_dumps(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
 
     # All bindings, i.e. attr paths, mentioned in the IRs:
     # - if a dumped primitive binding is contained, we know it's a user-defined
@@ -1115,7 +1165,7 @@ def load_selectors_reducers(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
     all_submod_bindings: OrderedSet[Tuple[int, str]] = OrderedSet(
         itertools.chain(*jit_submods.values())
     )
