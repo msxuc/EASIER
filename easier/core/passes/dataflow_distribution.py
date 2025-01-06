@@ -227,9 +227,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
     """
 
     def if_call_function(self, function):
-        if function not in [
-            esr.sum, esr.prod, esr.norm, esr.max, esr.min
-        ]:
+        if function not in esr.easier_aggregators:
             return
 
         node = self.current_node

@@ -314,6 +314,8 @@ def compile(
         graphs = loaded_graphs
     else:
         # passes
+        modules, graphs = passes.check_syntax(modules, graphs)
+
         modules, graphs = passes.group_tensors(modules, graphs)
 
         # After bind_reducer, new Selector instances and Nodes are inserted,
