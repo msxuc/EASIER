@@ -71,7 +71,7 @@ class HaloExchanger(torch.nn.Module):
         # If no communication is needed, the item is None.
         # `recv_buffers[this_rank]` is always None.
         self.recv_buffers: List[Optional[torch.Tensor]]
-        self.chunk_v: Optional[torch.Tensor] = None
+        self.chunk: Optional[torch.Tensor] = None
 
     def analyze_halo_properties(self):
         # In certain cases we should avoid preallocation or avoid inserting
@@ -132,10 +132,10 @@ class HaloExchanger(torch.nn.Module):
             # go on with the input tensor.
             return
 
-        if self.chunk_v != None:
-            prev_subshape = tuple(self.chunk_v.shape[1:])
+        if self.chunk != None:
+            prev_subshape = tuple(self.chunk.shape[1:])
             if prev_subshape == element_tensor_shape \
-                    and self.chunk_v.dtype == dtype:
+            and self.chunk.dtype == dtype:
                 return
 
         def _get_buffer_shape(batchsize: int):
@@ -165,7 +165,7 @@ class HaloExchanger(torch.nn.Module):
         #
         # WARNING But if the HaloExchanger instance is called twice,
         # the 2nd writing may invalidate the 1st result.
-        self.chunk_v = torch.empty(
+        self.chunk = torch.empty(
             size=_get_buffer_shape(self.chunk_length),
             dtype=dtype, device=device
         )
@@ -186,7 +186,7 @@ class HaloExchanger(torch.nn.Module):
 
         # When Selector has no recvs,
         # don't bother writing a chunk, but directly return the input tensor.
-        if self.chunk_v is None:
+        if self.chunk is None:
             return local
 
         recv_buffers: List[torch.Tensor] = []
@@ -214,8 +214,8 @@ class HaloExchanger(torch.nn.Module):
         for req in dist_env.batch_isend_irecv(p2p_ops):
             req.wait()
 
-        torch.concat(recv_buffers, out=self.chunk_v)
-        return self.chunk_v
+        torch.concat(recv_buffers, out=self.chunk)
+        return self.chunk
 
 
 def all_gather_into_tensor(
