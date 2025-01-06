@@ -71,6 +71,11 @@ class EasierProxy(Proxy):
     #   https://github.com/pytorch/pytorch/blob/v1.13.0/torch/fx/graph.py#L1473
 
 
+# Store base types outside of EasierTracer. During FX tracing those symbols
+# will become FX hooks instead of Python types.
+_leaf_module_types = (esr.Module, esr.Selector, esr.Reducer)
+
+
 class EasierTracer(Tracer):
     """Custom Tracer to label easier atomic modules and functions as leaf nodes
     """
@@ -80,15 +85,38 @@ class EasierTracer(Tracer):
                  autowrap_functions: Tuple[Callable, ...] = (),
                  param_shapes_constant: bool = False) -> None:
         super().__init__(
-            # NOTE both esr and _EsrMod modules are required, so that
-            # invocations like `esr.sum` and `_EsrMod.sum` are hooked by FX.
+            # In `eaiser/__init__.py` and many other Python modules we did
+            # `from easier.core.modules import sum, xxx`
+            # and such imports effectively add new variable names in the
+            # importing modules. Although these variables point to the same
+            # function/class, these variables in re-importing modules are
+            # different.
+            # NOTE unrelevant functions like the constructor `esr.Module`
+            # is FX-traced too!
+            #
+            # So we need to wrap all re-importing modules, so that invocations
+            # like `esr.sum` and `esr.core.modules.sum` are hooked by FX.
             tuple(autowrap_modules) + (math, esr, _EsrMod),  # type: ignore
-            autowrap_functions, param_shapes_constant)
+            # All functions in `autowrap_modules` will be included as
+            # `autowrap_functions`, so we don't need to specify esr.sum etc.
+            # But the opposite way won't work: only specifying esr.sum etc.
+            # as `autowrap_functions` only affects the current `global()`, it
+            # won't wrap module-dot-function `esr.sum` calls.
+            autowrap_functions,
+            param_shapes_constant
+        )
 
     def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
-        # register modules in easier.core.ops as leaf module during tracing
-        return (super().is_leaf_module(m, module_qualified_name)
-                or m.__module__.startswith("easier.core.module"))
+        # register:
+        # - esr.Selector, esr.Reducer
+        # - esr.Module, to stop inlining and avoid graph size bloating
+        # in easier.core.modules as leaf modules during tracing
+        # NOTE we cannot reference esr.Module etc. here, because during
+        # tracing, the result of deferencing "Module" in "esr" module
+        # will become a function -- a FX wrapper.
+        if isinstance(m, _leaf_module_types):
+            return True
+        return super().is_leaf_module(m, module_qualified_name)
 
     def proxy(self, node: Node) -> EasierProxy:
         return EasierProxy(node, tracer=self)
@@ -312,8 +340,7 @@ def compile(
 
     if loaded_graphs is not None:
         graphs = loaded_graphs
-    else:
-        # passes
+    else:  # ahead-of-time passes
         modules, graphs = passes.check_syntax(modules, graphs)
 
         modules, graphs = passes.group_tensors(modules, graphs)

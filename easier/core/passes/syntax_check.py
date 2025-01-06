@@ -41,16 +41,23 @@ class SyntaxChecker(EasierInterpreter):
                     f"Unexpected function call to {function}"
                 )
 
-
     def if_call_module(self, submod: nn.Module):
         if isinstance(submod, _EsrMod.Module):
-            # TODO will be changed in the future and allow nested calls
-            raise EasierJitException(
-                "Cannot have nested esr.Module calls"
-            )
+            # Ok to have nodes of calls to nested esr.Module, which prevents
+            # from inlining and bloating the graph.
+            # Do some common checks here:
+            if len(self.current_node.users) > 0:
+                raise EasierJitException(
+                    "The result of easier.Module.forward() is always"
+                    " None and cannot be used"
+                )
+            if len(self.current_node.all_input_nodes) > 0:
+                raise EasierJitException(
+                    "easier.Module.forward() cannot have parameters"
+                )
 
         elif isinstance(submod, (_EsrMod.Selector, _EsrMod.Reducer)):
-            pass 
+            pass
 
         else:
             raise EasierJitException(
@@ -58,12 +65,12 @@ class SyntaxChecker(EasierInterpreter):
                 " torch.nn.functional function instead"
             )
 
-
     def if_output(self):
         if self.current_node.args != (None,):
             raise EasierJitException(
                 "easier.Module.forward() cannot have return value"
             )
+
 
 def check_syntax(modules, graphs):
     """

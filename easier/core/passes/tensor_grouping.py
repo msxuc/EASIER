@@ -177,7 +177,12 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         else:
             return rep_input_def  # follow whatever TensorDef of the inputs
 
-    def if_call_module(self, module: torch.nn.Module):
+    def if_call_module(
+        self, module: torch.nn.Module
+    ) -> Optional[EasierTensorDef]:
+        if isinstance(module, esr.Module):  # nested esr.Module calls
+            return None
+
         args = self.current_node.args
         kwargs = self.current_node.kwargs
 

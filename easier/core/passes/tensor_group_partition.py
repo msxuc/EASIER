@@ -159,6 +159,9 @@ class CommPairCollector(EasierInterpreter):
             self.accum_n += tensor_group.n
 
     def if_call_module(self, submod: Module):
+        if isinstance(submod, esr.Module):  # nested esr.Module calls
+            return
+
         if submod in self.visited:
             # We assume the TensorGroup equivalency based on module instance
             return

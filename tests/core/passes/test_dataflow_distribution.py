@@ -111,7 +111,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_length is None
+        assert haloxchg.concat_buffer_length is None
 
     elif local_rank == 1:
         getattr_v, call_selector, setitem_v, out = graph.nodes
@@ -120,7 +120,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_length == 8
+        assert haloxchg.concat_buffer_length == 8
 
     assert getattr_v.op == FX.GET_ATTR
     assert call_selector.op == FX.CALL_MODULE
@@ -216,7 +216,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
         getattr_v, call_haloxchg, call_reducer, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_length == 4
+        assert haloxchg.concat_buffer_length == 4
 
     elif local_rank == 1:
         getattr_v, call_reordering_selector, call_reducer, \
@@ -232,7 +232,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
             out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_length == 8
+        assert haloxchg.concat_buffer_length == 8
 
         assert isinstance(
             jm.get_submodule(call_reordering_selector.target),  # type: ignore

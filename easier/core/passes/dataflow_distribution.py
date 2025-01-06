@@ -80,6 +80,9 @@ class HaloExchangerInserter(EasierInterpreter):
         self.haloxchg_name_allocator = SubmodNameAllocator('haloexchanger')
 
     def if_call_module(self, submod: torch.nn.Module):
+        if isinstance(submod, esr.Module):  # nested esr.Module calls
+            return
+
         root = self.current_module
         node = self.current_node
 

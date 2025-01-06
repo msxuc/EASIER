@@ -133,6 +133,40 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
     assert jitted.v2.elempart.lengths[0] == 13  # type: ignore
 
 
+def test_nested_easier_modules():
+    class Inner(esr.Module):
+        def __init__(self):
+            super().__init__()
+            self.v = esr.Tensor(torch.ones(10), mode='partition')
+            self.s = esr.Selector(torch.arange(10))
+            self.r = esr.Reducer(torch.arange(10), 10)
+
+        def forward(self):
+            self.v[:] = self.r(self.s(self.v))
+
+    class Outer(esr.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = Inner()
+            self.s = esr.Selector(torch.arange(10))
+            self.r = esr.Reducer(torch.arange(10), 10)
+
+        def forward(self):
+            k = self.s(self.inner.v)
+            self.inner()
+            self.inner.v[:] = self.r(k)
+
+    outer = Outer()
+    j_outer, = esr.compile([outer])
+
+    g: Graph = j_outer.forward.__self__.graph  # type: ignore
+    for n in g.nodes:
+        if n.op == 'call_module' and n.target == 'inner':
+            break
+    else:
+        assert False, "shoud have nested call"
+
+
 def worker__test_collect(local_rank: int, world_size: int,
                          dev_type: str, jit_backend: str):
 

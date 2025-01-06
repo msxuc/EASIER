@@ -140,11 +140,6 @@ class EasierInterpreter(Generic[_T]):
             submod_path = cast(str, node.target)
             callee = root.get_submodule(submod_path)
 
-            if isinstance(callee, esr.Module):
-                raise EasierJitException(
-                    "Currently esr.Modules should have been inlined"
-                )
-
             self.callee_module_path = submod_path
             val = self.if_call_module(callee)
 
