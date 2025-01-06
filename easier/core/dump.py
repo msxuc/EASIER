@@ -709,11 +709,12 @@ class HaloXchgBindingsCollector(EasierInterpreter):
 
     def if_call_module(self, submod):
         if isinstance(submod, HaloExchanger):
-            self.halo_exchangers_bindings[self.callee_module_path] = \
-                HaloExchangerInfo(
-                    bound_prim_path=submod.parent_primitive,
-                    input_elempart_length=submod.input_elempart_length
-                )
+            self.halo_exchangers_bindings[
+                self.callee_module_path
+            ] = HaloExchangerInfo(
+                bound_prim_path=submod.parent_primitive,
+                input_elempart_length=submod.input_elempart_length
+            )
 
 
 class ConstantsCollector(EasierInterpreter):
