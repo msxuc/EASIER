@@ -25,9 +25,6 @@ from easier.core.module import Module, Selector, Reducer
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.tensor_group_partition import \
     ElemPart
-from easier.core.passes.metadata_propagation.metadata import \
-    EasierTensorMeta, Role, convert_scalar_type_to_torch_dtype, \
-    set_node_meta, get_node_meta
 
 
 class ConstantTensorMover(EasierInterpreter):
@@ -103,20 +100,14 @@ class HaloExchangerInserter(EasierInterpreter):
             get_node_tensor_group(input_node)  # type: ignore
         ]
 
-        meta: EasierTensorMeta = get_node_meta(node)  # type: ignore
         haloxchg_inst = HaloExchanger(
             is_for_selector=isinstance(submod, esr.Selector),
             input_elempart_length=input_elempart.idx.shape[0],
             runtime_halos_lidxes=submod.runtime_halos_local_idxes,
             runtime_recv_lengths=submod.runtime_halos_recv_lengths,
-            dtype=convert_scalar_type_to_torch_dtype(meta.dtype),
             parent_primitive=self.callee_module_path
         )
         if haloxchg_inst.is_needed:
-            # TODO Still pre init buffer because current metaprop needs the
-            # batch-dim size of the chuck buffer.
-            haloxchg_inst.init_buffers(meta.shape[1:])
-
             # Rewrite call_module Node
             haloxchg_modpath = self.haloxchg_name_allocator.alloc_name(
                 root, hint=self.callee_module_path
@@ -236,9 +227,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
     """
 
     def if_call_function(self, function):
-        if function not in [
-            esr.sum, esr.prod, esr.norm, esr.max, esr.min
-        ]:
+        if function not in esr.easier_aggregators:
             return
 
         node = self.current_node
@@ -294,10 +283,6 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             )
 
         node.replace_all_uses_with(replica_reduce)
-        # Newly added Nodes have no metadata associated,
-        # and since we replace uses with the newly added Node, we need to copy
-        # node metadata for it.
-        set_node_meta(replica_reduce, get_node_meta(node))
         node.graph.erase_node(node)
 
 

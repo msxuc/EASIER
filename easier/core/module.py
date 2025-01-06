@@ -162,7 +162,10 @@ def _resolve_data_loader(arg) -> DataLoaderBase:
         raise TypeError(f"Unknown data type {type(arg)}")
 
 
-def _validate_idx(dl: DataLoaderBase, cls_name: str, n: Optional[int]):
+def _validate_idx_dataloader(module: Union['Selector', 'Reducer']):
+    dl = module.easier_data_loader
+    cls_name = module.__class__.__name__
+
     cpu_dist_env = get_cpu_dist_env()
     if cpu_dist_env.rank == 0:
         try:
@@ -185,7 +188,8 @@ def _validate_idx(dl: DataLoaderBase, cls_name: str, n: Optional[int]):
                     f"The minimum value of the {cls_name} index tensor {idxmin}"
                     f" must be greater than or equal 0"
                 )
-            if n is not None:
+            if isinstance(module, Reducer):
+                n = module.n
                 if not isinstance(n, int):
                     raise TypeError(
                         f"The argument `n` to {cls_name} must be an integer"
@@ -202,10 +206,14 @@ def _validate_idx(dl: DataLoaderBase, cls_name: str, n: Optional[int]):
             # Aborting one rank-0 will kill all processes and surpass barriers.
             cpu_dist_env.abort()
 
-        cpu_dist_env.barrier()
+    else:  # rank != 0
+        idxmax = -1  # does not matter
 
-    else:
-        cpu_dist_env.barrier()
+    # NOTE this bcast() also serves as a collective barrier.
+    [idxmax] = cpu_dist_env.broadcast_object_list(0, [idxmax])
+
+    if isinstance(module, Selector):
+        module.idx_max = idxmax
 
 
 def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
@@ -257,16 +265,23 @@ class Selector(nn.Module):
             )
             self.idx = idx
             self.easier_index_status = 'rewritten'
+
+            # self.idx_max is not needed for noncollective Selectors
+
             # Let related passes to fill other JIT-only fields.
 
             return
 
         idx_dl = _resolve_data_loader(idx)
-        _validate_idx(idx_dl, 'Selector', None)
         self.easier_data_loader = idx_dl
+        _validate_idx_dataloader(self)
         idx_ph: torch.Tensor = idx_dl.get_placeholder()
 
         self.idx: torch.Tensor = idx_ph
+
+        # The maximum index of the original idx data loader,
+        # collectively figured out in _validate_idx_dataloader
+        self.idx_max: int
 
         self.easier_index_status: IdxStatus = 'placeholder'
 
@@ -289,6 +304,9 @@ class Selector(nn.Module):
         if self.easier_index_status != 'rewritten':
             raise RuntimeError("Selector.idx not ready, run compile() first")
 
+        # NOTE at backend==none runtime,
+        # bad cases like `not(self.idx_max < tensor.shape[0])` will be
+        # thrown and reported by the tensor indexing operation.
         return tensor[self.idx]
 
     def to(self, *args, **kwargs):
@@ -308,17 +326,17 @@ class Reducer(nn.Module):
                  ) -> None:
         super().__init__()
 
+        self.n = n
+        self.reduce = reduce
+
         idx_dl = _resolve_data_loader(idx)
-        _validate_idx(idx_dl, 'Reducer', n)
         self.easier_data_loader = idx_dl
+        _validate_idx_dataloader(self)
         idx_ph: torch.Tensor = idx_dl.get_placeholder()
 
         self.idx: torch.Tensor = idx_ph
 
         self.easier_index_status: IdxStatus = 'placeholder'
-
-        self.n = n
-        self.reduce = reduce
 
         self.set_fullness()
 
@@ -437,6 +455,10 @@ class Tensor(nn.Parameter):
                 mode: Literal['partition', 'replicate'],
                 requires_grad: bool = False) -> "Tensor":
         dl = _resolve_data_loader(data)
+        if mode == 'partition':
+            if not (len(dl.shape) >= 1):
+                raise ValueError('Partition easier.Tensor must have ndim >= 1')
+
         data_ph: torch.Tensor = dl.get_placeholder()
 
         tensor = super().__new__(cls, data_ph, requires_grad)  # type: ignore
@@ -474,9 +496,17 @@ class Tensor(nn.Parameter):
 
     def __repr__(self) -> str:
         if self.is_replica:
-            return 'Replicated easier.Tensor\n' + repr(self.data)
+            if not self.easier_data_ready:
+                repr_str = ' ' + repr(self.easier_data_loader)
+            else:
+                repr_str = '\n' + repr(self.data)
+            return 'Replicated easier.Tensor' + repr_str
         else:
-            return 'Managed partitioned easier.Tensor'
+            if not self.easier_data_ready:
+                repr_str = ' ' + repr(self.easier_data_loader)
+            else:
+                repr_str = ''
+            return 'Managed partitioned easier.Tensor' + repr_str
 
     def __setitem__(self, indices, val) -> 'Tensor':
         """
@@ -503,12 +533,18 @@ class Tensor(nn.Parameter):
             " consider defining a new easier.Tensor instance.")
 
     def collect(self) -> torch.Tensor:
+        if not self.easier_data_ready:
+            raise RuntimeError("Tensor data is not ready, run compile() first")
+
         if self.elempart is not None:
             return _dist_collect(self)
         else:
             return self.data.to(self.easier_data_loader.device, copy=True)
 
     def save(self, h5_file_path, h5_dataset_path, **h5_file_kwargs) -> None:
+        if not self.easier_data_ready:
+            raise RuntimeError("Tensor data is not ready, run compile() first")
+
         cpu_dist_env = get_cpu_dist_env()
         if cpu_dist_env.rank == 0:
 
@@ -692,3 +728,6 @@ def min(tensor: torch.Tensor) -> torch.Tensor:
         At JIT-time, must be a distributed tensor.
     """
     return _allreduce(torch.min, tensor)
+
+
+easier_aggregators = (sum, prod, norm, max, min)

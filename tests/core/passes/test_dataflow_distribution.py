@@ -97,7 +97,6 @@ def worker__test_halo_exchanger_insertion_for_selector(
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
     [jm], [graph] = passes.group_tensors([m], [graph])
 
     _JitRuntimeDistEnv.set_runtime_dist_env_backend('cpu')
@@ -112,7 +111,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is None
+        assert haloxchg.chunk_length is None
 
     elif local_rank == 1:
         getattr_v, call_selector, setitem_v, out = graph.nodes
@@ -121,7 +120,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
+        assert haloxchg.chunk_length == 8
 
     assert getattr_v.op == FX.GET_ATTR
     assert call_selector.op == FX.CALL_MODULE
@@ -149,7 +148,6 @@ def worker__test_halo_exchanger_insertion_for_reducer(
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
     [jm], [graph] = passes.group_tensors([m], [graph])
 
     input_elempart_idxes = torch.arange(18).split(6)
@@ -218,8 +216,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
         getattr_v, call_haloxchg, call_reducer, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
-        assert haloxchg.chunk_v.shape[0] == 4
+        assert haloxchg.chunk_length == 4
 
     elif local_rank == 1:
         getattr_v, call_reordering_selector, call_reducer, \
@@ -235,8 +232,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
             out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
-        assert haloxchg.chunk_v.shape[0] == 8
+        assert haloxchg.chunk_length == 8
 
         assert isinstance(
             jm.get_submodule(call_reordering_selector.target),  # type: ignore

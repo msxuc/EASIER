@@ -484,7 +484,6 @@ def test_evenly_mode():
     m = M()
     m.partition_mode = 'evenly'
     g = EasierTracer().trace(m)
-    [m], [g] = passes.propagate_metadata([m], [g])  # type: ignore
     [m], [g] = passes.group_tensors([m], [g])  # type: ignore
     [m], [g] = passes.partition_tensor_groups(
         [m], [g]
