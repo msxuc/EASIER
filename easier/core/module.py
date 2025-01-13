@@ -105,10 +105,10 @@ def arange(start, end, step=1, dtype=None, device=None): ...
 
 
 def arange(*args, **kwargs):
-    def _end_matcher(end, dtype, device):
+    def _end_matcher(end, dtype=None, device=None):
         return (0, end, 1, dtype, device)
 
-    def _start_end_matcher(start, end, step, dtype, device):
+    def _start_end_matcher(start, end, step=1, dtype=None, device=None):
         return (start, end, step, dtype, device)
 
     def _resolve():
@@ -142,6 +142,10 @@ def arange(*args, **kwargs):
 
     if dtype is None:
         dtype = default_dtype
+
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
 
     return ArangeTensorLoader(start, end, step, dtype, device)
 

@@ -199,7 +199,17 @@ class CommPairCollector(EasierInterpreter):
         self._init_tensor_group_offset(src_tensor_group)
         self._init_tensor_group_offset(dst_tensor_group)
 
-        src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
+        d = get_cpu_dist_env()
+        if d.rank == 0:
+            ns = src_tensor_group.n
+            nd = dst_tensor_group.n
+            src_idx = torch.concat([ torch.full([nd], i) for i in range(ns)])
+            dst_idx = torch.concat([ torch.arange(nd) for i in range(ns)])
+        else:
+            src_idx = torch.zeros([0], dtype=torch.int64)
+            dst_idx = torch.zeros([0], dtype=torch.int64)
+
+        # src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
         self.comm_pairs.append(CommPair(src_tensor_group, src_idx,
                                         dst_tensor_group, dst_idx,
                                         caused_by_reducer))
