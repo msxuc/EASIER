@@ -20,8 +20,6 @@ class ShallowWaterAssembler:
     def __init__(self, mesh_path: str):
         path, name = os.path.split(mesh_path)
         path = os.path.join(path, 'SW_' + name)
-        if os.path.exists(path):
-            return path
 
         self.path = path
 
@@ -48,6 +46,9 @@ class ShallowWaterAssembler:
         self.alpha = torch.zeros(ne).double()
 
     def assemble(self):
+        if os.path.exists(self.path):
+            return self.path
+
         points = self.points
         src_p = self.cells[self.src]
         dst_p = self.cells[self.dst]
@@ -271,8 +272,7 @@ class ShallowWaterEquation(esr.Module):
         gather_b_h_square = 0.5 * self.gather_b(h)**2
 
         delta_h = - (
-            self.scatter(uh_f_times_sx + vh_f_times_sy) +
-            self.scatter_b(self.gather_b(h * 0))
+            self.scatter(uh_f_times_sx + vh_f_times_sy)
         ) / self.area
 
         delta_uh = - (
