@@ -39,26 +39,24 @@ pip install -e .                            # equals `python setup.py develop`
 
 ### Run examples
 
-Solve shallow water equations in a square box:
+Solving shallow water equations in a square box with EASIER:
 ```shell
 # create folder to store simulation results
 mkdir res
 
 # launch the simulation in a `torchrun` style
 easierrun --nnodes=1 --nproc_per_node=4 tutorial/shallow_water_equation.py --backend=cpu --output=res
-```
 
-EASIER launcher `easierrun` provides similar user experience to that of `torchrun`.
-Just add `--master_addr` argument to the launcher if there are multiple nodes.
-
-Plot the simulation results
-```shell
+# Visualize simulation results
 python tutorial/swe_plot.py --data_dir res --filename swe.gif
 ```
 
 <div align="center">
-  <img width="500px" src="tutorial/swe.gif"/>
+  <img width="600px" src="tutorial/swe.gif"/>
 </div>
+
+EASIER launcher `easierrun` provides similar user experience to that of `torchrun`.
+Just add `--master_addr` argument to the launcher if there are multiple nodes.
 
 # Tutorial
 Detailed tutorial and more examples are coming soon.
