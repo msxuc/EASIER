@@ -4,7 +4,6 @@ import easier as esr
 
 import gmsh
 import meshio
-import pyvista as pv
 from tqdm import trange
 
 
