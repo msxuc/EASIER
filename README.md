@@ -6,63 +6,42 @@
 
 # What is EASIER?
 
-Manufacturing engineers and natural science researchers have long struggled with ad-hoc implementations of physical simulations and manual deployment on large clusters, preventing them from fully focusing on their products and scientific research.
-**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a domain specific language for
+Manufacturing engineers and natural science researchers have long struggled with the ad-hoc implementations of large-scale numerical simulations and their manual deployment on clusters.
+**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a just-in-time (JIT) tensor dataflow compiler
+built on top of PyTorch.
+It scales numerical simulations to any number of workers and any kind of accelerators without requiring any code changes, making the development of numerical simulations and their deployment on explosively growing AI supercomputers as easy as that of large language models.
 
-**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is an open-source parallel programming language for scientific computing at scale.
-It is embedded in PyTorch and uses just-in-time (JIT) compiler to automatically scale scientific computing tasks, especially physical simulations,
+# Get Started
 
-Taichi Lang is an open-source, imperative, parallel programming language for high-performance numerical computation. It is embedded in Python and uses just-in-time (JIT) compiler frameworks, for example LLVM, to offload the compute-intensive Python code to the native GPU or CPU instructions.
+### Installation
 
-, just-in-time compiler, and high-performance runtime to make development and deployment of physical simulations as easy as that of large language models.
-
-
-
-# Getting Started
-
-Manufacturing engineers and natural science researchers have long struggled with ad-hoc implementations of physical simulations and manual deployment on large-scale clusters, which prevents them from fully focusing on their products and research. **EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a domain-specific language, compiler, and runtime that simplifies the development and deployment of physical simulations, similar to large language models. This saves R&D costs for industries and research labs.
-
-scientific computing tasks and their hand-craft deployment on clusters.
-
-
- efficiently and automatically scaling scientific computing tasks up and out, providing scientific computing developers similar experience to that of developing and deploying large-scale deep learning models.
-
-## Setup the development environment
-
-The dependencies should be fixed to exactly the acceptable minimun versions to
-ensure the widest compatibility and development consistency.
-
-The Python itself should be fixed to 3.8:
+To ensure the compatibility of all dependencies, the Python verion should be fixed to 3.8 for now.
 
 ```shell
 # for conda
 conda create -n ENV_NAME python=3.8
 conda activate ENV_NAME
 
-# for other venvs
-# TODO
+# for conda, run this only when you see compile/link errors with following `pip` commands
+conda install gxx_linux-64
 ```
 
-To install the dependencies for development:
+Clone the repo and install EASIER as well as all dependencies:
 
 ```shell
-pip install Cython mpi4py               # must be installed separately
+git clone https://github.com/microsoft/EASIER.git
+cd EASIER
+
+# for Ubuntu
+sudo apt-get install libopenmpi-dev
+
+pip install Cython==3.0.11 mpi4py==3.1.5    # must be installed separately
 pip install -r dev-requirements.txt
-pip install -e .                        # equals `python setup.py develop`
+pip install -e .                            # equals `python setup.py develop`
 ```
 
-## Project folder structure
-```bash
-├── docker/       # Dockerfiles
-├── easier/       # python package
-│   ├── core/     # jit compiler implementation
-│   └── **/**     # numerical algorithms based on eaiser jit compiler
-├── tests/        # unit tests
-├── dev-requirements.txt
-├── README.md
-├── setup.py
-└── .gitignore
-```
+### Run examples
+
 
 ## Trademarks
 

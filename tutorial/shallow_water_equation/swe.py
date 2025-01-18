@@ -1,24 +1,22 @@
 import os
 import argparse
-from typing_extensions import Literal
 
 import torch
+import h5py
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import imageio.v2 as imageio
 
 import easier as esr
-from easier.core.module import VertexSet
-from easier.examples import Poisson
 from easier.examples.mesh import get_triagular_mesh
 
 
 class ShallowWaterEquation(esr.Module):
     def __init__(self, mesh_size=100, dt=0.005) -> None:
         super().__init__()
-        mesh_path = mesh = get_triagular_mesh(mesh_size)
+        mesh_path = get_triagular_mesh(mesh_size)
         path, name = os.path.split(mesh_path)
-        path = os.path.join(path, 'Poisson_' + name)
+        path = os.path.join(path, 'SWE_' + name)
         if os.path.exists(path):
             return path
 
@@ -30,35 +28,11 @@ class ShallowWaterEquation(esr.Module):
             bcells = torch.from_numpy(mesh['bcells'][...]).long()
             bpoints = torch.from_numpy(mesh['bpoints'][...]).long()
 
-
         self.dt = 0.005
 
-        mesh = Poisson(type).mesh
-
-        # cells (torch.LongTensor): three point indices for each triangle
-        #   cells, with shape `(nc, 3)`, `nc` means number of cells
-        cells = torch.from_numpy(mesh['cells']).long()
-        # points (torch.DoubleTensor): point coordinates on a plane,
-        #   with shape `(np, 2)`, `np` means number of points
-        points = torch.from_numpy(mesh['points']).double()
-
-        pset = VertexSet(points.shape[0])
-        cset = esr.VertexSet(cells.shape[0])
-
-        # src (torch.LongTensor): src cell indices, with shape `(ne,)`
-        src = torch.from_numpy(mesh['src']).long()
-        # dst (torch.LongTensor): dst cell indices, with shape `(ne,)`
-        dst = torch.from_numpy(mesh['dst']).long()
-        # bcells (torch.LongTensor): boundary cell indices, with shape `(nbc,)`,
-        #   `nbc` means number of boundary cell
-        bcells = torch.from_numpy(mesh['bcells']).long()
-        # bpoints (torch.LongTensor): boundary points indices in each boundary
-        #   cell, with shape `(nbc, 2)`, `nbc` means number of boundary cell
-        bpoints = torch.from_numpy(mesh['bpoints']).long()
-
-        self.scatter = esr.Scatter(dst, cset)
-        self.gather_src = esr.Gather(src, cset)
-        self.gather_dst = esr.Gather(dst, cset)
+        self.reduce = esr.Reducer(dst, cells.shape[0])
+        self.select_src = esr.Selector(src)
+        self.select_dst = esr.Gather(dst, cells.shape[0])
         self.scatter_b = esr.Scatter(bcells, cset)
         self.gather_b = esr.Gather(bcells, cset)
 
