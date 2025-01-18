@@ -2,14 +2,11 @@
   <img width="500px" src="tutorial/logo.png"/>
 </div>
 
----
-
 # What is EASIER?
 
-Manufacturing engineers and natural science researchers have long struggled with the ad-hoc implementations of large-scale numerical simulations and their manual deployment on clusters.
-**EASIER** (**E**fficient **A**uto-scalable **S**cientific **I**nfrastructure for **E**ngineers and **R**esearchers) is a just-in-time (JIT) tensor dataflow compiler
-built on top of PyTorch.
-It scales numerical simulations to any number of workers and any kind of accelerators without requiring any code changes, making the development of numerical simulations and their deployment on explosively growing AI supercomputers as easy as that of large language models.
+**EASIER** is a domain specific language to automatically scale physical simulations to any number of workers and any kind of accelerators without requiring any code changes.
+It is embedded in Pytorch and just-in-time (JIT) distributes and compiles tensor dataflows that describe large-scale physical simulations,
+making the development of physical simulations and their deployment on explosively growing AI supercomputers as easy as that of large language models.
 
 # Get Started
 
