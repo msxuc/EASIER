@@ -4,9 +4,9 @@
 
 # What is EASIER?
 
-**EASIER** is a domain specific language to automatically scale physical simulations to any number of workers and any kind of accelerators without requiring any code changes.
-It is embedded in Pytorch and just-in-time (JIT) distributes and compiles tensor dataflows that describe large-scale physical simulations,
-making the development of physical simulations and their deployment on explosively growing AI supercomputers as easy as that of large language models.
+**EASIER** is a domain specific language embedded in PyTorch to automatically scale physical simulations up and out.
+It just-in-time (JIT) distributes tensor dataflows that describe physical simulations to any number of workers and compiles them for any kind of accelerators without requiring any code changes.
+This makes the development of high-performance physical simulations on explosively growing AI supercomputers is as easy as that of large language models.
 
 # Get Started
 
@@ -39,6 +39,29 @@ pip install -e .                            # equals `python setup.py develop`
 
 ### Run examples
 
+Solve shallow water equations
+
+```shell
+mkdir res  # create folder to store simulation results
+easierrun --nnodes=1 --nproc_per_node=4 tutorial/shallow_water_equation.py --backend=cpu --output=res
+python tutorial/swe_plot.py --data_dir res --filename swe.gif
+```
+
+EASIER launcher `easierrun` provides similar user experience to that of `torchrun`.
+Just add `--master_addr` argument to the launcher if there are multiple nodes.
+
+Plot the simulation results
+
+```shell
+python tutorial/swe_plot.py --data_dir res --filename swe.gif
+```
+
+<div align="center">
+  <img width="500px" src="tutorial/swe.gif"/>
+</div>
+
+# Tutorial
+Detailed tutorial and more examples are coming soon.
 
 ## Trademarks
 
