@@ -10,7 +10,7 @@ from mpi4py import MPI
 import easier as esr
 from easier.numeric import Linsys
 
-from .mesh import get_triagular_mesh
+from .mesh import get_triangular_mesh
 
 
 def _reduce(tensor: torch.Tensor, idx: torch.Tensor, n: int):
@@ -133,7 +133,7 @@ class Poisson(esr.Module):
         comm = MPI.COMM_WORLD
         rank = comm.Get_rank()
         if rank == 0:
-            mesh = get_triagular_mesh(mesh_size)
+            mesh = get_triangular_mesh(mesh_size)
             poisson = _assemble_poisson(mesh)
             mesh, poisson = comm.bcast([mesh, poisson])
         else:
