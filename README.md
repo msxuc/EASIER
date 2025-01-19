@@ -5,7 +5,7 @@
 # What is EASIER?
 
 **EASIER** is a domain specific language embedded in PyTorch to automatically scale physical simulations up and out.
-It just-in-time (JIT) distributes tensor dataflows that describe physical simulations to any number of workers and compiles them for extendable backend accelerators without requiring developers to make any code changes.
+It just-in-time (JIT) distributes tensor dataflows that describe physical simulations to any number of workers and compiles them for extendable hardware backends without requiring developers to make any code changes.
 This makes the development of large-scale high-performance physical simulations on explosively growing AI supercomputers is as easy as that of large language models.
 
 # Get Started
@@ -19,27 +19,16 @@ To ensure the compatibility of all dependencies, the Python verion should be fix
 conda create -n ENV_NAME python=3.8
 conda activate ENV_NAME
 
-<<<<<<< HEAD
 # for conda, run this only when you see compile/link errors with following `pip` commands
 conda install gxx_linux-64
-=======
-# for conda, only run this if you see compile/link errors with `pip` commands
-conda install gxx_linux-64
-
-# for other venvs
-# TODO
->>>>>>> main
 ```
 
 Clone the repo and install EASIER as well as all dependencies:
 
 ```shell
-<<<<<<< HEAD
 git clone https://github.com/microsoft/EASIER.git
 cd EASIER
 
-=======
->>>>>>> main
 # for Ubuntu
 sudo apt-get install libopenmpi-dev
 
@@ -65,7 +54,7 @@ python tutorial/swe_plot.py --data_dir res --filename swe.gif
 <div align="center">
   <img width="300px" src="tutorial/swe.png">
   &nbsp &nbsp &nbsp &nbsp &nbsp &nbsp
-  <img width="257px" src="tutorial/swe.gif"/>
+  <img width="330px" src="tutorial/swe.gif"/>
 </div>
 
 EASIER launcher `easierrun` provides similar user experience to that of `torchrun`.
