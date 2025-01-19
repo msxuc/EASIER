@@ -19,16 +19,27 @@ To ensure the compatibility of all dependencies, the Python verion should be fix
 conda create -n ENV_NAME python=3.8
 conda activate ENV_NAME
 
+<<<<<<< HEAD
 # for conda, run this only when you see compile/link errors with following `pip` commands
 conda install gxx_linux-64
+=======
+# for conda, only run this if you see compile/link errors with `pip` commands
+conda install gxx_linux-64
+
+# for other venvs
+# TODO
+>>>>>>> main
 ```
 
 Clone the repo and install EASIER as well as all dependencies:
 
 ```shell
+<<<<<<< HEAD
 git clone https://github.com/microsoft/EASIER.git
 cd EASIER
 
+=======
+>>>>>>> main
 # for Ubuntu
 sudo apt-get install libopenmpi-dev
 
