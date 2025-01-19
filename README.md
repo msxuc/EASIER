@@ -5,7 +5,7 @@
 # What is EASIER?
 
 **EASIER** is a domain specific language embedded in PyTorch to automatically scale physical simulations up and out.
-It just-in-time (JIT) distributes tensor dataflows that describe physical simulations to any number of workers and compiles them for extendable hardware backends without requiring developers to make any code changes.
+It just-in-time (JIT) distributes tensor dataflows that describe physical simulations to any number of workers and compiles them for extendable hardware backends without requiring users to make any code changes.
 This makes the development of large-scale high-performance physical simulations on explosively growing AI supercomputers is as easy as that of large language models.
 
 # Get Started
