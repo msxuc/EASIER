@@ -5,7 +5,7 @@ import math
 import operator
 from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, cast
+    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
 from typing_extensions import Literal
 import more_itertools
 import os
@@ -26,7 +26,7 @@ from easier.core.passes.utils import \
     get_easier_objects
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
-    set_dist_env_runtime_backend, set_dist_env_runtime_device_type
+    set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type
 
 
 class EasierProxy(Proxy):
@@ -161,7 +161,7 @@ def _validate_compile_args(
     partition_mode,
 ) -> Tuple[
     List[esr.Module],  # top_modules
-    Literal['torch', 'cpu', 'gpu', 'none'],  # backend
+    Literal['torch', 'cpu', 'cuda', 'none'],  # backend
     Literal['metis', 'evenly'],  # partition_mode,
 ]:
     # validate top_modules must never be compiled
@@ -184,28 +184,7 @@ def _validate_compile_args(
                     _raise()
 
     # validate compile backend
-    if backend is None:
-        # Python keyword `None` is different from string "none":
-        # - `None` means the compile backend is not specified at all at the
-        #   invocation of `compile()`, the backend to use will be decided by
-        #   a chain of rules;
-        # - "none" means the JIT compilation is turned off.
-        #   "none" may be a result decided by the rules when `backend is None`.
-
-        # The env var "EASIER_COMPILE_BACKEND" may be set by EASIER Launcher
-        # command line argument `--backend`.
-        env_backend = os.environ.get("EASIER_COMPILE_BACKEND", None)
-
-        if env_backend is None:
-            backend = 'torch'
-        elif env_backend in ['torch', 'cpu', 'gpu', 'none']:
-            backend = env_backend  # type: ignore
-        else:
-            raise EasierJitException(
-                "Detected invalid value of EASIER_COMPILE_BACKEND: "
-                + env_backend
-            )
-    if backend not in ['torch', 'cpu', 'gpu', 'none']:
+    if backend not in ['torch', 'cpu', 'cuda', 'none']:
         raise EasierJitException(f"Argument `jit_backend` cannot be {backend}")
 
     # validate partition_mode
@@ -249,7 +228,7 @@ def _fully_load_data_backend_none(
 
 
 def init(
-    comm_backend: Literal['gloo', 'nccl', 'mpi', None] = None,
+    comm_backend: Union[Literal['gloo', 'nccl', 'mpi'], str, None] = None,
     **kwargs
 ) -> None:
     """
@@ -260,14 +239,19 @@ def init(
             if provided, EASIER compiler will use the specified communication
             backend for runtime communication, supporting:
             - "gloo": GLOO backend provided by `torch.distributed`, CPU-only
-            - "nccl": NCCL backend provided by `torch.distributed`, GPU-only
+            - "nccl": NCCL backend provided by `torch.distributed`, CUDA-only
             - "mpi": MPI backend provided by `torch.distributed`,
-                supporting CPU and GPU TODO CPU-only?
+                could support CPU and CUDA depending on how OpenMPI is built.
+            
+            Combining device types and communication backends is supported,
+            e.g. "cpu:gloo,cuda:nccl".
 
-            If None is provided, use the value specified by the
-            environment variable EASIER_COMPILE_BACKEND.
-            If EASIER_COMM_BACKEND is not defined, will use "gloo" for CPU
-            and "nccl" for GPU.
+            If None is provided, EASIER will use
+            "cpu:gloo,cuda:nccl" if CUDA is available, or simply "gloo" if
+            CUDA is not available.
+    
+    -   **kwargs
+            additional arguments to `torch.distributed.init_process_group()`
     """
     # TODO although we'll just pass `comm_backend` to
     # `torch.distributed.init_process_group()`, we must limit the values like
@@ -275,26 +259,22 @@ def init(
     # dispatch DistEnv for certain implementation, like GlooDistEnv,
     # because different comm backend has different API set.
     if comm_backend is None:
-        env_comm_backend = os.environ.get("EASIER_COMM_BACKEND", None)
-        if env_comm_backend not in ['gloo', 'nccl', 'mpi', None]:
-            raise EasierJitException(
-                "Detected invalid value of EASIER_COMM_BACKEND: "
-                + env_comm_backend  # type: ignore
-            )
-        comm_backend = env_comm_backend  # type: ignore
+        if torch.cuda.is_available():
+            comm_backend = "cpu:gloo,cuda:nccl"
+        else:
+            comm_backend = "gloo"
 
-    if comm_backend is None:
-        # TODO or fallback to GLOO?
-        raise EasierJitException(
-            f"Argument `comm_backend` is not specified"
-        )
+
+    for channel in comm_backend.split(','):
+        kv = channel.split(':')
+
 
     if comm_backend not in ['gloo', 'nccl', 'mpi']:
         raise EasierJitException(
             f"Argument `comm_backend` cannot be {comm_backend}"
         )
 
-    set_dist_env_runtime_backend(comm_backend)
+    set_dist_env_runtime_backend_config(comm_backend)
 
     logger.info("Initializing torch.distributed")
 
@@ -323,7 +303,7 @@ def init(
 
 def compile(
     modules: List[esr.Module],
-    backend: Literal['torch', 'cpu', 'gpu', 'none', None] = None,
+    backend: Literal['torch', 'cpu', 'cuda', 'none'] = 'torch',
     *,
     load_dir: Optional[str] = None,
     partition_mode: Literal['metis', 'evenly'] = 'metis',
@@ -337,19 +317,19 @@ def compile(
     -   backend (str):
             backend platform that modules should be compiled to,
             supporting:
-            - "torch": inherit the device specified by `modules`
-            - "gpu": enforce CUDA for now
+            - "torch": will inherit the device specified by `modules`,
+                distribute the EASIER programs, but will not do
+                backend-specific compilation.
+            - "cuda": CUDA on GPU
             TODO will support AMD too, need to check if torch/dist can
                 transparently switch to AMD infrastructure when adding support.
-            - "cpu": CPU
+            - "cpu": OpenMP on CPU
             - "none": disable jit and return `modules` directly
-            - None: use the value specified by environment variable
-                EASIER_COMPILE_BACKEND.
-                If EASIER_COMPILE_BACKEND is not defined, use default backend
-                "torch".
+
+            The default backend is "torch".
 
             Please note the difference between string-typed value `"none"` and
-            object-typed value `None`.
+            object-typed value `None`, which is not a valid argument.
     -   load_dir (str):
             if provided, EASIER compiler will load the compilation cache
             generated by `easier.dump()` on rank-0,

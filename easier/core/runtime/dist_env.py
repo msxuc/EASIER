@@ -808,9 +808,11 @@ _runtime_backend: Optional[Literal['gloo', 'nccl', 'mpi']] = None
 # whatever device type, may be other than 'cpu' and 'cuda'
 _runtime_device_type: Optional[str] = None
 
-
-def set_dist_env_runtime_backend(
-    comm_backend: Literal['gloo', 'nccl', 'mpi']
+def set_dist_env_runtime_backend_config(
+    comm_backend_config: Union[
+        Literal['gloo', 'nccl', 'mpi'],
+        Dict[str, Literal['gloo', 'nccl', 'mpi']]
+    ],
 ):
     # TODO will data-to-send still be too big for CUDA memory, even though
     # we move AOT-compilation data back to CPU each time after comm?
@@ -863,7 +865,9 @@ def set_dist_env_runtime_device_type(
         for pickle-based APIs.
         Becasue except dist.bcast_object_lists, APIs like dist.gather_object
         does not support explicitly specifying the pickling-to device.
-        TODO However, EASIER internals can avoid using pickling-based APIs.
+        TODO However, EASIER internals can avoid using pickling-based APIs,
+        or we explicitly pickle.dumps, and put the bytes tensors to the proper
+        comm device.
         """
         local_rank = get_local_rank_for_backend(_runtime_backend)
         cuda_device = torch.device('cuda', local_rank)
