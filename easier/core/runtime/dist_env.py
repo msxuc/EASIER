@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import numpy
 from typing_extensions import Literal, TypeAlias, TypeVar
 import typing
 import threading
 import time
 import functools
 import copy
+import pickle
 
 import torch
 import torch.distributed as dist
@@ -297,10 +299,10 @@ class DistEnv:
             send_tensor = send_tensor.contiguous()
         return (self, dst, send_tensor), {}
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
         raise NotImplementedError()
 
-    def _pre_gather_object(self, dst, obj):
+    def _pre_gather_object_list(self, dst, obj):
         assert 0 <= dst < self.world_size
         return (self, dst, obj), {}
 
@@ -341,14 +343,16 @@ class DistEnv:
         return (self, src, tensors), {}
 
     @typing.overload
-    def scatter_object(self, src: int) -> Any: ...
+    def scatter_object_list(self, src: int) -> Any: ...
     @typing.overload
-    def scatter_object(self, src: int, objs: List[_T]) -> _T: ...
+    def scatter_object_list(self, src: int, objs: List[_T]) -> _T: ...
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
         raise NotImplementedError()
 
-    def _pre_scatter_object(self, src, objs=None):
+    def _pre_scatter_object_list(self, src, objs=None):
         assert 0 <= src < self.world_size
 
         if src == self.rank:
@@ -440,7 +444,7 @@ class DummyDistEnv(DistEnv):
                ) -> Optional[List[torch.Tensor]]:
         return [send_tensor.clone()]
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
         return [copy.deepcopy(obj)]
 
     def scatter(
@@ -449,7 +453,9 @@ class DummyDistEnv(DistEnv):
         assert tensors is not None
         return tensors[0].clone()
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
         assert objs is not None
         return copy.deepcopy(objs[0])
 
@@ -458,21 +464,6 @@ class DummyDistEnv(DistEnv):
 
     def barrier(self):
         return None
-
-
-def get_local_rank_for_backend(backend: Literal['gloo', 'nccl', 'mpi']):
-    """
-    NOTE for cases of nccl backend started by mpirun, users are supposed to
-    properly set LOCAL_RANK etc. env vars.
-    """
-    if backend in ['gloo', 'nccl']:
-        local_rank = int(os.environ['LOCAL_RANK'])
-    elif backend in ['mpi']:
-        local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-    else:
-        raise EasierJitException(f"Unknown backend {backend}")
-
-    return local_rank
 
 
 class TorchDistEnv(DistEnv):
@@ -520,11 +511,13 @@ class TorchDistEnv(DistEnv):
         ensure those tensors are with `device='cpu'`.
         """
         if src == self.rank:
-            dist.broadcast_object_list([object_list], src)
+            dist.broadcast_object_list(
+                [object_list], src, device=self.comm_device
+            )
             return object_list  # type: ignore
         else:
             recv_list = [None]
-            dist.broadcast_object_list(recv_list, src)
+            dist.broadcast_object_list(recv_list, src, device=self.comm_device)
             return recv_list[0]  # type: ignore
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> dist.P2POp:
@@ -611,44 +604,67 @@ class TorchDistEnv(DistEnv):
         NCCL can take different shapes but GLOO cannot. Use P2P to unify.
         """
         shape = tuple(send_tensor.shape)
-        shapes = self.gather_object(dst, shape)
+
+        # But for current use cases we still have the same subshapes
+        from easier.core.runtime.utils import check_collective_equality
+        check_collective_equality("subshape", shape[1:], dist_env=self)
 
         if self.rank == dst:
-            assert shapes is not None
             recv_buffers = []
-            ops = []
             for w in range(self.world_size):
                 if w != self.rank:
+                    batch_size_w = self.recv_int64(w, w)
+
                     buffer = torch.empty(
-                        shapes[w],
+                        (batch_size_w,) + shape[1:],
                         dtype=send_tensor.dtype,
                         device=self.comm_device
                     )
                     recv_buffers.append(buffer)
+                    # since we are sending/recving twice per node,
+                    # TODO we'd use blocking recv here.
+                    self.recv(buffer, w, w)
 
-                    irecv = self.def_irecv(buffer, w, w)
-                    ops.append(irecv)
                 else:
-                    recv_buffers.append(send_tensor)
-            for req in self.batch_isend_irecv(ops):
-                req.wait()
+                    recv_buffers.append(send_tensor.clone())
 
             return recv_buffers
 
         else:
+            self.send_int64(shape[0], dst, self.rank)
             self.send(send_tensor, dst, self.rank)
             return None
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        """
+        torch.distributed.gather_object_list does not take device parameter,
+        we should pickle the obj manually.
+        """
+        u8 = self._pickle_obj(obj)
+        u8s = self.gather(dst, u8)
+
         if self.rank == dst:
-            recvs = [None] * self.world_size  # type: ignore
+            assert u8s is not None
+            recvs = [self._unpickle_obj(u8) for u8 in u8s]
         else:
-            # in this case it must be None as torch.dist.gather_object requires
-            recvs = None   # type: ignore
-
-        dist.gather_object(obj, recvs, dst)
-
-        return recvs  # type: ignore
+            recvs = None
+        return recvs
+    
+    def _pickle_obj(self, obj):
+        """
+        Serialize the object into the comm device
+        """
+        u8 = torch.from_numpy(
+            numpy.frombuffer(pickle.dumps(obj), dtype=numpy.uint8)
+        ).to(device=self.comm_device)
+        return u8
+    
+    def _unpickle_obj(self, u8_tensor: torch.Tensor):
+        assert u8_tensor.dtype == torch.uint8
+        obj = pickle.loads(
+            u8_tensor.cpu().numpy().tobytes()
+        )
+        return obj
 
     def scatter(
         self, src: int, tensors: Optional[Sequence[torch.Tensor]]
@@ -660,7 +676,12 @@ class TorchDistEnv(DistEnv):
         if self.rank == src:
             assert tensors is not None
             shapes_dtypes = [(t.shape, t.dtype) for t in tensors]
-            self.scatter_object(src, shapes_dtypes)
+
+            # Lightweight objects, just broadcast.
+            self.broadcast_object_list(src, shapes_dtypes)
+
+            # But for current use cases we still have the same subshapes
+            assert len(set(t.shape[1:] for t in tensors)) == 1
 
             ops = []
             for w in range(self.world_size):
@@ -670,19 +691,33 @@ class TorchDistEnv(DistEnv):
             for req in self.batch_isend_irecv(ops):
                 req.wait()
 
-            return tensors[src]
+            return tensors[src].clone()
 
         else:
-            shape, dtype = self.scatter_object(src)
+            shape, dtype = self.broadcast_object_list(src)[self.rank]
             buffer = self.recv(torch.empty(
                 shape, dtype=dtype, device=self.comm_device
             ), src=src, tag=self.rank)
             return buffer
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
-        recvs = [None]
-        dist.scatter_object_list(recvs, objs, src=src)
-        return recvs[0]  # type: ignore
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
+        """
+        torch.distributed.scatter_object_list does not take device parameter,
+        we should pickle the obj manually.
+        """
+        if self.rank == src:
+            assert objs is not None
+            u8s = [self._pickle_obj(obj) for obj in objs]
+            self.scatter(src, u8s)
+            u8 = u8s[self.rank]
+        else:
+            u8 = self.scatter(src, None)
+
+        obj = self._unpickle_obj(u8)
+        return obj
+
 
     def barrier(self):
         dist.barrier()
@@ -718,7 +753,7 @@ class TorchDistGlooDistEnv(TorchDistEnv):
                     irecv_op = self.def_irecv(buffer, w, tag=self.rank)
                     p2ps.append(irecv_op)
             else:
-                buffers.append(tensors[self.rank])
+                buffers.append(tensors[self.rank].clone())
 
         for p2p in self.batch_isend_irecv(p2ps):
             p2p.wait()
