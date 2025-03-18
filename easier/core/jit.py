@@ -234,6 +234,9 @@ def init(
     """
     Initialize the distributed environment for the EASIER compiler.
 
+    If CUDA is available, this will set the default CUDA device for each
+    EASIER processes.
+
     Args:
     -   comm_backend (str):
             if provided, EASIER compiler will use the specified communication
@@ -264,17 +267,8 @@ def init(
         else:
             comm_backend = "gloo"
 
-
-    for channel in comm_backend.split(','):
-        kv = channel.split(':')
-
-
-    if comm_backend not in ['gloo', 'nccl', 'mpi']:
-        raise EasierJitException(
-            f"Argument `comm_backend` cannot be {comm_backend}"
-        )
-
-    set_dist_env_runtime_backend_config(comm_backend)
+    comm_backend_config = set_dist_env_runtime_backend_config(comm_backend)
+    local_rank = comm_backend_config.get_local_rank()
 
     logger.info("Initializing torch.distributed")
 
@@ -283,15 +277,12 @@ def init(
 
     init_logger(dist.get_rank())
 
-    if comm_backend in ['gloo', 'nccl']:
-        local_rank = int(os.environ['LOCAL_RANK'])
-    elif comm_backend in ['mpi']:
-        # P.S. it's possible to use MPIRUN but use `nccl` instead,
-        # if users set WORLD_SIZE RANK LOCAL_RANK MASTER_ADDR MASTER_PORT etc.
-        # to reconstruct the environment that `torch.distributed + nccl` needs.
-        local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-    else:
-        assert False, "unreachable"
+    # In a distributed environment, it's always good to set different default
+    # CUDA device, even EASIER does not rely on the default setting.
+    if torch.cuda.is_available():
+        cuda_device = torch.device('cuda', local_rank)
+        logger.info(f"Set default CUDA device: {cuda_device}")
+        torch.cuda.set_device(cuda_device)
 
     # the `get_backend_config()` may return like "cpu:gloo,cuda:nccl"
     logger.info(
