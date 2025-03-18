@@ -10,11 +10,16 @@ By defining fixtures here the whole chain of depended fixtures are available.
 from unittest.mock import patch
 import pytest
 
-from easier.core.runtime.dist_env import DummyDistEnv
+from easier.core.runtime.dist_env import DummyDistEnv, CommBackendConfig
 
 
 @pytest.fixture
 def dummy_dist_env():
+    """
+    dummy_dist_env fixture should be used in unit tests where
+    DistEnv is involved, but the test is relatively simple and don't need to
+    spawn multiprocesses or run on certain devices.
+    """
 
     def _get_dummy(device_type):
         return DummyDistEnv('cpu')
@@ -26,10 +31,11 @@ def dummy_dist_env():
         'easier.core.runtime.dist_env._get_or_init_dist_env', new=_get_dummy
     ), patch(
         # deprecate get_default/runtime_dist_env raise
-        'easier.core.runtime.dist_env._runtime_backend', 'dummy_backend'
+        'easier.core.runtime.dist_env._comm_backend_config',
+        CommBackendConfig('gloo')
     ), patch(
         # deprecate get_default/runtime_dist_env raise
-        'easier.core.runtime.dist_env._runtime_device_type', 'dummy_type'
+        'easier.core.runtime.dist_env._runtime_device_type', 'cpu'
     ), patch(
         # jit module imports and calls
         # as long as this does not raise,
