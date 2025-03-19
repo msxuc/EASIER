@@ -866,7 +866,7 @@ class CommBackendConfig:
                 if len(kv) == 2:
                     device_type, backend = kv
                     backend = _check_backend(backend)
-                    self._check_known_backend_devicetype_compatibility(
+                    self._ensure_known_backend_devicetype_compatibility(
                         backend, device_type
                     )
                     self._config[device_type] = backend
@@ -898,8 +898,9 @@ class CommBackendConfig:
                         "The communication backend 'nccl' requires each process"
                         " has a dedicated CUDA device. This machine has only"
                         f" {torch.cuda.device_count()} CUDA device(s).\n"
-                        "Consider manually specifying the communication backend"
-                        " in `easier.init()` to exclude 'nccl'."
+                        "If CUDA devices are not the intended computing"
+                        "devices, consider explicitly specifying communication"
+                        " backends excluding 'nccl' to `easier.init()`"
                     )
 
                 # Although EASIER always explicitly specifies the CUDA index,
@@ -923,7 +924,7 @@ class CommBackendConfig:
                     )
 
 
-    def _check_known_backend_devicetype_compatibility(
+    def _ensure_known_backend_devicetype_compatibility(
         self, comm_backend, device_type
     ) -> None:
         """
@@ -942,9 +943,9 @@ class CommBackendConfig:
                 f" {comm_backend} communication backend"
             )
 
-    def check_device_type_compatibility(self, device_type: str):
+    def ensure_device_type_compatibility(self, device_type: str) -> None:
         if isinstance(self._config, str):
-            self._check_known_backend_devicetype_compatibility(
+            self._ensure_known_backend_devicetype_compatibility(
                 self._config, device_type
             )
         else:
@@ -980,7 +981,7 @@ class CommBackendConfig:
 
     def get_torch_dist_backend_for(self, device_type: str) -> DistBackendStr:
         if isinstance(self._config, str):
-            assert self._check_known_backend_devicetype_compatibility(
+            self._ensure_known_backend_devicetype_compatibility(
                 self._config, device_type
             )
             return self._config
@@ -1043,7 +1044,7 @@ def set_dist_env_runtime_device_type(
             " please ensure `easier.init()` has been called properly."
         )
 
-    _comm_backend_config.check_device_type_compatibility(comm_device_type)
+    _comm_backend_config.ensure_device_type_compatibility(comm_device_type)
     _comm_backend_config.warn_if_device_type_is_unknown(comm_device_type)
 
     global _runtime_device_type
