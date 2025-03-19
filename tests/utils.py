@@ -6,10 +6,12 @@ import string
 from typing import List, Literal
 from unittest.mock import patch
 import os
+import sys
 import pytest
+import subprocess
 
 import torch
-import torch.distributed as dist
+import torch.distributed
 from torch.multiprocessing.spawn import spawn
 
 import easier.core.runtime.dist_env as _DM
@@ -26,6 +28,23 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution"
 )
 
+def _has_cuda_aware_mpi() -> bool:
+    # if sys.platform != 
+    # subprocess.run()
+    return False
+
+has_cuda_aware_mpi = _has_cuda_aware_mpi()
+    
+
+# `pytest -m mpie2e`
+mpi_e2e = pytest.mark.skipif(
+    not (
+        torch.cuda.device_count() >= 2 and
+        torch.distributed.is_mpi_available() and
+        has_cuda_aware_mpi
+    ),
+    reason="MPI end-to-end tests need to be run with CUDA-MPI"
+)
 
 def _torchrun_spawn_target(
     local_rank: int, world_size: int, func, args, kwargs,
@@ -81,6 +100,42 @@ def torchrun_singlenode(
         join=True
     )
 
+
+def _mpirun_spawn_target(func, args, kwargs):
+    from mpi4py import MPI
+    local_rank = MPI.COMM_WORLD.rank
+    world_size = MPI.COMM_WORLD.size
+    try:
+        func(local_rank, world_size, *args, **kwargs)
+    except Exception as e:
+        import traceback
+        from easier import logger
+        logger.error(traceback.format_exc())
+        raise AssertionError(
+            e,
+            "To see exception details, run unit tests in the command line with"
+            "`pytest -s tests/.../test.py::test_func`")
+
+def mpirun_singlenode(nprocs: int, func, args=(), kwargs={}):
+    """
+    mpi4py executor won't record call stack for us, so it's recommended to
+    add concrete failure message on each assertion for locating failures.
+    
+    To see exception details, run unit tests in the command line with
+    `pytest -s tests/.../test.py::test_func` where `-s` captures stderr.
+    """
+    from mpi4py.futures import MPIPoolExecutor
+    with MPIPoolExecutor(nprocs, env={
+        "EASIER_USE_MPIRUN": "1",
+        "EASIER_LOG_LEVEL": "DEBUG"
+    }) as pool:
+        futures = []
+        for rank in range(nprocs):
+            future = pool.submit(_mpirun_spawn_target, func, args, kwargs)
+            futures.append(future)
+
+        for future in futures:
+            future.result()  # re-raise AssertException to host test environment
 
 def assert_tensor_list_equal(la: List[torch.Tensor],
                              lb: List[torch.Tensor]):

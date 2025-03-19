@@ -261,6 +261,10 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution")
 
 
+@pytest.mark.parametrize('launcher', [
+    torchrun_singlenode,
+    pytest.param(torchrun_singlenode, marks=1)
+])
 class TestJittedUsage:
 
     @pytest.mark.parametrize('dev_type', [

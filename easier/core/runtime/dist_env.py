@@ -935,12 +935,12 @@ class CommBackendConfig:
         and we don't know if MPI is CUDA-aware.
         """
         if (comm_backend, device_type) in [
-            ('gloo', 'cuda'),
-            ('nccl', 'cpu')
+            ('gloo', 'cuda'),  # No P2P ops
+            ('nccl', 'cpu')    # not supported at all
         ]:
             raise EasierJitException(
-                f"Device {device_type} cannot be used with"
-                f" {comm_backend} communication backend"
+                f"EASIER does not support use the device type '{device_type}'"
+                f" with the communication backend '{comm_backend}'"
             )
 
     def ensure_device_type_compatibility(self, device_type: str) -> None:

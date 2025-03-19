@@ -629,7 +629,7 @@ class Module(nn.Module):
         self.easier_hint_name: str
 
         self.easier_jit_backend: Literal[
-            'torch', 'cpu', 'cudu', 'none', None
+            'torch', 'cpu', 'cuda', 'none', None
         ] = None
 
         # Only has value when jit_backend in ['torch','cpu','cuda']
