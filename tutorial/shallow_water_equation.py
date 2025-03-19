@@ -306,7 +306,11 @@ if __name__ == "__main__":
         "--device", type=str, choices=["cpu", "cuda"], default="cpu"
     )
     parser.add_argument(
-        "--backend", type=str, choices=["none", "torch", "cpu", "gpu"],
+        "--backend", type=str, choices=["none", "torch", "cpu", "cuda"],
+        default=None
+    )
+    parser.add_argument(
+        "--comm_backend", type=str, choices=["gloo", "nccl"],
         default=None
     )
     parser.add_argument("--scale", type=int, default=100)
@@ -314,11 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str)
     args = parser.parse_args()
 
-    if args.backend in ["none", "torch"]:
-        comm_backend = "nccl" if args.device == "cuda" else "gloo"
-    else:
-        comm_backend = "nccl" if args.backend == "gpu" else "gloo"
-    esr.init(comm_backend)
+    esr.init(args.comm_backend)
 
     eqn = ShallowWaterEquation(args.scale, args.dt, args.device)
     [eqn] = esr.compile([eqn], args.backend)

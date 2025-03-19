@@ -5,7 +5,6 @@ pytest
 more-itertools
 numpy
 scipy
-matplotlib
 torch
 pymetis
 h5py

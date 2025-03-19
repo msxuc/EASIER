@@ -68,10 +68,11 @@ def torchrun_singlenode(
     - init_type:
         'none': no special initialization is done, a worker process is just
             like a brand new torchrun subprocess, with only env vars set.
-        'cpu'/'cuda': prepare the global distributed settings:
-            - torch.distributed.init_process_group('gloo/nccl');
-            - dist_env.set_runtime_backend('gloo/nccl');
-            - dist_env.set_runtime_device_type('cpu/cuda');
+        'cpu': call easier.init('gloo')
+        'cuda': call easier.init('nccl')
+            test cases specifying 'cuda' should take care of the minimum CUDA
+            device number. e.g. using
+            `pytest.mark.skipif(torch.cuda.device_count() < 2, reason='')`
     """
     spawn(
         _torchrun_spawn_target,

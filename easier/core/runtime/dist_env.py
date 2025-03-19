@@ -833,7 +833,7 @@ class TorchDistMpiDistEnv(TorchDistEnv):
             works.append(work)
         return works
 
-
+DistBackendStr: TypeAlias = Literal['gloo', 'nccl', 'mpi']
 
 # must be explicitly supported by EASIER
 class CommBackendConfig:
@@ -841,13 +841,9 @@ class CommBackendConfig:
         self,
         comm_backend_config_str: str
     ) -> None:
+        self._config: Union[DistBackendStr, Dict[str, DistBackendStr]]
 
-        self._config: Union[
-            Literal['gloo', 'nccl', 'mpi'],
-            Dict[str, Literal['gloo', 'nccl', 'mpi']]
-        ]
-
-        def _check_backend(x) -> Literal['gloo', 'nccl', 'mpi']:
+        def _check_backend(x) -> DistBackendStr:
             if x not in ['gloo', 'nccl', 'mpi']:
                 raise EasierJitException(
                     f"Unsupported communication backend {x}"
@@ -862,7 +858,8 @@ class CommBackendConfig:
 
             def _bad_format():
                 raise EasierJitException(
-                    f"Bad communication backend {comm_backend_config_str}"
+                    f"Communication backend '{comm_backend_config_str}'"
+                    " is bad-format"
                 )
             for channel in comm_backend_config_str.split(','):
                 kv = channel.split(':')
@@ -878,6 +875,53 @@ class CommBackendConfig:
                     _bad_format()
             else:
                 _bad_format()
+    
+    def get_backends(self) -> List[DistBackendStr]:
+        if isinstance(self._config, str):
+            return [self._config]
+        else:
+            return list(self._config.values())
+    
+    def backend_specific_setup(self):
+        for backend in self.get_backends():
+            if backend == 'nccl':
+                # Validate if CUDA is available and CUDA device number
+                # NCCL requires each rank has an individual card.
+                if not torch.cuda.is_available():
+                    raise EasierJitException(
+                        "The communication backend 'nccl' is specified"
+                        " but CUDA is not available"
+                    )
+                
+                if self.get_local_rank() >= torch.cuda.device_count():
+                    raise EasierJitException(
+                        "The communication backend 'nccl' requires each process"
+                        " has a dedicated CUDA device. This machine has only"
+                        f" {torch.cuda.device_count()} CUDA device(s).\n"
+                        "Consider manually specifying the communication backend"
+                        " in `easier.init()` to exclude 'nccl'."
+                    )
+
+                # Although EASIER always explicitly specifies the CUDA index,
+                # if users call pickle-based torch.distributed APIs, this is
+                # required, (only NCCL needs, CUDA-aware MPI does not)
+                # and this can help avoid CUDA:0 OOM.
+                #
+                # TODO benefits the CUDA MPI, but since MPI is not strongly
+                # bound with CUDA, we need to avoid enforcing dedicated
+                # CUDA devices in case users do not intend to use CUDA at all.
+                if torch.cuda.is_available():
+                    cuda_device = torch.device('cuda', self.get_local_rank())
+                    logger.info(f"Set default CUDA device: {cuda_device}")
+                    torch.cuda.set_device(cuda_device)
+
+            if backend == 'mpi':
+                if not torch.distributed.is_mpi_available():
+                    raise EasierJitException(
+                        "The communication backend 'mpi' is not supported by"
+                        " the PyTorch package"
+                    )
+
 
     def _check_known_backend_devicetype_compatibility(
         self, comm_backend, device_type
@@ -904,7 +948,7 @@ class CommBackendConfig:
                 self._config, device_type
             )
         else:
-            if device_type not in self._config:
+            if device_type not in self._config.keys():
                 raise EasierJitException(
                     f"No communication backend is specified for {device_type}"
                 )
@@ -920,27 +964,21 @@ class CommBackendConfig:
                 " please ensure the data are properly assigned to each device"
             )
 
+    @functools.cache
     def get_local_rank(self) -> int:
-        if isinstance(self._config, str):
-            has_mpi = self._config == 'mpi'
-        else:
-            has_mpi = 'mpi' in self._config.values()
-
         # If MPI is mentioned, it must be launched by MPIRUN.
         #
         # Nonetheless, it's possible to use MPIRUN and use `nccl`,
         # but users need to set WORLD_SIZE RANK LOCAL_RANK MASTER_ADDR etc.
         # to reconstruct the environment that `torch.distributed + nccl` need.
-        if has_mpi:
+        if 'mpi' in self.get_backends():
             local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
         else:
             local_rank = int(os.environ['LOCAL_RANK'])
 
         return local_rank
 
-    def get_torch_dist_backend_for(
-        self, device_type: str
-    ) -> Literal['gloo', 'nccl', 'mpi']:
+    def get_torch_dist_backend_for(self, device_type: str) -> DistBackendStr:
         if isinstance(self._config, str):
             assert self._check_known_backend_devicetype_compatibility(
                 self._config, device_type
@@ -991,6 +1029,8 @@ def set_dist_env_runtime_backend_config(
     global _comm_backend_config
     assert _comm_backend_config is None
     _comm_backend_config = CommBackendConfig(comm_backend_config_str)
+
+    _comm_backend_config.backend_specific_setup()
 
     return _comm_backend_config
 

@@ -200,10 +200,8 @@ def worker__test_collect(local_rank: int, world_size: int,
 
     if jit_backend == 'torch':
         comm_dev_type = model_dev.type
-    elif jit_backend == 'cpu':
-        comm_dev_type = 'cpu'
-    elif jit_backend == 'gpu':
-        comm_dev_type = 'cuda'
+    else:
+        comm_dev_type = jit_backend
 
     from easier.core.runtime.dist_env import get_runtime_dist_env
     if comm_dev_type == 'cpu':
@@ -272,17 +270,13 @@ class TestJittedUsage:
     @pytest.mark.parametrize('jit_backend', [
         'torch',
         'cpu',
-        pytest.param('gpu', marks=when_ngpus_ge_2)
+        pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
     def test_collect(self, dev_type: str, jit_backend: str):
         if jit_backend == 'torch':
             init_type = dev_type
-        elif jit_backend == 'cpu':
-            init_type = 'cpu'
-        elif jit_backend == 'gpu':
-            init_type = 'cuda'
         else:
-            assert False
+            init_type = dev_type
         torchrun_singlenode(
             2, worker__test_collect,
             (dev_type, jit_backend),

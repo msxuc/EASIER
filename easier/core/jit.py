@@ -263,31 +263,35 @@ def init(
     # because different comm backend has different API set.
     if comm_backend is None:
         if torch.cuda.is_available():
+            logger.info(
+                "The user did not specify the communication backend"
+                ", and CUDA is detected"
+                ". Initializing torch.distributed with 'cpu:gloo,cuda:nccl'"
+            )
             comm_backend = "cpu:gloo,cuda:nccl"
         else:
+            logger.info(
+                "The user did not specify the communication backend"
+                ". Initializing torch.distributed with 'gloo'"
+            )
             comm_backend = "gloo"
+    
+    else:
+        logger.info(
+            f"Initializing torch.distributed with '{comm_backend}'"
+        )
 
     comm_backend_config = set_dist_env_runtime_backend_config(comm_backend)
-    local_rank = comm_backend_config.get_local_rank()
-
-    logger.info("Initializing torch.distributed")
 
     import torch.distributed as dist
     dist.init_process_group(comm_backend, **kwargs)
 
     init_logger(dist.get_rank())
 
-    # In a distributed environment, it's always good to set different default
-    # CUDA device, even EASIER does not rely on the default setting.
-    if torch.cuda.is_available():
-        cuda_device = torch.device('cuda', local_rank)
-        logger.info(f"Set default CUDA device: {cuda_device}")
-        torch.cuda.set_device(cuda_device)
-
-    # the `get_backend_config()` may return like "cpu:gloo,cuda:nccl"
+    local_rank = comm_backend_config.get_local_rank()
     logger.info(
         f"torch.distributed"
-        f" backend={dist.get_backend_config()} rank={dist.get_rank()}"
+        f" backend={comm_backend} rank={dist.get_rank()}"
         f" local_rank={local_rank}"
     )
 
@@ -308,13 +312,13 @@ def compile(
     -   backend (str):
             backend platform that modules should be compiled to,
             supporting:
-            - "torch": will inherit the device specified by `modules`,
+            - "torch": will use the device specified by `modules` and
                 distribute the EASIER programs, but will not do
                 backend-specific compilation.
-            - "cuda": CUDA on GPU
+            - "cuda": target GPU and CUDA as the backend
             TODO will support AMD too, need to check if torch/dist can
                 transparently switch to AMD infrastructure when adding support.
-            - "cpu": OpenMP on CPU
+            - "cpu": target CPU and OpenMP etc. as the backend
             - "none": disable jit and return `modules` directly
 
             The default backend is "torch".
@@ -358,12 +362,8 @@ def compile(
 
     elif backend == 'torch':
         device_type = orig_device_type
-    elif backend == 'gpu':
-        device_type = 'cuda'  # TODO enforce GPU == CUDA for now
-    elif backend == 'cpu':
-        device_type = 'cpu'
     else:
-        raise EasierJitException(f"Argument `jit_backend` cannot be {backend}")
+        device_type = backend
 
     esr.logger.info(
         f"EASIER just-in-time compilation has started, backend={backend}"
