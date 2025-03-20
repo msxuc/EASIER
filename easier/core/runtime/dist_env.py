@@ -655,7 +655,10 @@ class TorchDistEnv(DistEnv):
         Serialize the object into the comm device
         """
         u8 = torch.from_numpy(
-            numpy.frombuffer(pickle.dumps(obj), dtype=numpy.uint8)
+            # numpy.frombuffer creates a view, without taking ownership of the
+            # memory, and will trigger non-writable warning
+            # during torch.from_numpy. copy() to deprecate the warning.
+            numpy.frombuffer(pickle.dumps(obj), dtype=numpy.uint8).copy()
         ).to(device=self.comm_device)
         return u8
 

@@ -281,10 +281,14 @@ class TestJittedUsage:
     def test_collect(
         self, launcher: Launcher, dev_type: str, jit_backend: str
     ):
+        if jit_backend == 'torch':
+            init_type = dev_type
+        else:
+            init_type = jit_backend
         launcher(
             2, worker__test_collect,
             (dev_type, jit_backend),
-            init_type=dev_type  # type: ignore
+            init_type=init_type  # type: ignore
         )
 
     @pytest.mark.parametrize('dev_type', [
