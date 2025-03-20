@@ -33,6 +33,11 @@ def detect_cuda_aware_openmpi_e2e_setting() -> Tuple[bool, str]:
     -   bool: if there is CUDA-aware OpenMPI
     -   str: what component of the CUDA-aware OpenMPI for testing is missing
     """
+    try:
+        import mpi4py
+    except ImportError:
+        return False, "mpi4py is not installed"
+
     if torch.cuda.device_count() < 2:
         return False, "CUDA device number < 2"
 
