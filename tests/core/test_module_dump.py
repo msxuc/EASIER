@@ -16,7 +16,7 @@ import easier as esr
 
 from ..utils import \
     torchrun_singlenode, get_random_str, assert_tensor_list_equal, \
-    when_ngpus_ge_2, mpi_e2e, Launcher, mpirun_singlenode
+    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode
 
 
 class Model(esr.Module):
@@ -178,7 +178,7 @@ def worker__test_jitted_shared(
     )
 
 
-@pytest.mark.parametrize('launcher', [
+@pytest.mark.parametrize('xrun_singlenode', [
     torchrun_singlenode,
     pytest.param(mpirun_singlenode, marks=mpi_e2e)
 ])
@@ -191,18 +191,18 @@ class TestModuleDump:
     Run using `pytest -s` to see logs of where the dump jit.hdf5 is stored.
     """
 
-    def test_jitted_dump(self, launcher: Launcher, dev_type):
+    def test_jitted_dump(self, xrun_singlenode, dev_type):
         dumpdir = os.path.join(tempfile.gettempdir(), "easier", "tests",
                                get_random_str())
-        launcher(
+        xrun_singlenode(
             2, worker__test_jitted_dump, (dev_type, dumpdir,),
             init_type=dev_type
         )
 
-    def test_jitted_shared(self, launcher: Launcher, dev_type):
+    def test_jitted_shared(self, xrun_singlenode, dev_type):
         dumpdir = os.path.join(tempfile.gettempdir(), "easier", "tests",
                                get_random_str())
-        launcher(
+        xrun_singlenode(
             2, worker__test_jitted_shared,
             (dev_type, dumpdir,),
             init_type=dev_type

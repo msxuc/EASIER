@@ -4,7 +4,6 @@
 import random
 import string
 from typing import Callable, List, Literal, Tuple
-from typing_extensions import Protocol
 from unittest.mock import patch
 import os
 import pytest
@@ -77,14 +76,6 @@ mpi_e2e: List[pytest.MarkDecorator] = [
     ),
     pytest.mark.mpi_e2e  # test group name, can be run by `pytest -m mpi_e2e`
 ]
-
-
-class Launcher(Protocol):
-    def __call__(
-        self,
-        nprocs: int, func, args=(), kwargs={},
-        init_type: Literal['none', 'cpu', 'cuda'] = 'cpu'
-    ) -> None: ...
 
 
 def _torchrun_spawn_target(

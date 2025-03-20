@@ -17,7 +17,7 @@ from easier.core.runtime.dist_env import DummyDistEnv
 
 from ..utils import \
     torchrun_singlenode, get_random_str, \
-    mpi_e2e, Launcher, mpirun_singlenode
+    mpi_e2e, mpirun_singlenode
 
 
 class Model(esr.Module):
@@ -263,7 +263,7 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution")
 
 
-@pytest.mark.parametrize('launcher', [
+@pytest.mark.parametrize('xrun_singlenode', [
     torchrun_singlenode,
     pytest.param(mpirun_singlenode, marks=mpi_e2e)
 ])
@@ -279,13 +279,13 @@ class TestJittedUsage:
         pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
     def test_collect(
-        self, launcher: Launcher, dev_type: str, jit_backend: str
+        self, xrun_singlenode, dev_type: str, jit_backend: str
     ):
         if jit_backend == 'torch':
             init_type = dev_type
         else:
             init_type = jit_backend
-        launcher(
+        xrun_singlenode(
             2, worker__test_collect,
             (dev_type, jit_backend),
             init_type=init_type  # type: ignore
@@ -295,8 +295,8 @@ class TestJittedUsage:
         'cpu',
         pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
-    def test_save(self, launcher: Launcher, dev_type: str):
-        launcher(
+    def test_save(self, xrun_singlenode, dev_type: str):
+        xrun_singlenode(
             2, worker__test_save, (dev_type,),
             init_type=dev_type  # type: ignore
         )
