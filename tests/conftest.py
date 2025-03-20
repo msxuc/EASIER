@@ -41,7 +41,6 @@ def _warn_skipped_tests():
         )
 
 
-
 @pytest.fixture
 def dummy_dist_env():
     """

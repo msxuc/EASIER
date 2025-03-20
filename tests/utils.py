@@ -27,6 +27,7 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution"
 )
 
+
 def detect_cuda_aware_openmpi_e2e_setting() -> Tuple[bool, str]:
     """
     Returns:
@@ -63,19 +64,20 @@ def detect_cuda_aware_openmpi_e2e_setting() -> Tuple[bool, str]:
 
     return True, "SHOULD NOT PRINT THIS"
 
+
 has_mpi_e2e, mpi_e2e_missing_dep = \
     detect_cuda_aware_openmpi_e2e_setting()
 
 mpi_e2e: List[pytest.MarkDecorator] = [
     pytest.mark.skipif(
         not has_mpi_e2e,
-        reason=\
-            "MPI end-to-end tests need to be run with PyTorch built with" \
-            " CUDA-aware MPI and in a distributed CUDA environment," \
-            f" but we get: {mpi_e2e_missing_dep}"
+        reason="MPI end-to-end tests need to be run with PyTorch built with"
+        " CUDA-aware MPI and in a distributed CUDA environment,"
+        f" but we get: {mpi_e2e_missing_dep}"
     ),
     pytest.mark.mpi_e2e  # test group name, can be run by `pytest -m mpi_e2e`
 ]
+
 
 class Launcher(Protocol):
     def __call__(
@@ -171,6 +173,7 @@ def _mpirun_spawn_target(
             "`pytest -s tests/.../test.py::test_func`"
         )
 
+
 def mpirun_singlenode(
     nprocs: int, func, args=(), kwargs={},
     init_type: Literal['none', 'cpu', 'cuda'] = 'cpu'
@@ -178,7 +181,7 @@ def mpirun_singlenode(
     """
     mpi4py executor won't record call stack for us, so it's recommended to
     add concrete failure message on each assertion for locating failures.
-    
+
     To see exception details, run unit tests in the command line with
     `pytest -s tests/.../test.py::test_func` where `-s` captures stderr.
     """
@@ -203,6 +206,7 @@ def mpirun_singlenode(
 
         for future in futures:
             future.result()  # re-raise AssertException to host test environment
+
 
 def assert_tensor_list_equal(la: List[torch.Tensor],
                              lb: List[torch.Tensor]):

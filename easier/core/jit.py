@@ -245,14 +245,14 @@ def init(
             - "nccl": NCCL backend provided by `torch.distributed`, CUDA-only
             - "mpi": MPI backend provided by `torch.distributed`,
                 could support CPU and CUDA depending on how OpenMPI is built.
-            
+
             Combining device types and communication backends is supported,
             e.g. "cpu:gloo,cuda:nccl".
 
             If None is provided, EASIER will use
             "cpu:gloo,cuda:nccl" if CUDA is available, or simply "gloo" if
             CUDA is not available.
-    
+
     -   **kwargs
             additional arguments to `torch.distributed.init_process_group()`
     """
@@ -275,7 +275,7 @@ def init(
                 ". Initializing torch.distributed with 'gloo'"
             )
             comm_backend = "gloo"
-    
+
     else:
         logger.info(
             f"Initializing torch.distributed with '{comm_backend}'"

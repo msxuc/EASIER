@@ -649,7 +649,7 @@ class TorchDistEnv(DistEnv):
         else:
             recvs = None
         return recvs
-    
+
     def _pickle_obj(self, obj):
         """
         Serialize the object into the comm device
@@ -658,7 +658,7 @@ class TorchDistEnv(DistEnv):
             numpy.frombuffer(pickle.dumps(obj), dtype=numpy.uint8)
         ).to(device=self.comm_device)
         return u8
-    
+
     def _unpickle_obj(self, u8_tensor: torch.Tensor):
         assert u8_tensor.dtype == torch.uint8
         obj = pickle.loads(
@@ -717,7 +717,6 @@ class TorchDistEnv(DistEnv):
 
         obj = self._unpickle_obj(u8)
         return obj
-
 
     def barrier(self):
         dist.barrier()
@@ -833,9 +832,12 @@ class TorchDistMpiDistEnv(TorchDistEnv):
             works.append(work)
         return works
 
+
 DistBackendStr: TypeAlias = Literal['gloo', 'nccl', 'mpi']
 
 # must be explicitly supported by EASIER
+
+
 class CommBackendConfig:
     def __init__(
         self,
@@ -849,10 +851,10 @@ class CommBackendConfig:
                     f"Unsupported communication backend {x}"
                 )
             return x
-        
+
         if ',' not in comm_backend_config_str:
             self._config = _check_backend(comm_backend_config_str)
-        
+
         else:
             self._config = {}
 
@@ -875,13 +877,13 @@ class CommBackendConfig:
                     _bad_format()
             else:
                 _bad_format()
-    
+
     def get_backends(self) -> List[DistBackendStr]:
         if isinstance(self._config, str):
             return [self._config]
         else:
             return list(self._config.values())
-    
+
     def backend_specific_setup(self):
         for backend in self.get_backends():
             if backend == 'nccl':
@@ -892,7 +894,7 @@ class CommBackendConfig:
                         "The communication backend 'nccl' is specified"
                         " but CUDA is not available"
                     )
-                
+
                 if self.get_local_rank() >= torch.cuda.device_count():
                     raise EasierJitException(
                         "The communication backend 'nccl' requires each process"
@@ -922,7 +924,6 @@ class CommBackendConfig:
                         "The communication backend 'mpi' is not supported by"
                         " the PyTorch package"
                     )
-
 
     def _ensure_known_backend_devicetype_compatibility(
         self, comm_backend, device_type
@@ -1013,6 +1014,7 @@ class CommBackendConfig:
         else:
             return ','.join(f'{k}:{v}' for k, v in self._config.items())
 
+
 _comm_backend_config: Optional[CommBackendConfig] = None
 
 # whatever device type, may be other than 'cpu' and 'cuda'
@@ -1034,6 +1036,7 @@ def set_dist_env_runtime_backend_config(
     _comm_backend_config.backend_specific_setup()
 
     return _comm_backend_config
+
 
 def set_dist_env_runtime_device_type(
     comm_device_type: str
