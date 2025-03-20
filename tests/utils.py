@@ -3,12 +3,11 @@
 
 import random
 import string
-from typing import List, Literal
+from typing import Callable, List, Literal, Tuple
+from typing_extensions import Protocol
 from unittest.mock import patch
 import os
-import sys
 import pytest
-import subprocess
 
 import torch
 import torch.distributed
@@ -28,23 +27,58 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution"
 )
 
-def _has_cuda_aware_mpi() -> bool:
-    # if sys.platform != 
-    # subprocess.run()
-    return False
+def detect_cuda_aware_openmpi_e2e_setting() -> Tuple[bool, str]:
+    """
+    Returns:
+    -   bool: if there is CUDA-aware OpenMPI
+    -   str: what component of the CUDA-aware OpenMPI for testing is missing
+    """
+    if torch.cuda.device_count() < 2:
+        return False, "CUDA device number < 2"
 
-has_cuda_aware_mpi = _has_cuda_aware_mpi()
-    
+    if not torch.distributed.is_mpi_available():
+        return False, "torch is not built with MPI distributed backend"
 
-# `pytest -m mpie2e`
-mpi_e2e = pytest.mark.skipif(
-    not (
-        torch.cuda.device_count() >= 2 and
-        torch.distributed.is_mpi_available() and
-        has_cuda_aware_mpi
+    import sys
+    if sys.platform != 'linux':
+        return False, "OS != linux"
+
+    # expect to see
+    # ```shell
+    # $ ompi_info --parsable --all | grep mpi_built_with_cuda_support:value
+    # mca:mpi:base:param:mpi_built_with_cuda_support:value:true
+    # ```
+    import subprocess
+    ompi_info_ret: bytes = subprocess.check_output(
+        "ompi_info --parsable --all | grep mpi_built_with_cuda_support:value",
+        shell=True
+    )
+    if b'cuda_support:value:true' not in ompi_info_ret:
+        return False, "no CUDA-aware OpenMPI"
+
+    return True, "SHOULD NOT PRINT THIS"
+
+has_mpi_e2e, mpi_e2e_missing_dep = \
+    detect_cuda_aware_openmpi_e2e_setting()
+
+mpi_e2e: List[pytest.MarkDecorator] = [
+    pytest.mark.skipif(
+        not has_mpi_e2e,
+        reason=\
+            "MPI end-to-end tests need to be run with PyTorch built with" \
+            " CUDA-aware MPI and in a distributed CUDA environment," \
+            f" but we get: {mpi_e2e_missing_dep}"
     ),
-    reason="MPI end-to-end tests need to be run with CUDA-MPI"
-)
+    pytest.mark.mpi_e2e  # test group name, can be run by `pytest -m mpi_e2e`
+]
+
+class Launcher(Protocol):
+    def __call__(
+        self,
+        nprocs: int, func, args=(), kwargs={},
+        init_type: Literal['none', 'cpu', 'cuda'] = 'cpu'
+    ) -> None: ...
+
 
 def _torchrun_spawn_target(
     local_rank: int, world_size: int, func, args, kwargs,
@@ -101,10 +135,25 @@ def torchrun_singlenode(
     )
 
 
-def _mpirun_spawn_target(func, args, kwargs):
+def _mpirun_spawn_target(
+    func, func_args_kwargs,
+    init_type: Literal['none', 'cpu', 'cuda']
+):
+    (args, kwargs) = func_args_kwargs
+
+    os.environ["EASIER_LOG_LEVEL"] = "DEBUG"
+
     from mpi4py import MPI
     local_rank = MPI.COMM_WORLD.rank
     world_size = MPI.COMM_WORLD.size
+
+    if init_type in ['cpu', 'cuda']:
+        init('mpi')
+        _DM.set_dist_env_runtime_device_type(init_type)
+
+    else:
+        assert init_type == 'none'
+
     try:
         func(local_rank, world_size, *args, **kwargs)
     except Exception as e:
@@ -114,9 +163,13 @@ def _mpirun_spawn_target(func, args, kwargs):
         raise AssertionError(
             e,
             "To see exception details, run unit tests in the command line with"
-            "`pytest -s tests/.../test.py::test_func`")
+            "`pytest -s tests/.../test.py::test_func`"
+        )
 
-def mpirun_singlenode(nprocs: int, func, args=(), kwargs={}):
+def mpirun_singlenode(
+    nprocs: int, func, args=(), kwargs={},
+    init_type: Literal['none', 'cpu', 'cuda'] = 'cpu'
+):
     """
     mpi4py executor won't record call stack for us, so it's recommended to
     add concrete failure message on each assertion for locating failures.
@@ -124,14 +177,23 @@ def mpirun_singlenode(nprocs: int, func, args=(), kwargs={}):
     To see exception details, run unit tests in the command line with
     `pytest -s tests/.../test.py::test_func` where `-s` captures stderr.
     """
-    from mpi4py.futures import MPIPoolExecutor
-    with MPIPoolExecutor(nprocs, env={
-        "EASIER_USE_MPIRUN": "1",
-        "EASIER_LOG_LEVEL": "DEBUG"
-    }) as pool:
+    try:
+        from mpi4py.futures import MPIPoolExecutor
+    except ImportError:
+        assert False, \
+            "Cannot import the optional testing dependency mpi4py," \
+            " the test case using this launcher function should be wrapped" \
+            " by some pytest.mark.skipif()"
+
+    with MPIPoolExecutor(nprocs) as pool:
         futures = []
         for rank in range(nprocs):
-            future = pool.submit(_mpirun_spawn_target, func, args, kwargs)
+            future = pool.submit(
+                _mpirun_spawn_target,
+                func,
+                (args, kwargs),
+                init_type=init_type
+            )
             futures.append(future)
 
         for future in futures:

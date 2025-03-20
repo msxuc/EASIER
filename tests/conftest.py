@@ -16,7 +16,8 @@ import torch.distributed
 
 from easier.core.runtime.dist_env import DummyDistEnv, CommBackendConfig
 
-from .utils import has_cuda_aware_mpi
+from .utils import has_mpi_e2e, mpi_e2e_missing_dep
+
 
 @pytest.fixture(scope='session', autouse=True)
 def _warn_skipped_tests():
@@ -27,11 +28,18 @@ def _warn_skipped_tests():
     if torch.cuda.is_available():
         if torch.cuda.device_count() < 2:
             warnings.warn("Distributed tests on 2 CUDA devices are skipped")
-
     else:
         warnings.warn("Single-process tests on CUDA are skipped")
 
-    warnings.warn("hello")
+    if not has_mpi_e2e:
+        warnings.warn(
+            "MPI communication backend tests are skipped, because of"
+            f" {mpi_e2e_missing_dep}."
+            "\n\tCheck tests/utils.py for dependencies of these test cases."
+            "\n\tTo selectively re-run these test cases, run pytest with the"
+            " test group marker: `pytest -m mpi_e2e`."
+        )
+
 
 
 @pytest.fixture

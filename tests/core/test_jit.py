@@ -15,7 +15,9 @@ from easier.core.passes.utils import OrderedSet
 from easier.examples import Poisson
 from easier.core.runtime.dist_env import DummyDistEnv
 
-from ..utils import torchrun_singlenode, get_random_str
+from ..utils import \
+    torchrun_singlenode, get_random_str, \
+    mpi_e2e, Launcher, mpirun_singlenode
 
 
 class Model(esr.Module):
@@ -263,7 +265,7 @@ when_ngpus_ge_2 = pytest.mark.skipif(
 
 @pytest.mark.parametrize('launcher', [
     torchrun_singlenode,
-    pytest.param(torchrun_singlenode, marks=1)
+    pytest.param(mpirun_singlenode, marks=mpi_e2e)
 ])
 class TestJittedUsage:
 
@@ -276,23 +278,21 @@ class TestJittedUsage:
         'cpu',
         pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
-    def test_collect(self, dev_type: str, jit_backend: str):
-        if jit_backend == 'torch':
-            init_type = dev_type
-        else:
-            init_type = dev_type
-        torchrun_singlenode(
+    def test_collect(
+        self, launcher: Launcher, dev_type: str, jit_backend: str
+    ):
+        launcher(
             2, worker__test_collect,
             (dev_type, jit_backend),
-            init_type=init_type  # type: ignore
+            init_type=dev_type  # type: ignore
         )
 
     @pytest.mark.parametrize('dev_type', [
         'cpu',
         pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
-    def test_save(self, dev_type: str):
-        torchrun_singlenode(
+    def test_save(self, launcher: Launcher, dev_type: str):
+        launcher(
             2, worker__test_save, (dev_type,),
             init_type=dev_type  # type: ignore
         )
