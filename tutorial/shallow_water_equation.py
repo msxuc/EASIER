@@ -307,11 +307,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--backend", type=str, choices=["none", "torch", "cpu", "cuda"],
-        default=None
+        default='torch'
     )
     parser.add_argument(
         "--comm_backend", type=str, choices=["gloo", "nccl"],
-        default=None
+        default='gloo'
     )
     parser.add_argument("--scale", type=int, default=100)
     parser.add_argument("--dt", type=float, default=0.005)
