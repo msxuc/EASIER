@@ -588,12 +588,22 @@ class TorchDistEnv(DistEnv):
         # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
         shapes: Sequence[Sequence[int]]
     ) -> List[torch.Tensor]:
-        recv_buffers = [
-            torch.empty(shape, dtype=send_tensor.dtype,
-                        device=self.comm_device)
-            for shape in shapes
-        ]
-        dist.all_gather(recv_buffers, send_tensor)
+        """
+        torch.distributed doc does not say it, but GLOO and MPI backends
+        do not support all_gather with different shapes (even batch sizes).
+        Use broadcast to implement.
+
+        This method is used in Tensor.collect.
+        """
+        recv_buffers = []
+        for i in range(self.world_size):
+            if i == self.rank:
+                self.broadcast(src=i, tensor=send_tensor)
+                recv_buffers.append(send_tensor.clone())
+            else:
+                recv = self.broadcast(src=i, shape=shapes[i],
+                                      dtype=send_tensor.dtype)
+                recv_buffers.append(recv)
         return recv_buffers
 
     def gather(
@@ -601,7 +611,10 @@ class TorchDistEnv(DistEnv):
     ) -> Optional[List[torch.Tensor]]:
         """
         torch.distributed doc says all tensor sizes must be the same,
-        NCCL can take different shapes but GLOO cannot. Use P2P to unify.
+        in EASIER cases the sizes are generally different.
+        Use P2P to reimplement.
+
+        P.S. NCCL can still take different shapes however GLOO cannot.
         """
         shape = tuple(send_tensor.shape)
 
@@ -762,25 +775,6 @@ class TorchDistGlooDistEnv(TorchDistEnv):
 
         return buffers
 
-    def all_gather(
-        self, send_tensor: torch.Tensor, shapes: Sequence[Sequence[int]]
-    ) -> List[torch.Tensor]:
-        """
-        torch.distributed doc does not say it,
-        but GLOO backend doesn't support all_gather with different shapes.
-        Use broadcast to implement.
-        """
-        recv_buffers = []
-        for i in range(self.world_size):
-            if i == self.rank:
-                self.broadcast(src=i, tensor=send_tensor)
-                recv_buffers.append(send_tensor.clone())
-            else:
-                recv = self.broadcast(src=i, shape=shapes[i],
-                                      dtype=send_tensor.dtype)
-                recv_buffers.append(recv)
-        return recv_buffers
-
 
 class TorchDistMpiDistEnv(TorchDistEnv):
     def all_gather_into_tensor(
@@ -799,14 +793,23 @@ class TorchDistMpiDistEnv(TorchDistEnv):
 
         if shape[0] != 1:
             raise NotImplementedError("Support different tensor sizes")
+        
+        recv_buffers = [
+            torch.empty(shape, dtype=send_tensor.dtype, device=self.comm_device)
+            for w in range(self.world_size)
+        ]
 
         # In our use cases of aggregators all input tensors have the same size.
-        tensors = self.all_gather(send_tensor, [shape] * self.world_size)
+        # Don't call self.all_gather because we have reimplemented it
+        # using broadcast in base TorchDistEnv.
+        # Just call the slightly faster dist.all_gather.
+        dist.all_gather(recv_buffers, send_tensor)
 
         if form == 'concat':
-            return torch.concat(tensors)
+            return torch.concat(recv_buffers)
         else:
-            return torch.stack(tensors)
+            return torch.stack(recv_buffers)
+
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
         return (dist.isend, tensor, dst, tag)

@@ -184,7 +184,9 @@ def mpirun_singlenode(
             " the test case using this launcher function should be wrapped" \
             " by some pytest.mark.skipif()"
 
-    with MPIPoolExecutor(nprocs) as pool:
+    # main=False: don't pickle and inherit all globals, because the parent
+    #   process is launched by pytest.
+    with MPIPoolExecutor(nprocs, main=False) as pool:
         futures = []
         for rank in range(nprocs):
             future = pool.submit(
