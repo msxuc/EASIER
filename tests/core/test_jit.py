@@ -111,7 +111,7 @@ def test_jit_orphan_tensors():
             self.v[:] = self.v + 3
 
     m = M()
-    jitted, = esr.compile([m])  # type: ignore
+    jitted, = esr.compile([m], 'torch')  # type: ignore
     jitted: M
     jitted()
     v = jitted.v.collect()
@@ -154,7 +154,7 @@ def test_nested_easier_modules():
             self.inner.v[:] = self.r(k)
 
     outer = Outer()
-    j_outer, = esr.compile([outer])
+    j_outer, = esr.compile([outer], 'torch')
 
     g: Graph = j_outer.forward.__self__.graph  # type: ignore
     for n in g.nodes:

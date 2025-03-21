@@ -370,7 +370,7 @@ def dump(
     else:
         m1 = Model1(x=easier.zeros(...))  # x data is uninitialized
 
-        [m1, m2, minit] = easier.compile([m1, m2, minit])
+        [m1, m2, minit] = easier.compile([m1, m2, minit], 'torch')
 
         # OK to dump after easier.compile(), and dump a subset of modules
         easier.dump([m1, m2], dump_dir='/mnt/checkpoint')

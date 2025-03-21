@@ -228,7 +228,7 @@ def _fully_load_data_backend_none(
 
 
 def init(
-    comm_backend: Union[Literal['gloo', 'nccl', 'mpi'], str, None] = None,
+    comm_backend: Union[Literal['gloo', 'nccl', 'mpi'], str],
     **kwargs
 ) -> None:
     """
@@ -249,39 +249,22 @@ def init(
             Combining device types and communication backends is supported,
             e.g. "cpu:gloo,cuda:nccl".
 
-            If None is provided, EASIER will use
-            "cpu:gloo,cuda:nccl" if CUDA is available, or simply "gloo" if
-            CUDA is not available.
-
     -   **kwargs
             additional arguments to `torch.distributed.init_process_group()`
     """
     # TODO although we'll just pass `comm_backend` to
-    # `torch.distributed.init_process_group()`, we must limit the values like
-    # these three, because we need concrete and single backend name to
-    # dispatch DistEnv for certain implementation, like GlooDistEnv,
-    # because different comm backend has different API set.
-    if comm_backend is None:
-        if torch.cuda.is_available():
-            logger.info(
-                "The user did not specify the communication backend"
-                ", and CUDA is detected"
-                ". Initializing torch.distributed with 'cpu:gloo,cuda:nccl'"
-            )
-            comm_backend = "cpu:gloo,cuda:nccl"
-        else:
-            logger.info(
-                "The user did not specify the communication backend"
-                ". Initializing torch.distributed with 'gloo'"
-            )
-            comm_backend = "gloo"
-
-    else:
-        logger.info(
-            f"Initializing torch.distributed with '{comm_backend}'"
-        )
+    # `torch.distributed.init_process_group()`, we must limit the values to
+    # gloo/nccl/mpi, because we need concrete and known backend names to
+    # get certain DistEnv implementation, like GlooDistEnv,
+    # because different comm backends have different API sets.
+    if not isinstance(comm_backend, str):
+        raise EasierJitException('`comm_backend` must be str')
 
     comm_backend_config = set_dist_env_runtime_backend_config(comm_backend)
+
+    logger.info(
+        f"Initializing torch.distributed with '{comm_backend}'"
+    )
 
     import torch.distributed as dist
     dist.init_process_group(comm_backend, **kwargs)
@@ -298,7 +281,7 @@ def init(
 
 def compile(
     modules: List[esr.Module],
-    backend: Literal['torch', 'cpu', 'cuda', 'none'] = 'torch',
+    backend: Literal['torch', 'cpu', 'cuda', 'none'],
     *,
     load_dir: Optional[str] = None,
     partition_mode: Literal['metis', 'evenly'] = 'metis',
@@ -320,8 +303,6 @@ def compile(
                 transparently switch to AMD infrastructure when adding support.
             - "cpu": target CPU and OpenMP etc. as the backend
             - "none": disable jit and return `modules` directly
-
-            The default backend is "torch".
 
             Please note the difference between string-typed value `"none"` and
             object-typed value `None`, which is not a valid argument.

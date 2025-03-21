@@ -836,9 +836,8 @@ class TorchDistMpiDistEnv(TorchDistEnv):
         return works
 
 
-DistBackendStr: TypeAlias = Literal['gloo', 'nccl', 'mpi']
-
 # must be explicitly supported by EASIER
+DistBackendStr: TypeAlias = Literal['gloo', 'nccl', 'mpi']
 
 
 class CommBackendConfig:

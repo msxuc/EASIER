@@ -16,8 +16,7 @@ import torch.distributed
 
 from easier.core.runtime.dist_env import DummyDistEnv, CommBackendConfig
 
-from .utils import has_mpi_e2e, mpi_e2e_missing_dep
-
+from tests.utils import has_mpi_e2e, mpi_e2e_missing_dep
 
 @pytest.fixture(scope='session', autouse=True)
 def _warn_skipped_tests():
@@ -33,7 +32,7 @@ def _warn_skipped_tests():
 
     if not has_mpi_e2e:
         warnings.warn(
-            "MPI communication backend tests are skipped, because of"
+            "MPI communication backend tests are skipped, because:"
             f" {mpi_e2e_missing_dep}."
             "\n\tCheck tests/utils.py for dependencies of these test cases."
             "\n\tTo selectively re-run these test cases, run pytest with the"
