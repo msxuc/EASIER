@@ -18,6 +18,7 @@ from easier.core.runtime.dist_env import DummyDistEnv, CommBackendConfig
 
 from tests.utils import has_mpi_e2e, mpi_e2e_missing_dep
 
+
 @pytest.fixture(scope='session', autouse=True)
 def _warn_skipped_tests():
     """

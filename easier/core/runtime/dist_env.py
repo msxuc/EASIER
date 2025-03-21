@@ -793,10 +793,11 @@ class TorchDistMpiDistEnv(TorchDistEnv):
 
         if shape[0] != 1:
             raise NotImplementedError("Support different tensor sizes")
-        
+
         recv_buffers = [
-            torch.empty(shape, dtype=send_tensor.dtype, device=self.comm_device)
-            for w in range(self.world_size)
+            torch.empty(
+                shape, dtype=send_tensor.dtype, device=self.comm_device
+            ) for w in range(self.world_size)
         ]
 
         # In our use cases of aggregators all input tensors have the same size.
@@ -809,7 +810,6 @@ class TorchDistMpiDistEnv(TorchDistEnv):
             return torch.concat(recv_buffers)
         else:
             return torch.stack(recv_buffers)
-
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
         return (dist.isend, tensor, dst, tag)
