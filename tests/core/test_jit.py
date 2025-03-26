@@ -15,16 +15,9 @@ from easier.core.passes.utils import OrderedSet
 from easier.examples import Poisson
 from easier.core.runtime.dist_env import DummyDistEnv
 
-from ..utils import mpirun_singlenode, get_random_str
-
-
-@pytest.fixture(scope='function')
-def singleton_dist_env_mock():
-    with patch('easier.core.runtime.dist_env._get_or_init_dist_env') as mock:
-        def _get_or_init(backend: str):
-            return DummyDistEnv(backend)  # type: ignore
-        mock.side_effect = _get_or_init
-        yield mock
+from ..utils import \
+    torchrun_singlenode, get_random_str, \
+    mpi_e2e, mpirun_singlenode
 
 
 class Model(esr.Module):
@@ -59,6 +52,7 @@ class Model(esr.Module):
         self.out1[:] = esr.norm(res, 2)[0]
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_jit_nnModule():
     """test whether easier ops are jitted as leaf node"""
     m = Model(3)
@@ -77,7 +71,8 @@ def test_jit_nnModule():
                 getattr(jitted, node.target), esr.Reducer)
 
 
-def test_jit_tensors(singleton_dist_env_mock):
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_jit_tensors():
     """test whether easier tensors are mutable after jitted"""
 
     torch.manual_seed(2345)
@@ -97,7 +92,8 @@ def test_jit_tensors(singleton_dist_env_mock):
         jitted_res1, nonjitted_res1))  # type: ignore
 
 
-def test_jit_orphan_tensors(singleton_dist_env_mock):
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_jit_orphan_tensors():
     """
     Test that Tensors that are not involved in Selector-Reducer pairs
     are properly partitioned.
@@ -115,7 +111,7 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
             self.v[:] = self.v + 3
 
     m = M()
-    jitted, = esr.compile([m])  # type: ignore
+    jitted, = esr.compile([m], 'torch')  # type: ignore
     jitted: M
     jitted()
     v = jitted.v.collect()
@@ -133,6 +129,7 @@ def test_jit_orphan_tensors(singleton_dist_env_mock):
     assert jitted.v2.elempart.lengths[0] == 13  # type: ignore
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_nested_easier_modules():
     class Inner(esr.Module):
         def __init__(self):
@@ -157,7 +154,7 @@ def test_nested_easier_modules():
             self.inner.v[:] = self.r(k)
 
     outer = Outer()
-    j_outer, = esr.compile([outer])
+    j_outer, = esr.compile([outer], 'torch')
 
     g: Graph = j_outer.forward.__self__.graph  # type: ignore
     for n in g.nodes:
@@ -169,7 +166,6 @@ def test_nested_easier_modules():
 
 def worker__test_collect(local_rank: int, world_size: int,
                          dev_type: str, jit_backend: str):
-
     if dev_type == 'cpu':
         model_dev = 'cpu'
     else:
@@ -181,9 +177,9 @@ def worker__test_collect(local_rank: int, world_size: int,
         [Model(3, model_dev)], backend='none')
     m()
 
-    orig_vertex = m.vertex_tensor.clone()
-    orig_edge = m.edge_tensor.clone()
-    orig_replica = m.tensor.clone()
+    orig_vertex = m.vertex_tensor.clone().cpu()
+    orig_edge = m.edge_tensor.clone().cpu()
+    orig_replica = m.tensor.clone().cpu()
 
     torch.manual_seed(2345)
     jitted, = esr.compile(
@@ -200,20 +196,23 @@ def worker__test_collect(local_rank: int, world_size: int,
     assert collected_vertex.device == model_dev
     assert collected_edge.device == model_dev
     assert collected_vertex.device == model_dev
-    torch.testing.assert_close(collected_vertex, orig_vertex)
-    torch.testing.assert_close(collected_edge, orig_edge)
-    torch.testing.assert_close(collected_replica, orig_replica)
+    torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
+    torch.testing.assert_close(collected_edge.cpu(), orig_edge)
+    torch.testing.assert_close(collected_replica.cpu(), orig_replica)
 
     if jit_backend == 'torch':
-        comm_dev = model_dev
-    elif jit_backend == 'cpu':
-        comm_dev = 'cpu'
-    elif jit_backend == 'gpu':
-        comm_dev = f'cuda:{local_rank}'
-    comm_dev = torch.device(comm_dev)  # type: ignore
+        comm_dev_type = model_dev.type
+    else:
+        comm_dev_type = jit_backend
 
     from easier.core.runtime.dist_env import get_runtime_dist_env
-    assert get_runtime_dist_env().comm_device == comm_dev
+    if comm_dev_type == 'cpu':
+        assert get_runtime_dist_env().comm_device.type == 'cpu'
+    elif comm_dev_type == 'cuda':
+        assert get_runtime_dist_env().comm_device.type == 'cuda'
+        assert get_runtime_dist_env().comm_device.index == local_rank
+    else:
+        assert False
 
 
 def worker__test_save(local_rank: int, world_size: int,
@@ -264,6 +263,10 @@ when_ngpus_ge_2 = pytest.mark.skipif(
     reason="no enough CUDA GPU (ngpus >= 2) to test distribution")
 
 
+@pytest.mark.parametrize('xrun_singlenode', [
+    torchrun_singlenode,
+    pytest.param(mpirun_singlenode, marks=mpi_e2e)
+])
 class TestJittedUsage:
 
     @pytest.mark.parametrize('dev_type', [
@@ -273,14 +276,27 @@ class TestJittedUsage:
     @pytest.mark.parametrize('jit_backend', [
         'torch',
         'cpu',
-        pytest.param('gpu', marks=when_ngpus_ge_2)
+        pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
-    def test_collect(self, dev_type: str, jit_backend: str):
-        mpirun_singlenode(2, worker__test_collect, (dev_type, jit_backend))
+    def test_collect(
+        self, xrun_singlenode, dev_type: str, jit_backend: str
+    ):
+        if jit_backend == 'torch':
+            init_type = dev_type
+        else:
+            init_type = jit_backend
+        xrun_singlenode(
+            2, worker__test_collect,
+            (dev_type, jit_backend),
+            init_type=init_type  # type: ignore
+        )
 
     @pytest.mark.parametrize('dev_type', [
         'cpu',
         pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
-    def test_save(self, dev_type: str):
-        mpirun_singlenode(2, worker__test_save, (dev_type,))
+    def test_save(self, xrun_singlenode, dev_type: str):
+        xrun_singlenode(
+            2, worker__test_save, (dev_type,),
+            init_type=dev_type  # type: ignore
+        )

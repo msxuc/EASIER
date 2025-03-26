@@ -12,7 +12,7 @@ from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
 
-from easier.core.runtime.dist_env import get_cpu_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.utils import \
     logger, EasierJitException
 import easier.core.module as esr
@@ -88,10 +88,15 @@ class CsrSelectorInserter(EasierInterpreter[None]):
             # created again -- it's ok as this is merely a data loader,
             # till its `.idx` get directly overwritten with the loaded data.
             csr_selector = esr.Selector(esr.arange(
-                submod.idx.shape[0],
-                dtype=submod.idx.dtype,
-                device=submod.idx.device
+                submod.easier_data_loader.shape[0],
+                dtype=submod.easier_data_loader.dtype,
+                device=submod.easier_data_loader.device
             ))
+            csr_selector.easier_hint_name = \
+                f"{submod.easier_hint_name}.{selector_attrname}"
+            # TODO if we reuse the Selector instance the naming will be
+            # as consistent as dataflow_distribution
+            # f"{submod.easier_hint_name}.reorderingSelector"
 
             self.current_module.add_module(selector_attrname, csr_selector)
 
@@ -119,9 +124,16 @@ def bind_reducer(modules: List[esr.Module], graphs: List[Graph]):
     target_reducers: Dict[EasierTensorGroup, esr.Reducer] = {}
     for grp, reducer2nnodes in reducer_binder.tengrp2reducer.items():
 
+        # If multiple Reducers are reducing the same input tensor group,
+        # we first sort them by "fullness" i.e. how many percentage of
+        # the OUTPUT tensor group gets written.
+        # (however, we ignore the sizes of those OUTPUT tensor groups for now,
+        # which are the `Reducer.n`s)
+        # Which could be simply calculated as `len(unique(R.idx)) / R.n`
+        #
         # tuple (fullness, nnodes) are ordered lexicographically
         weighted_reducers = [
-            ((r.easier_fullness, nnodes), r)
+            ((float(r.easier_data_loader.count_unique()) / r.n, nnodes), r)
             for r, nnodes in reducer2nnodes.items()
         ]
         _maxweight, target = max(weighted_reducers, key=lambda tp: tp[0])

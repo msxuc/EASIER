@@ -25,7 +25,8 @@ from easier.core.passes.utils import \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     get_easier_tensors
 from easier.core.runtime.dist_env import \
-    get_cpu_dist_env
+    get_runtime_dist_env
+from easier.core.distpart import distpart_kway, DistConfig
 from easier.core.utils import EasierJitException, logger
 
 # METIS adj weights are ints
@@ -94,43 +95,15 @@ def parallel_partition_graph(
     graph.setdiag(0, off_diag)
     graph = graph.tocsr()
 
-    metis_impl = os.environ.get('EASIER_METIS_IMPL', 'EASIER').upper()
-    if metis_impl == 'EASIER':
-        from easier.core.distpart import distpart_kway, DistConfig
-        local_membership = distpart_kway(
-            DistConfig(
-                int(vtxdist[-1]),
-                (vtxdist[1:] - vtxdist[:-1]).tolist()
-            ),
-            torch.from_numpy(graph.indptr).to(torch.int64),
-            torch.from_numpy(graph.indices).to(torch.int64),
-            torch.from_numpy(graph.data).to(torch.int64)
-        )
-
-    elif metis_impl == 'PARMETIS':
-        from mgmetis import parmetis
-        from mpi4py import MPI
-        import time
-        comm: MPI.Intracomm = MPI.COMM_WORLD
-        parmetis_start = time.time()
-        # `ncuts` is already summed up and replicated;
-        # `local_membership` works like this:
-        #   the result of`AllGather(local_membership)` is the result of
-        #   non-distributed version of graph partitioning.
-        ncuts, local_membership = parmetis.part_kway(
-            comm.size, graph.indptr, graph.indices, vtxdist, comm,
-            adjwgt=graph.data)
-
-        parmetis_latency = time.time() - parmetis_start
-        logger.debug(
-            f"ParMetis finished: ncuts={ncuts},"
-            f" total time: {parmetis_latency}sec"
-        )
-
-        local_membership = torch.tensor(local_membership)
-
-    else:
-        raise EasierJitException('Unknown Metis implementation')
+    local_membership = distpart_kway(
+        DistConfig(
+            int(vtxdist[-1]),
+            (vtxdist[1:] - vtxdist[:-1]).tolist()
+        ),
+        torch.from_numpy(graph.indptr).to(torch.int64),
+        torch.from_numpy(graph.indices).to(torch.int64),
+        torch.from_numpy(graph.data).to(torch.int64)
+    )
 
     return local_membership
 
@@ -285,7 +258,7 @@ def partition_tensor_groups_with_adjmat(
         for pair in [unidirect_pair, unidirect_pair.get_symmetric_pair()]
     ]
 
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     world_size = dist_env.world_size
     rank = dist_env.rank
     per_worker_n = (accum_n + world_size - 1) // world_size
@@ -345,8 +318,9 @@ def partition_tensor_groups_with_adjmat(
             # partitioned among columns.
             adjmat_colids = colgrp_idx_slice + colgrp_offset
 
-            subadjmat_rowids_to_send[w] = subadjmat_rowids
-            adjmat_colids_to_send[w] = adjmat_colids
+            subadjmat_rowids_to_send[w] = subadjmat_rowids.to(
+                dist_env.comm_device)
+            adjmat_colids_to_send[w] = adjmat_colids.to(dist_env.comm_device)
 
         subadjmat_rowids_tensors = \
             dist_env.all_to_all(subadjmat_rowids_to_send)
@@ -356,8 +330,8 @@ def partition_tensor_groups_with_adjmat(
         # concat all recieved row/col ids
         # and the result is not ordered or uniqued.
         rowcolids_for_commpairs.append((
-            torch.concat(subadjmat_rowids_tensors),
-            torch.concat(adjmat_colids_tensors),
+            torch.concat(subadjmat_rowids_tensors).cpu(),
+            torch.concat(adjmat_colids_tensors).cpu(),
             comm_pair.caused_by_reducer
         ))
     # endfor comm_pairs
@@ -440,7 +414,7 @@ def synchronize_partition_result(
     # Exchange partition result
     # to construct partition info of every TensorGroup on every worker
     #
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     world_size = dist_env.world_size
     rank = dist_env.rank
 
@@ -491,11 +465,11 @@ def synchronize_partition_result(
             for w in range(world_size):
                 elempart = tensor_group_begin \
                     + torch.argwhere(grp_membership == w).ravel()
-                elempart_to_send[w] = elempart
+                elempart_to_send[w] = elempart.to(dist_env.comm_device)
 
         elempart_recv = dist_env.all_to_all(elempart_to_send)
 
-        elempart = torch.concat(elempart_recv)
+        elempart = torch.concat(elempart_recv).cpu()
         elempart_lengths = dist_env.all_gather_into_tensor(
             torch.tensor([elempart.shape[0]], device=dist_env.comm_device)
         ).tolist()
@@ -558,7 +532,7 @@ def get_even_elemparts(modules, graphs):
         ElemPart/partition, i.e. not in `comm_elemparts: dict`,
         assign an even ElemPart for it.
     """
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     world_size = dist_env.world_size
     rank = dist_env.rank
 

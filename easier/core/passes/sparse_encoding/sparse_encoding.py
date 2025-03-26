@@ -15,7 +15,7 @@ from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
 from easier.core.passes.tensor_group_partition import ElemPart
 
-from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.utils import \
     logger, EasierJitException
 import easier.core.module as esr
@@ -74,7 +74,7 @@ def calculate_paired_in_out_idx(
         `input_gidx_to_this` contains gidx for both local input elements and
         elements of potentially halos to this worker.
     """
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     input_gidxes_to_others = []
     output_gidxes_on_others = []
@@ -86,13 +86,18 @@ def calculate_paired_in_out_idx(
     # and collects output_elempart from all other workers.
     for t in range(dist_env.world_size):
         if dist_env.rank == t:
-            output_elempart_t = dist_env.broadcast(t, output_elempart.idx)
+            output_elempart_t = dist_env.broadcast(
+                t,
+                output_elempart.idx.to(dist_env.comm_device)
+            )
         else:
             output_elempart_t = dist_env.broadcast(
                 t,
                 shape=(output_elempart.lengths[t],),
                 dtype=output_elempart.idx.dtype
             )
+
+        output_elempart_t = output_elempart_t.cpu()
 
         pos = torch.isin(
             output_gidx_part, output_elempart_t
@@ -109,16 +114,20 @@ def calculate_paired_in_out_idx(
         input_gidx_to_t = input_gidx_part[pos]
         output_gidx_on_t = output_gidx_part[pos]
 
-        input_gidxes_to_others.append(input_gidx_to_t)
-        output_gidxes_on_others.append(output_gidx_on_t)
+        input_gidxes_to_others.append(
+            input_gidx_to_t.to(dist_env.comm_device)
+        )
+        output_gidxes_on_others.append(
+            output_gidx_on_t.to(dist_env.comm_device)
+        )
 
     input_gidxes_to_this: List[torch.Tensor] = \
         dist_env.all_to_all(input_gidxes_to_others)
     output_gidxes_on_this: List[torch.Tensor] = \
         dist_env.all_to_all(output_gidxes_on_others)
 
-    input_gidx_to_this = torch.concat(input_gidxes_to_this)
-    output_gidx_on_this = torch.concat(output_gidxes_on_this)
+    input_gidx_to_this = torch.concat(input_gidxes_to_this).cpu()
+    output_gidx_on_this = torch.concat(output_gidxes_on_this).cpu()
 
     # Having equal lengths is essential for I/O idx being paired,
     # and their pairs are not necessarily in any certain order.
@@ -159,14 +168,17 @@ def calculate_halo_info(
         Global and local idx in both of them have strict order, which follow
         the element order of `input_elempart`.
     """
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     halo_lidxes_to_this = []
     halo_gidxes_to_this = []
 
     for u in range(dist_env.world_size):
         if dist_env.rank == u:
-            input_elempart_u = dist_env.broadcast(u, input_elempart.idx)
+            input_elempart_u = dist_env.broadcast(
+                u,
+                input_elempart.idx.to(dist_env.comm_device)
+            )
 
         else:
             input_elempart_u = dist_env.broadcast(
@@ -175,16 +187,24 @@ def calculate_halo_info(
                 dtype=input_elempart.idx.dtype
             )
 
+        input_elempart_u = input_elempart_u.cpu()
+
         halo_lidx_u_to_this = torch.isin(
             input_elempart_u, input_gidx_to_this
         ).argwhere().ravel()
-        halo_lidxes_to_this.append(halo_lidx_u_to_this)
+        halo_lidxes_to_this.append(
+            halo_lidx_u_to_this.to(dist_env.comm_device)
+        )
 
         halo_gidx_u_to_this = input_elempart_u[halo_lidx_u_to_this]
-        halo_gidxes_to_this.append(halo_gidx_u_to_this)
+        halo_gidxes_to_this.append(
+            halo_gidx_u_to_this
+        )
 
-    halo_lidxes_to_others: List[torch.Tensor] = \
+    halo_lidxes_to_others: List[torch.Tensor] = [
+        t.cpu() for t in
         dist_env.all_to_all(halo_lidxes_to_this)
+    ]
 
     return halo_gidxes_to_this, halo_lidxes_to_others
 
@@ -253,7 +273,7 @@ def reorder_input_by_reducer(
     the concat-ed pre-reducer chunk, so that the Reducer can still
     read/write sequentially.
     """
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     input_idx_part, output_idx_part = \
         get_selector_reducer_idx_partition_pair(reducer)
@@ -308,7 +328,9 @@ def reorder_input_by_reducer(
         reordered_gidx_from_u = reordered_input_gidx_to_this[
             torch.isin(reordered_input_gidx_to_this, unordered_gidx_from_u)
         ]
-        reordered_halo_gidxes_to_this.append(reordered_gidx_from_u)
+        reordered_halo_gidxes_to_this.append(
+            reordered_gidx_from_u.to(dist_env.comm_device)
+        )
 
     reordered_halo_gidxes_to_others = \
         dist_env.all_to_all(reordered_halo_gidxes_to_this)
@@ -320,7 +342,9 @@ def reorder_input_by_reducer(
     # So `reordered_halo_gidxes_to_others`, which comes from pieces of
     # `reordered_input_gidx_to_this`, can directly be used
     # as the reordered `ElemPart.idx`.
-    reordered_input_elempart = torch.concat(reordered_halo_gidxes_to_others)
+    reordered_input_elempart = torch.concat(
+        reordered_halo_gidxes_to_others
+    ).cpu()
 
     # input_elempart may be loaded from a previous session
     assert torch.equal(
@@ -342,7 +366,7 @@ def rewrite_selector_instance(
         input_gidx_to_this, input_elempart
     )
 
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     rank = dist_env.rank
 
     _reordered_output_gidx, reordered_input_gidx, _pos = zipsort_using_order(
@@ -589,15 +613,13 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
 def log_rewrite_statistics(
     modules: Sequence[esr.Module], graphs: Sequence[Graph]
 ):
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     nrecv_selector = 0
     nrecv_reducer = 0
 
-    for submod, rooti_path_oset in get_selectors_reducers(modules, graphs).items():
-        (rooti, path) = next(iter(rooti_path_oset))
-
-        workers_recv_lengths = dist_env.gather_object(
+    for submod, _oset in get_selectors_reducers(modules, graphs).items():
+        workers_recv_lengths = dist_env.gather_object_list(
             0, submod.runtime_halos_recv_lengths
         )
         if dist_env.rank == 0:
@@ -611,9 +633,7 @@ def log_rewrite_statistics(
                 for wls in workers_recv_lengths
             )
 
-            submod_hint = \
-                f"(modules[{rooti}]:{modules[rooti].__class__.__name__})" \
-                f".({path}:{submod.__class__.__name__})"
+            submod_hint = submod.easier_hint_name
             logger.debug(f"{submod_hint} recvs: [\n{recvlenmat}\n]")
 
             for w, wls in enumerate(workers_recv_lengths):

@@ -15,7 +15,7 @@ from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
 
-from easier.core.runtime.dist_env import get_cpu_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.utils import \
     logger, EasierJitException
 import easier.core.module as esr
@@ -310,7 +310,13 @@ def build_cascade_reorder_plan_on_rank0(graph_builder: ReorderGraphBuilder):
             elif isinstance(pattern, esr.Reducer):
                 nnodes = graph_builder.reducer_nnodes[pattern]
                 cyc0_weighted_reducers.append((
-                    (pattern.easier_fullness, idxlen * nnodes,),
+                    (
+                        # fullness = len(unique(R.idx)) / R.n
+                        float(
+                            pattern.easier_data_loader.count_unique()
+                        ) / pattern.n,
+                        idxlen * nnodes,
+                    ),
                     depsrc, depdst
                 ))
             else:
@@ -401,7 +407,7 @@ def broadcast_plan(
     plan: List[CascadeReorderStep],
     graph_builder: ReorderGraphBuilder
 ) -> List[CascadeReorderStep]:
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     groups: Dict[EasierTensorGroup, int] = {}
     patterns: Dict[Union[esr.Reducer, esr.Selector], int] = {}
@@ -463,7 +469,7 @@ def build_cascade_reorder_plan(
     graph_builder = ReorderGraphBuilder(modules, graphs)
     graph_builder.run()
 
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     if dist_env.rank == 0:
         plan = build_cascade_reorder_plan_on_rank0(graph_builder)
 

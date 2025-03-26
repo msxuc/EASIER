@@ -215,13 +215,15 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         in_size = _get_tensordef_batch_size(input_def)
 
         if isinstance(module, esr.Selector):
-            if not (module.idx_max < in_size):
+            idx_max = int(module.easier_data_loader.minmax()
+                          [1])  # type: ignore
+            if not (idx_max < in_size):
                 raise EasierJitException(
                     "Selector.idx is out of bounds for the"
                     " input distributed tensor"
                 )
         if isinstance(module, esr.Reducer):
-            if in_size != module.idx.shape[0]:
+            if in_size != module.easier_data_loader.shape[0]:
                 raise EasierJitException(
                     "The length of the first dimension of the"
                     " input distributed tensor to Reducer does not match"
@@ -262,7 +264,7 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
 
     Also:
     -   check if Role transition is correct.
-    -   check if all Selector/Reducer.idx.shape[0] are compatible.
+    -   check if all Selector/Reducer.dataloader.shape[0] are compatible.
     """
     tensor_grouper = TensorGrouper(modules, graphs)
     tensor_grouper.run()
@@ -299,9 +301,10 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
 
         if not hasattr(p, 'easier_tensor_group'):
 
-            logger.warning("Distributed esr.Tensor at "
-                           f"{root.__class__.__name__}.{name} is never used"
-                           " in easier.Module")
+            logger.warning(
+                "Distributed easierr.Tensor "
+                f"{p.easier_hint_name} is never used in easier.Module"
+            )
             tensor_group = EasierTensorGroup(
                 OrderedSet([p]), n=p.shape[0],
                 hint=_get_group_hint(root, name)

@@ -4,13 +4,13 @@
 import os
 
 import torch
+import torch.distributed
 import h5py
-from mpi4py import MPI
 
 import easier as esr
 from easier.numeric import Linsys
 
-from .mesh import get_triagular_mesh
+from .mesh import get_triangular_mesh
 
 
 def _reduce(tensor: torch.Tensor, idx: torch.Tensor, n: int):
@@ -130,14 +130,16 @@ class Poisson(esr.Module):
     def __init__(self, mesh_size=100, device='cpu', x=None) -> None:
         super().__init__()
 
-        comm = MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        if rank == 0:
-            mesh = get_triagular_mesh(mesh_size)
+        if torch.distributed.get_rank() == 0:
+            mesh = get_triangular_mesh(mesh_size)
             poisson = _assemble_poisson(mesh)
-            mesh, poisson = comm.bcast([mesh, poisson])
+            torch.distributed.broadcast_object_list([mesh, poisson], 0)
         else:
-            mesh, poisson = comm.bcast(None)
+            recv_objs = [None, None]
+            torch.distributed.broadcast_object_list(recv_objs, 0)
+            mesh, poisson = recv_objs
+        mesh: str
+        poisson: str
 
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
         self.src = esr.hdf5(mesh, 'src', dtype=torch.long, device=device)

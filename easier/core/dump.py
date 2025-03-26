@@ -25,9 +25,9 @@ import h5py
 import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
     get_easier_tensors, get_selectors_reducers, \
-    get_sub_easier_modules, pickle_ir, unpickle_ir, \
+    pickle_ir, unpickle_ir, get_easier_objects, \
     fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
-from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
@@ -153,17 +153,17 @@ class EasierDump(JsonBase):
 
     primitives: List['PrimitiveInfo']
     # array datasets:
-    # - /primitives/0:S:sub.selector/idx
-    # - /primitives/0:S:sub.selector/runtime_halos_local_idxes/3
-    # - /primitives/0:S:sub.selector/in_memory_data_loader_tensor
+    # - /primitives/0:S:(sub.selector:Selector)/idx
+    # - /primitives/0:S:(sub.selector:Selector)/runtime_halos_local_idxes/3
+    # - /primitives/0:S:(sub.selector:Selector)/in_memory_data_loader_tensor
     #   (for validation)
 
     modules: List['ModuleInfo']
     # array datasets:
-    # - /modules/0:M:Model/raw_ir_pickle_bytes
+    # - /modules/0:M:(modules[3]:Model)/raw_ir_pickle_bytes
     #   (for validation)
-    # - /modules/0:M:Model/fw_ir_pickle_bytes
-    # - /modules/0:M:Model/constants/constant_tensor0
+    # - /modules/0:M:(modules[3]:Model)/fw_ir_pickle_bytes
+    # - /modules/0:M:(modules[3]:Model)/constants/constant_tensor0
     #   (for validation, warning only)
 
 
@@ -211,9 +211,9 @@ class GlobalConfig(JsonBase):
 
 
 def _get_current_global_config():
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     config = GlobalConfig(
-        world_size=cpu_dist_env.world_size,
+        world_size=dist_env.world_size,
     )
     return config
 
@@ -226,10 +226,10 @@ def _coll_check(
     -   arguments to `.load()` is wrong; cache format is interrupted
     -   session environment changes, gently stop reusing cache
     """
-    cpu_dist_env = get_cpu_dist_env()
-    all_checks = cpu_dist_env.all_gather_into_tensor(
-        torch.tensor([1 if expect else 0], dtype=torch.int64)
-    ).sum().item() == cpu_dist_env.world_size
+    dist_env = get_runtime_dist_env()
+    all_checks = dist_env.all_gather_into_tensor(torch.tensor(
+        [1 if expect else 0], dtype=torch.int64, device=dist_env.comm_device
+    )).sum().item() == dist_env.world_size
     if not all_checks:
         raise ex_ctor(ex_msg)
 
@@ -264,17 +264,19 @@ def _gather_dump_files(local_dumpfile: str, rank0_jitdir: str) -> None:
     TODO we can detect NFS or shared storage, to leverage currently ununsed
         `dump_dir` parameters on ranks>0, and directly read/write on that dir.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     if rank == 0:
-        for w in range(1, cpu_dist_env.world_size):
+        for w in range(1, dist_env.world_size):
             rank_dumpfile = os.path.join(rank0_jitdir, f'jit_{w}.hdf5')
 
-            length = cpu_dist_env.recv_int64(src=w, tag=w)  # tag source
-            u8 = torch.empty((length,), dtype=torch.uint8)
-            cpu_dist_env.recv(u8, src=w, tag=w)
-            u8.numpy().tofile(rank_dumpfile)
+            length = dist_env.recv_int64(src=w, tag=w)  # tag source
+            u8 = torch.empty(
+                (length,), dtype=torch.uint8, device=dist_env.comm_device
+            )
+            dist_env.recv(u8, src=w, tag=w)
+            u8.cpu().numpy(force=True).tofile(rank_dumpfile)
 
             logger.debug(
                 f'Gather dump file and save to {rank_dumpfile}'
@@ -282,8 +284,11 @@ def _gather_dump_files(local_dumpfile: str, rank0_jitdir: str) -> None:
     else:
         u8 = numpy.fromfile(local_dumpfile, dtype=numpy.uint8)
         length = u8.shape[0]
-        cpu_dist_env.send_int64(length, dst=0, tag=rank)  # tag source
-        cpu_dist_env.send(torch.from_numpy(u8), dst=0, tag=rank)
+        dist_env.send_int64(length, dst=0, tag=rank)  # tag source
+        dist_env.send(
+            torch.from_numpy(u8).to(dist_env.comm_device),
+            dst=0, tag=rank
+        )
 
 
 def _scatter_dump_files(rank0_jitdir: str) -> str:
@@ -291,11 +296,11 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
     Returns:
         The path to the dump file for that rank.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     if rank == 0:
-        for w in range(1, cpu_dist_env.world_size):
+        for w in range(1, dist_env.world_size):
             # The dump file is for runtime data needed by one rank, so it's ok
             # to load it fully into the memory.
             u8 = numpy.fromfile(
@@ -303,8 +308,11 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
             )
             length = u8.shape[0]
 
-            cpu_dist_env.send_int64(length, dst=w, tag=w)  # tag destination
-            cpu_dist_env.send(torch.from_numpy(u8), dst=w, tag=w)
+            dist_env.send_int64(length, dst=w, tag=w)  # tag destination
+            dist_env.send(
+                torch.from_numpy(u8).to(dist_env.comm_device),
+                dst=w, tag=w
+            )
 
         return os.path.join(rank0_jitdir, f'jit_0.hdf5')
 
@@ -313,10 +321,12 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
         os.makedirs(temp_jitdir, exist_ok=True)
         temp_dumpfile = os.path.join(temp_jitdir, f'jit_{rank}.hdf5')
 
-        length = cpu_dist_env.recv_int64(src=0, tag=rank)  # tag destination
-        u8 = torch.empty((length,), dtype=torch.uint8)
-        cpu_dist_env.recv(u8, src=0, tag=rank)
-        u8.numpy().tofile(temp_dumpfile)
+        length = dist_env.recv_int64(src=0, tag=rank)  # tag destination
+        u8 = torch.empty(
+            (length,), dtype=torch.uint8, device=dist_env.comm_device
+        )
+        dist_env.recv(u8, src=0, tag=rank)
+        u8.cpu().numpy(force=True).tofile(temp_dumpfile)
 
         logger.debug(
             f'Recv scattered dump file and save to {temp_dumpfile}'
@@ -360,7 +370,7 @@ def dump(
     else:
         m1 = Model1(x=easier.zeros(...))  # x data is uninitialized
 
-        [m1, m2, minit] = easier.compile([m1, m2, minit])
+        [m1, m2, minit] = easier.compile([m1, m2, minit], 'torch')
 
         # OK to dump after easier.compile(), and dump a subset of modules
         easier.dump([m1, m2], dump_dir='/mnt/checkpoint')
@@ -392,17 +402,22 @@ def dump(
 
     top_modules = modules
 
-    modules = list(get_sub_easier_modules(top_modules))
+    modules: List[esr.Module] = []
+
+    objs = get_easier_objects(top_modules)
+    for obj, names in objs.items():
+        if isinstance(obj, esr.Module):
+            modules.append(obj)
 
     for root in modules:
-        if root.easier_jit_backend not in ['torch', 'cpu', 'gpu']:
+        if root.easier_jit_backend not in ['torch', 'cpu', 'cuda']:
             raise RuntimeError(
                 "Only easier.Module compiled with backend"
-                " 'torch', 'cpu', 'gpu' can be dumped"
+                " 'torch', 'cpu', 'cuda' can be dumped"
             )
 
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     # We always recommend users to specify a valid dump_dir,
     # but we'll do some renaming to rescue the compiled internal data,
@@ -624,21 +639,20 @@ def dump_selectors_reducers(
             assert False, "Must be a Selector or Reducer"
 
         typechar = submod_type[0].upper()
-        rep_rooti, rep_path = instance_bindings[0]
         submod_grp = h5_prim_root.create_group(
             # hint only
-            f'{submodi}:{typechar}:{rep_rooti}.{rep_path}'
+            f'{submodi}:{typechar}:{submod.easier_hint_name}'
         )
         # full path e.g. /primitives/0:S:x.x
         grp_basepath: str = submod_grp.name  # type: ignore
 
         submod_grp.create_dataset(
-            H5_DATASET_PRIM_IDX, data=submod.idx.to('cpu')
+            H5_DATASET_PRIM_IDX, data=submod.idx.cpu()
         )
 
         lidx_grp = submod_grp.create_group(H5_GROUP_PRIM_HALOLOCALIDXES)
         for t, lidx_for_t in enumerate(submod.runtime_halos_local_idxes):
-            lidx_grp.create_dataset(str(t), data=lidx_for_t.to('cpu'))
+            lidx_grp.create_dataset(str(t), data=lidx_for_t.cpu())
 
         if not hasattr(submod, 'easier_data_loader'):
             # reordering Selector, will not be validated during loading
@@ -738,7 +752,7 @@ class ConstantsCollector(EasierInterpreter):
             assert '.' not in path, \
                 "constant tensors must be attrs of the root module"
 
-            self.constant_values[path] = attr_val.to('cpu')
+            self.constant_values[path] = attr_val.cpu()
 
 
 def dump_modules(
@@ -753,7 +767,7 @@ def dump_modules(
             cast(torch.fx.graph_module.GraphModule, mod.forward.__self__).graph
 
         mod_grp = h5_module_root.create_group(
-            f'{modi}:M:{mod.__class__.__name__}'
+            f'{modi}:M:{mod.easier_hint_name}'
         )
         grp_basepath: str = mod_grp.name  # type: ignore
 
@@ -797,7 +811,7 @@ def _get_data_loader_repr(data_loader: DataLoaderBase) -> Tuple[
     and a "repr_str" for other DataLoaders.
     """
     if isinstance(data_loader, InMemoryTensorLoader):
-        return 'tensor', data_loader.tensor.to('cpu'), None
+        return 'tensor', data_loader.tensor.cpu(), None
     else:
         return 'repr', None, repr(data_loader)
 
@@ -816,8 +830,8 @@ def load_dumps(
     If the dump is not compatible with the current user programs,
     raise Exceptions.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     dump_dir = os.path.expanduser(dump_dir)
     jit_dir = os.path.join(dump_dir, 'jit')
@@ -943,7 +957,7 @@ def _detect_user_program_changes(
             ))
 
             logger.debug(
-                f'The {mi}-th user program {mod.__class__.__name__} changes'
+                f'The user program {mod.easier_hint_name} changes'
             )
             logger.debug(''.join(difflines))  # lines are \n-terminated
 
@@ -1064,8 +1078,7 @@ def rank0_validates_dumps(
         submod = root.get_submodule(prim_path)
 
         hint_submod = \
-            f"{root.__class__.__name__}.{prim_path}" \
-            f" on the {modi}-th easier.Module"
+            f"{prim_path} on {root.easier_hint_name}"
 
         prim_type = \
             esr.Selector if prim_info.type == 'selector' else esr.Reducer
@@ -1115,8 +1128,8 @@ def load_elemparts(
     h5_ep_root: h5py.Group,
     elempart_infos: List[ElemPartInfo]
 ) -> None:
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     for ep_info in elempart_infos:
         if ep_info.elempart_type == None:
@@ -1144,7 +1157,7 @@ def load_elemparts(
             p = root.get_parameter(tensorpath)
             if not isinstance(p, esr.Tensor):
                 raise EasierJitException(
-                    f'{root.__class__.__name__}.{tensorpath}'
+                    f'{root.easier_hint_name}.{tensorpath}'
                     ' is not an easier.Tensor'
                 )
             p.elempart = elempart
@@ -1156,7 +1169,7 @@ def load_selectors_reducers(
     h5_ep_root: h5py.Group,
     primitives_infos: List[PrimitiveInfo]
 ) -> None:
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
@@ -1172,9 +1185,7 @@ def load_selectors_reducers(
         is_injected = rep_binding not in all_submod_bindings  # type: ignore
         if is_injected:
             # Init with arbitrary idx, will soon be rewritten.
-            submod = esr.Selector(
-                torch.empty((0,)), easier_noncollective_idx=True
-            )
+            submod = esr.Selector(torch.empty((0,)))
             for modi, prim_path in prim_info.instance_bindings:
                 parent_path, _, prim_attrname = prim_path.rpartition('.')
                 parent = modules[modi].get_submodule(parent_path)
@@ -1202,7 +1213,7 @@ def load_selectors_reducers(
                 H5_DATASET_PRIM_IDX][...]
         )
         lidxes = []
-        for t in range(cpu_dist_env.world_size):
+        for t in range(dist_env.world_size):
             lidxes.append(torch.from_numpy(
                 h5_ep_root[prim_info.h5_group_basepath][  # type: ignore
                     H5_GROUP_PRIM_HALOLOCALIDXES][str(t)][...]

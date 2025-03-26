@@ -3,16 +3,21 @@
 
 from contextlib import contextmanager
 import os
-from typing import Iterator, Optional, Tuple, Union, cast
+from typing import Iterator, Optional, Tuple, TypeAlias, Union, cast
 import h5py
+import functools
 
 import numpy as np
 import torch
 
-from easier.core.runtime.dist_env import get_cpu_dist_env
+from easier.core.runtime.dist_env import \
+    get_default_dist_env, get_runtime_dist_env
+from easier.core.runtime.utils import check_collective_equality
 
 
 ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
+
+Num: TypeAlias = Union[int, float, bool]
 
 
 def _get_offset_exactly_nparts(orig_len: int, nparts: int, part: int
@@ -37,18 +42,18 @@ def _get_offset_exactly_nparts(orig_len: int, nparts: int, part: int
     return start, end
 
 
-def _check_data_loader_metas(dt: 'DataLoaderBase', *more_metas):
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
-
-    dt_metas = [dt.dtype, dt.device.type, dt.shape] + list(more_metas)
-    dt_metas0 = cpu_dist_env.broadcast_object_list(0, dt_metas)
-
-    if dt_metas != dt_metas0:
-        raise TypeError(
-            f'Tensor properties {dt_metas} on rank-{rank}'
-            f' do not equal properties {dt_metas0} on rank-0'
-        )
+def _wrap_function(pre_hook, post_hook, func):
+    # NOTE Python captures capsule by stackframe, a dedicated function like
+    # this is required, in case this is called wihtin a loop.
+    @functools.wraps(func)
+    def wrapper(this, *args, **kwargs):
+        if pre_hook is not None:
+            pre_hook(this, *args, **kwargs)
+        res = func(this, *args, **kwargs)
+        if post_hook is not None:
+            res = post_hook(this, res, *args, **kwargs)
+        return res
+    return wrapper
 
 
 class DataLoaderBase:
@@ -56,13 +61,84 @@ class DataLoaderBase:
     The data loader for one specified data source, e.g. a HDF5 dataset.
 
     Calls to every method should be collective.
-
-    # TODO ensure whether the result tensor is always a new clone to avoid
-    accidently modify the views, if any.
     """
 
     def __init__(self) -> None:
-        pass
+        """
+        The constructor should do simple member data storage and local tasks.
+
+        When collective operations are needed, implementations should use
+        `get_default_dist_env` because the constructors are called by users
+        before `esr.compile()`.
+        """
+        self.shape: Tuple[int, ...]
+        self.dtype: torch.dtype
+
+        # The device on which the data loader is intially defined.
+        # This device configuration only take effect with "torch" JIT backend.
+        self.device: torch.device
+
+        # e.g. "(Module).(a.b.c:Selector).idx"
+        # Decided during `esr.compile()`
+        self.easier_hint_name: str
+
+    def __init_subclass__(cls) -> None:
+        """
+        Before a data loader API provided by a subclass runs,
+        any _prefilter_ and _postfilter_ defined in this DataLoaderBase will
+        run to check the environment and ensure critical requirements are
+        satisfied.
+        """
+        for member_name, member in list(cls.__dict__.items()):
+            # cls.__dict__ doesn't contain inherited methods from DistEnv
+            if callable(member):
+                # both `member` and `pre/post_hook` function objects are not
+                # bound to some DataLoader instance yet, the `self` argument
+                # will be included at the head in `args` in the wrapper.
+                pre_hook = getattr(
+                    DataLoaderBase, '_pre_' + member_name, None
+                )
+                post_hook = getattr(
+                    DataLoaderBase, '_post_' + member_name, None
+                )
+                setattr(
+                    cls, member_name,
+                    _wrap_function(pre_hook, post_hook, member)
+                )
+
+    def coll_check_dtype_shape_devicetype(self):
+        check_collective_equality(
+            f"Tensor properties of {self.easier_hint_name}",
+            [self.dtype, self.shape, self.device.type]
+        )
+
+    def collective_init(self) -> None:
+        """
+        Validate if the the data of this data loader is collectively correct.
+
+        Require callers to first ensure the data loders among workers are
+        actually referring to the same data set i.e. of the same type.
+        """
+        raise NotImplementedError()
+
+    def minmax(self) -> Tuple[Num, Num]:
+        raise NotImplementedError()
+
+    def count_unique(self) -> int:
+        """
+        Used by Reducer.set_fullness()
+        """
+        raise NotImplementedError()
+
+    # TODO now we accept keyword parameters only, we may make it do
+    # overloading resolution like Selector(idx=)
+    def to(
+        self,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[Union[torch.device, str]] = None
+    ) -> 'DataLoaderBase':
+        raise NotImplementedError()
 
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:
@@ -76,6 +152,22 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
+    def _pre_partially_load_by_chunk(self, chunk_size):
+        dist_env = get_runtime_dist_env()
+        assert dist_env.rank == 0, \
+            "Loading-by-chunk is only available on rank-0"
+
+    def _post_partially_load_by_chunk(
+        self, res: Iterator[torch.Tensor], chunk_size
+    ) -> Iterator[torch.Tensor]:
+        def _check_item(chunk):
+            assert chunk.device.type == 'cpu'
+            return chunk
+
+        # `map()` make a new iterator, the `_check_item` is run when the
+        # iterator get actually iterated.
+        return map(_check_item, res)
+
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
         """
         Collectively load an evenly distributed part of the target dataset
@@ -87,6 +179,11 @@ class DataLoaderBase:
         - int: the end offset of the part (exclusive)
         """
         raise NotImplementedError()
+
+    def _post_partially_load_by_rank(self, res):
+        (tensor, begin, end) = res
+        assert tensor.device.type == 'cpu'
+        return res
 
     def partially_load_by_index(self, index: torch.Tensor, **kwargs
                                 ) -> torch.Tensor:
@@ -104,34 +201,25 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    def fully_load(self, device: Union[torch.device, str, None]
-                   ) -> torch.Tensor:
+    def _pre_partially_load_by_index(self, index, **kwargs):
+        assert index.device.type == 'cpu'
+
+    def _post_partially_load_by_index(self, res, index, **kwargs):
+        assert res.device.type == 'cpu'
+        return res
+
+    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
         """
-        When fully loading the dataset.
+        Fully load the dataset, typically for compile backend=='none' case.
+
+        Can be called even without dist env set up -- but if not called on
+        rank-0, the result may be corrupted.
 
         Args:
-        - device:
-            If None, the initial device specified on the data loader is used;
-            otherwise, load the data to the input device.
+        - device: the device to load data to. (self.device will not be used.)
 
         Returns:
-        - torch.Tensor: the full tensor, on the resolved device.
-        """
-        raise NotImplementedError()
-
-    @property
-    def dtype(self) -> torch.dtype:
-        raise NotImplementedError()
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        raise NotImplementedError()
-
-    @property
-    def device(self) -> torch.device:
-        """
-        The device to where the data will be initially loaded.
-        This device configuration only take effect with "torch" JIT backend.
+        - torch.Tensor: the full tensor, on the specified device.
         """
         raise NotImplementedError()
 
@@ -188,33 +276,37 @@ class InMemoryTensorLoader(DataLoaderBase):
     def __init__(self, tensor: torch.Tensor) -> None:
         super().__init__()
 
-        self._device = tensor.device
+        self.dtype = tensor.dtype
+        self.shape = tensor.shape
+        self.device = tensor.device
 
-        # The data is always stored as CPU tensor, while,
-        # the DataLoader would behave as being on the proper `self._device`.
-        self.tensor = tensor.to('cpu')
+        # The data is always stored as CPU tensor
+        self.tensor = tensor.cpu()
 
-        _check_data_loader_metas(self)
+    def collective_init(self) -> None:
+        self.coll_check_dtype_shape_devicetype()
 
-        cpu_dist_env = get_cpu_dist_env()
-        if cpu_dist_env.rank == 0:
-            cpu_dist_env.broadcast(0, self.tensor)
-        else:
-            tensor0 = cpu_dist_env.broadcast(
-                0, shape=self.shape, dtype=self.dtype
-            )
-            if not torch.allclose(tensor0, self.tensor):
-                raise TypeError(
-                    f'Tensor on rank-{cpu_dist_env.rank} {self.tensor}'
-                    f' does not equal rank-0 {tensor0}'
-                )
+        def _eq_tensor(v, v0):
+            # torch.allclose support broadcasting, so we need to check shapes.
+            return v.shape == v0.shape and torch.allclose(v, v0)
+        check_collective_equality(
+            f"The input tensor of {self.easier_hint_name}",
+            self.tensor,
+            eq=_eq_tensor
+        )
 
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        cpu_dist_env = get_cpu_dist_env()
-        assert cpu_dist_env.rank == 0, \
-            "Loading-by-chunk is only available on rank-0"
+    @functools.cache
+    def minmax(self) -> Tuple[Num, Num]:
+        amin, amax = self.tensor.aminmax()
+        return amin.item(), amax.item()
 
+    @functools.cache
+    def count_unique(self) -> int:
+        return self.tensor.unique().shape[0]
+
+    def partially_load_by_chunk(
+        self, chunk_size: int
+    ) -> Iterator[torch.Tensor]:
         orig_len = self.tensor.shape[0]
 
         # Put tailing elements in an individual chunk whose size is smaller.
@@ -232,9 +324,9 @@ class InMemoryTensorLoader(DataLoaderBase):
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        cpu_dist_env = get_cpu_dist_env()
-        world_size = cpu_dist_env.world_size
-        rank = cpu_dist_env.rank
+        dist_env = get_runtime_dist_env()
+        world_size = dist_env.world_size
+        rank = dist_env.rank
         orig_len = self.tensor.shape[0]
 
         # Put tailing elements in the part for the last rank, making the size
@@ -243,26 +335,13 @@ class InMemoryTensorLoader(DataLoaderBase):
 
         return self.tensor[start:end].clone(), start, end
 
-    def partially_load_by_index(self, index: torch.Tensor,
-                                **kwargs) -> torch.Tensor:
-        assert index.device == torch.device('cpu')
+    def partially_load_by_index(
+        self, index: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
         return self.tensor[index]
 
-    def fully_load(self, device: Union[torch.device, str, None]
-                   ) -> torch.Tensor:
-        return self.tensor.to(device or self.device, copy=True)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.tensor.dtype
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return self.tensor.shape
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
+    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+        return self.tensor.to(device, copy=True)
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(tensor={self.tensor})'
@@ -289,74 +368,154 @@ class H5DataLoader(DataLoaderBase):
     def __init__(self,
                  h5_file_path: str, h5_dataset_path: str,
                  *,
+                 device: Union[torch.device, str],
                  # Optional reading configs for users to load the dataset.
-                 dtype: Optional[torch.dtype] = None,
-                 device: Union[torch.device, str] = 'cpu',
+                 dtype: Optional[torch.dtype],
                  **h5_file_kwargs) -> None:
+        """
+        The constructor only is collective.
+        """
         super().__init__()
 
-        self._file_kwargs = h5_file_kwargs
+        self._file_path = os.path.expanduser(h5_file_path)
         self._dataset_path = h5_dataset_path
+        self._file_kwargs = h5_file_kwargs
 
-        self._device = torch.device(device)
+        self.device = torch.device(device)
 
-        self._target_np_dtype = None
+        dist_env = get_default_dist_env()  # runtime dist env not decided yet
+        if dist_env.rank == 0:
+            with h5py.File(self._file_path, 'r', **self._file_kwargs) as f:
+                d = f[self._dataset_path]
+                if not isinstance(d, h5py.Dataset):
+                    raise TypeError()
 
-        cpu_dist_env = get_cpu_dist_env()
-        if cpu_dist_env.rank == 0:
-
-            self._file_path = os.path.expanduser(h5_file_path)
-
-            with self._dataset() as d:
-                assert isinstance(d, h5py.Dataset)
                 raw_np_dtype = cast(np.dtype, d.dtype)
-                raw_dtype = numpy_dtype_to_torch_dtype(raw_np_dtype)
-
-                self._shape = tuple(d.shape)
+                self.shape = tuple(d.shape)
 
             if dtype is not None:
-                if not isinstance(dtype, torch.dtype):
-                    raise TypeError()
-                self._dtype = dtype
+                self._target_np_dtype = torch_dtype_to_numpy_dtype(dtype)
+                self.dtype = dtype
             else:
-                self._dtype = raw_dtype
+                self._target_np_dtype = None
+                self.dtype = numpy_dtype_to_torch_dtype(raw_np_dtype)
 
-            cpu_dist_env.broadcast_object_list(0, [self._dtype, self._shape])
+            dist_env.broadcast_object_list(
+                0, [self._target_np_dtype, self.dtype, self.shape]
+            )
 
         else:
-            self._file_path = h5_file_path  # not used on other ranks
+            [self._target_np_dtype, self.dtype, self.shape] = \
+                dist_env.broadcast_object_list(0)
 
-            self._dtype, self._shape = \
-                cpu_dist_env.broadcast_object_list(0)
+    def collective_init(self) -> None:
+        # Simply to additionally check device
+        self.coll_check_dtype_shape_devicetype()
 
-        self._target_np_dtype = torch_dtype_to_numpy_dtype(self.dtype)
+        # Since H5 paths are only required on rank-0, let's not check them
+        # collectively.
 
     @contextmanager
-    def _dataset(self):
+    def _dataset_as_dtype(self):
         """
-        Temporarily open the H5 File and Dataset.
+        Temporarily open the H5 File and cast the Dataset to the target dtype.
         After reading, the dataset should be closed in time to free memeory.
+
+        Only callable on rank-0.
         """
-        cpu_dist_env = get_cpu_dist_env()
-        assert cpu_dist_env.rank == 0
+        # NOTE we cannot really check rank == 0 here as in some situations
+        # we haven't yet initialized the DistEnv.
+        # assert rank == 0
 
         with h5py.File(self._file_path, 'r', **self._file_kwargs) as f:
             d = f[self._dataset_path]
-            if not isinstance(d, h5py.Dataset):
-                raise TypeError()
-
+            assert isinstance(d, h5py.Dataset)
             if self._target_np_dtype is not None:
                 # NOTE the result type of `astype` has no attr `.shape/dtype`.
-                d = d.astype(self._target_np_dtype)
+                d = d.astype(self._target_np_dtype)  # type: ignore
 
             yield d
 
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        cpu_dist_env = get_cpu_dist_env()
-        assert cpu_dist_env.rank == 0, \
-            "Loading-by-chunk is only available on rank-0"
+    @functools.cache
+    def minmax(self) -> Tuple[Num, Num]:
+        if self.dtype.is_floating_point:
+            raise NotImplementedError("Not supporting floats yet")
 
+        dist_env = get_runtime_dist_env()
+        if dist_env.rank == 0:
+            # TODO basically this is only used for idx, which are ints,
+            # but if we want this to be a universal component, we need to
+            # ensure float.NaN etc. work as expected.
+            amin, amax = None, None
+
+            def _opt_cmp(a: Optional[torch.Tensor], c: torch.Tensor, op):
+                return c if a is None else op(a, c)
+
+            for chunk in self.partially_load_by_chunk(1024 * 1024 * 128):
+                chunk_min, chunk_max = torch.aminmax(chunk)
+                amin = _opt_cmp(amin, chunk_min, min)
+                amax = _opt_cmp(amax, chunk_max, max)
+
+            amin, amax = amin.item(), amax.item()  # type: ignore
+
+            dist_env.broadcast_object_list(0, [amin, amax])
+
+        else:
+            [amin, amax] = dist_env.broadcast_object_list(0)
+
+        return amin, amax
+
+    @functools.cache
+    def count_unique(self) -> int:
+        if self.dtype.is_floating_point:
+            raise NotImplementedError("Not supporting floats yet")
+
+        amin, amax = self.minmax()
+        if not (amin >= 0):
+            raise NotImplementedError("simplify for Reducer.fullness cases")
+        assert isinstance(amax, int)
+
+        dist_env = get_runtime_dist_env()
+        if dist_env.rank == 0:
+            nunique = 0
+
+            # Each time we count elements that fall in the pack,
+            # in case the pack gets too big;
+            # For each such pack, traverse all .idx data and "set the bit" and
+            # count "bits".
+
+            bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
+            bitpack_n, remainder = divmod(amax, bitpack_maxlen)
+            if remainder > 0:
+                bitpack_n += 1
+
+            # TODO use real bitmap and popcount instead of *bool*pack.
+            for bitpack_i in range(bitpack_n):
+                bitpack_min = bitpack_i * bitpack_maxlen
+                bitpack_max = min((bitpack_i + 1) * bitpack_maxlen, amax)
+
+                bitpack = torch.zeros(
+                    [bitpack_max - bitpack_min], dtype=torch.bool
+                )
+
+                for chunk in self.partially_load_by_chunk(1024 * 1024 * 128):
+                    in_bitpack = torch.logical_and(
+                        chunk >= bitpack_min, chunk < bitpack_max)
+                    bitpack[chunk[in_bitpack] - bitpack_min] = 1
+
+                bitpack_nnz = int(torch.count_nonzero(bitpack))
+                nunique += bitpack_nnz
+
+            dist_env.broadcast_object_list(0, [nunique])
+
+        else:
+            [nunique] = dist_env.broadcast_object_list(0)
+
+        return nunique
+
+    def partially_load_by_chunk(
+        self, chunk_size: int
+    ) -> Iterator[torch.Tensor]:
         orig_len = self.shape[0]
 
         # Put tailing elements in an individual chunk whose size is smaller.
@@ -364,7 +523,7 @@ class H5DataLoader(DataLoaderBase):
         if remainder > 0:
             nchunk += 1
 
-        with self._dataset() as d:
+        with self._dataset_as_dtype() as d:
             for i in range(nchunk):
                 start = chunk_size * i
                 end = min(orig_len, chunk_size * (i + 1))
@@ -374,8 +533,8 @@ class H5DataLoader(DataLoaderBase):
                 yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        cpu_dist_env = get_cpu_dist_env()
-        rank = cpu_dist_env.rank
+        dist_env = get_runtime_dist_env()
+        rank = dist_env.rank
 
         orig_len = self.shape[0]
         sub_shape = self.shape[1:]
@@ -384,39 +543,44 @@ class H5DataLoader(DataLoaderBase):
         # simply call dist.scatter.
         # Instead, we load the part for each rank once, and do P2P.
         if rank == 0:
-            with self._dataset() as d:
-                for w in range(1, cpu_dist_env.world_size):
+            with self._dataset_as_dtype() as d:
+                for w in range(1, dist_env.world_size):
                     start, end = _get_offset_exactly_nparts(
-                        orig_len, nparts=cpu_dist_env.world_size, part=w)
+                        orig_len, nparts=dist_env.world_size, part=w)
 
                     part_np: np.ndarray = d[start:end]
-                    part: torch.Tensor = torch.from_numpy(part_np)
-                    isend = cpu_dist_env.def_isend(part, dst=w, tag=w)
-                    for req in cpu_dist_env.batch_isend_irecv([isend]):
+                    part: torch.Tensor = \
+                        torch.from_numpy(part_np).to(dist_env.comm_device)
+                    isend = dist_env.def_isend(part, dst=w, tag=w)
+                    for req in dist_env.batch_isend_irecv([isend]):
                         req.wait()
 
                     # TODO each rank-0-rank-w comm may take a while,
                     # subsequennt recvs should not timeout.
 
                 s0, e0 = _get_offset_exactly_nparts(
-                    orig_len, nparts=cpu_dist_env.world_size, part=0)
+                    orig_len, nparts=dist_env.world_size, part=0)
                 part0_np: np.ndarray = d[s0:e0]
                 part0 = torch.from_numpy(part0_np)
                 return part0, s0, e0
 
         else:
             start, end = _get_offset_exactly_nparts(
-                orig_len, cpu_dist_env.world_size, rank)
-            buffer = torch.empty((end - start,) + sub_shape, dtype=self.dtype)
-            irecv = cpu_dist_env.def_irecv(buffer, src=0, tag=rank)
-            for req in cpu_dist_env.batch_isend_irecv([irecv]):
+                orig_len, dist_env.world_size, rank)
+            buffer = torch.empty(
+                (end - start,) + sub_shape,
+                dtype=self.dtype, device=dist_env.comm_device
+            )
+            irecv = dist_env.def_irecv(buffer, src=0, tag=rank)
+            for req in dist_env.batch_isend_irecv([irecv]):
                 req.wait()
 
-            return buffer, start, end
+            return buffer.cpu(), start, end
 
     def partially_load_by_index(
         self, index: torch.Tensor, *,
-        chunk_size=1024 * 1024 * 128  # roughly 128M elements
+        chunk_size=1024 * 1024 * 128,  # roughly 128M elements
+        **kwargs
     ) -> torch.Tensor:
         """
         Each time, rank-0 broadcasts a chunk [chunk_size*i, chunk_size*(i+1))
@@ -426,11 +590,9 @@ class H5DataLoader(DataLoaderBase):
         Args:
         - index: element index in the global index space, may be not ordered.
         """
-        assert index.device == torch.device('cpu')
-
         sorted_index, sort_pos = torch.sort(index, stable=True)
 
-        cpu_dist_env = get_cpu_dist_env()
+        dist_env = get_runtime_dist_env()
 
         orig_len = self.shape[0]
         sub_shape = self.shape[1:]
@@ -448,19 +610,23 @@ class H5DataLoader(DataLoaderBase):
                 start = chunk_size * i
                 end = min(orig_len, chunk_size * (i + 1))
 
-                if cpu_dist_env.rank == 0:
+                if dist_env.rank == 0:
                     chunk_np: np.ndarray = d[start:end]
-                    chunk: torch.Tensor = torch.from_numpy(chunk_np)
-                    chunk = cpu_dist_env.broadcast(src=0, tensor=chunk)
+                    chunk: torch.Tensor = \
+                        torch.from_numpy(chunk_np).to(dist_env.comm_device)
+                    chunk = dist_env.broadcast(src=0, tensor=chunk)
 
                 else:
                     # similar to halo calculation in dist_pass,
                     # but the chunk is defined by a pair (start, end)
                     # TODO therefore for sparse cases
                     # we can use P2P instead of broadcasting.
-                    chunk = cpu_dist_env.broadcast(
+                    chunk = dist_env.broadcast(
                         src=0, shape=(end - start,) + sub_shape,
-                        dtype=self.dtype)
+                        dtype=self.dtype
+                    )
+
+                chunk = chunk.cpu()
 
                 region = torch.logical_and(
                     sorted_index >= start, sorted_index < end)
@@ -482,36 +648,21 @@ class H5DataLoader(DataLoaderBase):
                 res[pos, ...] = data
                 return res
 
-        if cpu_dist_env.rank == 0:
-            with self._dataset() as d:
+        if dist_env.rank == 0:
+            with self._dataset_as_dtype() as d:
                 return _run(d)
         else:
             return _run(None)
 
-    def fully_load(self, device: Union[torch.device, str, None]
-                   ) -> torch.Tensor:
-        cpu_dist_env = get_cpu_dist_env()
-
-        if cpu_dist_env.rank == 0:
-            with self._dataset() as d:
-                t = torch.from_numpy(d[...])
-                cpu_dist_env.broadcast(0, t)
-        else:
-            t = cpu_dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
-
-        return t.to(device=device or self.device)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return self._shape
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
+    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+        """
+        Called by backend=='none' case, EASIER does not initialize DistEnv.
+        EASIER requires there is only one process.
+        # dist_env = get_runtime_dist_env()
+        """
+        with self._dataset_as_dtype() as d:
+            t = torch.from_numpy(d[...]).to(device)
+            return t
 
     def __repr__(self) -> str:
         return ''.join([
@@ -529,27 +680,34 @@ class FulledTensorLoader(DataLoaderBase):
         super().__init__()
 
         self.value = value
-        self._shape = tuple(shape)
-        self._dtype = dtype
-        self._device = torch.device(device)
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.device = torch.device(device)
 
-        _check_data_loader_metas(self, self.value)
+    def collective_init(self) -> None:
+        self.coll_check_dtype_shape_devicetype()
+        check_collective_equality(
+            f"fill value of {self.easier_hint_name}", self.value
+        )
 
-    def _full(self, batch_dim_len: Optional[int] = None,
-              device: Union[torch.device, str, None] = None):
+    def minmax(self) -> Tuple[Num, Num]:
+        return self.value, self.value
+
+    def count_unique(self) -> int:
+        return 1
+
+    def _full(
+        self, batch_dim_len: Optional[int], device: Union[torch.device, str]
+    ):
         if batch_dim_len is None:
-            batch_dim_len = self._shape[0]
+            batch_dim_len = self.shape[0]
 
-        shape = (batch_dim_len,) + self._shape[1:]
+        shape = (batch_dim_len,) + self.shape[1:]
         return torch.full(
             shape, self.value, dtype=self.dtype, device=device)  # type: ignore
 
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:
-        cpu_dist_env = get_cpu_dist_env()
-        assert cpu_dist_env.rank == 0, \
-            "Loading-by-chunk is only available on rank-0"
-
         orig_len = self.shape[0]
 
         # Put tailing elements in an individual chunk whose size is smaller.
@@ -565,32 +723,20 @@ class FulledTensorLoader(DataLoaderBase):
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        cpu_dist_env = get_cpu_dist_env()
-        rank = cpu_dist_env.rank
-        orig_len = self._shape[0]
+        dist_env = get_runtime_dist_env()
+        rank = dist_env.rank
+        orig_len = self.shape[0]
         start, end = _get_offset_exactly_nparts(
-            orig_len, cpu_dist_env.world_size, rank)
+            orig_len, dist_env.world_size, rank)
         return self._full(end - start, 'cpu'), start, end
 
     def partially_load_by_index(self, index: torch.Tensor,
                                 **kwargs) -> torch.Tensor:
         return self._full(index.shape[0], 'cpu')
 
-    def fully_load(self, device: Union[torch.device, str, None]
+    def fully_load(self, device: Union[torch.device, str]
                    ) -> torch.Tensor:
-        return self._full(None, device=device or self.device)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return self._shape
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
+        return self._full(None, device)
 
     def __repr__(self) -> str:
         return ''.join([
@@ -606,23 +752,38 @@ class ArangeTensorLoader(DataLoaderBase):
     def __init__(self, start: int, end: int, step: int, dtype, device) -> None:
         super().__init__()
 
+        if step == 0:
+            raise ValueError("step must not be 0")
+
         self._start = start
         self._end = end
         self._step = step
 
         length = len(range(start, end, step))
-        self._shape = (length,)
-        self._dtype = dtype
-        self._device = torch.device(device)
+        self.shape = (length,)
+        self.dtype = dtype
+        self.device = torch.device(device)
 
-        _check_data_loader_metas(self, start, end, step)
+    def collective_init(self) -> None:
+        self.coll_check_dtype_shape_devicetype()
+        check_collective_equality(
+            f"arange of {self.easier_hint_name}",
+            [self._start, self._end, self._step]
+        )
 
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        cpu_dist_env = get_cpu_dist_env()
-        assert cpu_dist_env.rank == 0, \
-            "Loading-by-chunk is only available on rank-0"
+    def minmax(self) -> Tuple[Num, Num]:
+        r = range(self._start, self._end, self._step)
+        if self._step > 0:
+            return r[0], r[-1]
+        else:
+            return r[-1], r[0]
 
+    def count_unique(self) -> int:
+        return self.shape[0]
+
+    def partially_load_by_chunk(
+        self, chunk_size: int
+    ) -> Iterator[torch.Tensor]:
         orig_len = self.shape[0]
 
         # Put tailing elements in an individual chunk whose size is smaller.
@@ -639,15 +800,15 @@ class ArangeTensorLoader(DataLoaderBase):
                 range_end = max(self._end, range_end)
 
             chunk = torch.arange(range_start, range_end, self._step,
-                                 dtype=self._dtype, device='cpu')
+                                 dtype=self.dtype, device='cpu')
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        cpu_dist_env = get_cpu_dist_env()
-        rank = cpu_dist_env.rank
-        orig_len = self._shape[0]
+        dist_env = get_runtime_dist_env()
+        rank = dist_env.rank
+        orig_len = self.shape[0]
         offset_start, offset_end = _get_offset_exactly_nparts(
-            orig_len, cpu_dist_env.world_size, rank)
+            orig_len, dist_env.world_size, rank)
 
         range_start = self._start + offset_start * self._step
         range_end = self._start + offset_end * self._step
@@ -657,29 +818,19 @@ class ArangeTensorLoader(DataLoaderBase):
             range_end = max(self._end, range_end)
 
         chunk = torch.arange(range_start, range_end, self._step,
-                             dtype=self._dtype, device='cpu')
+                             dtype=self.dtype, device='cpu')
         return chunk, offset_start, offset_end
 
     def partially_load_by_index(self, index: torch.Tensor,
                                 **kwargs) -> torch.Tensor:
-        return (index * self._step + self._start).to(dtype=self._dtype)
+        return (index * self._step + self._start).to(dtype=self.dtype)
 
-    def fully_load(self, device: Union[torch.device, str, None]
+    def fully_load(self, device: Union[torch.device, str]
                    ) -> torch.Tensor:
-        return torch.arange(self._start, self._end, self._step,
-                            dtype=self._dtype, device=device or self.device)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return self._shape
-
-    @property
-    def device(self) -> torch.device:
-        return self._device
+        return torch.arange(
+            self._start, self._end, self._step,
+            dtype=self.dtype, device=device
+        )
 
     def __repr__(self) -> str:
         return ''.join([

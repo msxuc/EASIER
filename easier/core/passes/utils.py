@@ -16,6 +16,7 @@ import string
 import dataclasses
 import numpy
 import pickle
+import itertools
 
 import torch
 import torch.fx
@@ -24,7 +25,6 @@ from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
 
 import easier.core.module as esr
-from easier.core.runtime.dist_env import DistEnv, get_cpu_dist_env
 from easier.core.utils import EasierJitException
 
 
@@ -446,23 +446,58 @@ def get_easier_tensors(
     return tensors
 
 
-def get_sub_easier_modules(
+EasierObj: TypeAlias = Union[
+    esr.Module, esr.Selector, esr.Reducer, esr.Tensor, esr.DataLoaderBase
+]
+
+
+def get_easier_objects(
     top_modules: Sequence[esr.Module]
-) -> 'OrderedSet[esr.Module]':
+) -> Dict[EasierObj, List[str]]:
     """
-    Recursively get all sub easier.Modules into an OrderedSet.
+    Recursively get all EASIER-related objects,
+    and assign hint names for them.
+
+    NOTE some Selectors/Reducers may be out of the scope of EASIER compilation.
+
+    All hint names are made according to the top modules, with explicit indexes
+    in the top modules list and any module list, e.g.
+    ```
+    (modules[2]:GMRES).(update_x.5:UpdateX)
+    (modules[2]:GMRES).(update_x.5.V:Tensor)
+    (modules[2]:GMRES).(A.selector:Selector)
+    ```
+
+    If a sub esr.Module is referenced multiple times, the hint name is made
+    from the first appearance.
     """
-    modules = OrderedSet()
-    for module in top_modules:
-        if not isinstance(module, esr.Module):
+    objs: Dict[EasierObj, List[str]] = {}
+
+    for rooti, topmod in enumerate(top_modules):
+        if not isinstance(topmod, esr.Module):
             raise EasierJitException(
-                f"Instance of {module.__class__} cannot be jitted")
+                f"Instance of {topmod.__class__} cannot be jitted")
 
-        for m in module.modules():
-            if isinstance(m, esr.Module):
-                modules.add(m)
+        # top module may also be a nested module, e.g. mod A is also in Solver
+        topmod_name = f"(modules[{rooti}]:{topmod.__class__.__name__})"
+        objs.setdefault(topmod, []).append(topmod_name)
 
-    return modules
+        # attr path is like 'A.selector' or 'update_x.3.V'
+        for path, obj in itertools.chain(
+            topmod.named_modules(),
+            topmod.named_parameters(),
+        ):
+            if isinstance(obj, EasierObj.__args__):
+                obj_name = f"{topmod_name}.({path}:{obj.__class__.__name__})"
+                objs.setdefault(obj, []).append(obj_name)
+
+                if isinstance(obj, (esr.Selector, esr.Reducer, esr.Tensor)):
+                    dt_name = obj_name + (
+                        ".data" if isinstance(obj, esr.Tensor) else ".idx"
+                    )
+                    objs.setdefault(obj.easier_data_loader, []).append(dt_name)
+
+    return objs
 
 
 # torch.fx constants

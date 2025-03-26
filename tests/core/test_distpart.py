@@ -16,10 +16,10 @@ from easier.core.distpart import CoarseningLevel, DistConfig, \
     align_coarser_vids, get_csr_mask_by_rows, CoarseningRowDataExchanger, \
     exchange_cadj_adjw, merge_cadj_adjw, distpart_kway, uncoarsen_level, \
     metis_wrapper
-from easier.core.runtime.dist_env import get_cpu_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 import easier.cpp_extension as _C
 
-from ..utils import mpirun_singlenode, assert_tensor_list_equal
+from ..utils import torchrun_singlenode, assert_tensor_list_equal
 
 
 def _C_hem(
@@ -150,9 +150,6 @@ class TestCppDistPart:
 
 
 def worker__test_gather_csr_rowptr(local_rank: int, world_size: int):
-    from easier.core.runtime.dist_env import set_runtime_dist_env_backend
-    set_runtime_dist_env_backend('cpu')
-
     colidx = vec(1, 2, 3, 4, 5, 6)
     rowptr = vec(0, 3, 6)
     csr = gather_csr_graph(
@@ -179,7 +176,7 @@ def worker__test_gather_csr_rowptr(local_rank: int, world_size: int):
 
 
 def test_gather_csr_rowptr():
-    mpirun_singlenode(4, worker__test_gather_csr_rowptr)
+    torchrun_singlenode(4, worker__test_gather_csr_rowptr)
 
 
 class TestCoarserVertexID:
@@ -472,7 +469,7 @@ def worker__test_row_exchanger(local_rank: int, world_size: int):
 
 
 def test_row_exchanger():
-    mpirun_singlenode(3, worker__test_row_exchanger)
+    torchrun_singlenode(3, worker__test_row_exchanger)
 
 
 def worker__test_exchange_merge_adj(local_rank: int, world_size: int):
@@ -582,7 +579,7 @@ def worker__test_exchange_merge_adj(local_rank: int, world_size: int):
 
 
 def test_exchange_merge_adj():
-    mpirun_singlenode(3, worker__test_exchange_merge_adj)
+    torchrun_singlenode(3, worker__test_exchange_merge_adj)
 
 
 def worker__test_preserve_symmetry(local_rank, world_size):
@@ -592,7 +589,7 @@ def worker__test_preserve_symmetry(local_rank, world_size):
     """
     nv = 100
     ne = 2000
-    dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     dist_config = DistConfig.create_default(nv)
 
@@ -624,9 +621,9 @@ def worker__test_preserve_symmetry(local_rank, world_size):
     else:
         rs, cs, ws = None, None, None
 
-    rowptr = dist_env.scatter_object(0, rs)  # type: ignore
-    colidx = dist_env.scatter_object(0, cs)  # type: ignore
-    adjw = dist_env.scatter_object(0, ws)  # type: ignore
+    rowptr = dist_env.scatter_object_list(0, rs)  # type: ignore
+    colidx = dist_env.scatter_object_list(0, cs)  # type: ignore
+    adjw = dist_env.scatter_object_list(0, ws)  # type: ignore
 
     def _hook_metis(nparts, rowptr, colidx, vwgt, adjwgt):
         cnv = int(rowptr.shape[0]) - 1
@@ -659,7 +656,7 @@ def worker__test_preserve_symmetry(local_rank, world_size):
 
 
 def test_preserve_symmetry():
-    mpirun_singlenode(3, worker__test_preserve_symmetry)
+    torchrun_singlenode(3, worker__test_preserve_symmetry)
 
 
 def worker__test_uncoarsen_level(local_rank: int, world_size: int):
@@ -689,4 +686,4 @@ def worker__test_uncoarsen_level(local_rank: int, world_size: int):
 
 
 def test_uncoarsen_level():
-    mpirun_singlenode(3, worker__test_uncoarsen_level)
+    torchrun_singlenode(3, worker__test_uncoarsen_level)
