@@ -173,37 +173,44 @@ class EasierInterpreter(Generic[_T]):
         """
         pass
 
-    def if_call_function(self, function) -> _T:
+    def if_call_function(self, function: Callable) -> _T:  # type: ignore
         """
         The handler for Node `curent_node.op=='call_function'`
 
         Args:
-        -   function: the function callable
+        -   function: the function callable, e.g. `operator.add, torch.add`
 
-        By default dispatch to EASIER-specific call_operation handler.
+        By default dispatch to the unified `if_function_or_method` handler.
         """
-        return self.if_function_or_method(self.current_node.target)
+        return self.if_function_or_method(function)
 
-    def if_call_method(self, method) -> _T:
+    def if_call_method(self, method_name: str) -> _T:  # type: ignore
         """
         The handler for Node `curent_node.op=='call_method'`
 
         Args:
-        -   method: the callable of torch.Tensor method like
-                `torch.Tensor.repeat`.
+        -   method_name: the name of the method, e.g. "repeat", "sum"
 
-        By default dispatch to EASIER-specific call_operation handler.
-        """
-        return self.if_function_or_method(method)
+        By default dispatch to the unified `if_function_or_method` handler.
 
-    def if_function_or_method(self, op_callable) -> _T:  # type: ignore
+        NOTE
+        Derived interpreters should take care of whether the method is really
+        a method of the torch.Tensor.
         """
-        The EASIER-specific handler for operation invocation.
+        return self.if_function_or_method(method_name)
+
+    def if_function_or_method(
+        self, function_or_method_name: Union[Callable, str]
+    ) -> _T:  # type: ignore
+        """
+        The unified handler for operation invocation.
 
         Args:
-        -   op_callable:
-                The operation callable, e.g. `operator.add, torch.add`
-                or `torch.Tensor.repeat`.
+        -   function_or_method_name:
+                The function callable e.g. `operator.add, torch.add` if 
+                `curent_node.op=='call_function'`.
+                Or the name of the method e.g. "repeat", "sum" if 
+                `curent_node.op=='call_method'`.
         """
         pass
 

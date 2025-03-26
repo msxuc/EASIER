@@ -23,7 +23,7 @@ from easier.core import passes
 from easier.core import module as _EsrMod
 from easier.core.dump import load_dumps
 from easier.core.passes.utils import \
-    get_easier_objects
+    get_easier_objects, EasierInterpreter
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
     set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type
@@ -277,6 +277,8 @@ def init(
         f" backend={dist.get_backend_config()} rank={dist.get_rank()}"
         f" local_rank={local_rank}"
     )
+
+
 
 
 def compile(
