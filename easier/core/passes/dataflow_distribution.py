@@ -15,7 +15,7 @@ from easier.core.passes.tensor_grouping import \
     EasierTensorDef, EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import EasierInterpreter, SubmodNameAllocator, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    get_easier_tensors_as_parameters
+    get_easier_tensors
 from easier.core.utils import logger
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
@@ -23,11 +23,8 @@ from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
 import easier.core.module as esr
 from easier.core.module import Module, Selector, Reducer
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
-from easier.core.passes.tensor_partition import \
-    ElemPart, partition_tensor_groups, insert_naive_elemparts
-from easier.core.passes.metadata_propagation.metadata import \
-    EasierTensorMeta, Role, convert_scalar_type_to_torch_dtype, \
-    set_node_meta, get_node_meta
+from easier.core.passes.tensor_group_partition import \
+    ElemPart
 
 
 class ConstantTensorMover(EasierInterpreter):
@@ -83,6 +80,9 @@ class HaloExchangerInserter(EasierInterpreter):
         self.haloxchg_name_allocator = SubmodNameAllocator('haloexchanger')
 
     def if_call_module(self, submod: torch.nn.Module):
+        if isinstance(submod, esr.Module):  # nested esr.Module calls
+            return
+
         root = self.current_module
         node = self.current_node
 
@@ -103,20 +103,14 @@ class HaloExchangerInserter(EasierInterpreter):
             get_node_tensor_group(input_node)  # type: ignore
         ]
 
-        meta: EasierTensorMeta = get_node_meta(node)  # type: ignore
         haloxchg_inst = HaloExchanger(
             is_for_selector=isinstance(submod, esr.Selector),
             input_elempart_length=input_elempart.idx.shape[0],
             runtime_halos_lidxes=submod.runtime_halos_local_idxes,
             runtime_recv_lengths=submod.runtime_halos_recv_lengths,
-            dtype=convert_scalar_type_to_torch_dtype(meta.dtype),
             parent_primitive=self.callee_module_path
         )
         if haloxchg_inst.is_needed:
-            # TODO Still pre init buffer because current metaprop needs the
-            # batch-dim size of the chuck buffer.
-            haloxchg_inst.init_buffers(meta.shape[1:])
-
             # Rewrite call_module Node
             haloxchg_modpath = self.haloxchg_name_allocator.alloc_name(
                 root, hint=self.callee_module_path
@@ -165,9 +159,12 @@ class ReorderingSelectorInserter(EasierInterpreter):
             )
             if reordering_selector is None:
                 reordering_selector = Selector(
-                    submod.easier_reordering_selector_idx,
-                    easier_noncollective_idx=True
+                    submod.easier_reordering_selector_idx
                 )
+                reordering_selector.idx = submod.easier_reordering_selector_idx
+                reordering_selector.easier_index_status = 'rewritten'
+                reordering_selector.easier_hint_name = \
+                    f"{submod.easier_hint_name}.reorderingSelector"
 
                 # Rewrite as a non-halo Selector so that EASIER-injected
                 # Selectors can be inspected just like user-defined Selectors.
@@ -178,8 +175,7 @@ class ReorderingSelectorInserter(EasierInterpreter):
                 ]
                 reordering_selector.runtime_halos_recv_lengths = \
                     [0] * world_size
-                reordering_selector.easier_index_status = 'rewritten'
-                
+
                 self.reordering_selector_cache[submod] = reordering_selector
 
             # although we could further unify the module attribute name to
@@ -206,6 +202,9 @@ class ReorderingSelectorInserter(EasierInterpreter):
 
 class AllReducePrimitivesRewriter(EasierInterpreter):
     """
+    TODO we shouldn't just simply choose to rewrite aggregators to all_gather,
+    we should carefully choose all_reduce and AllReduceOp.SUM etc.
+
     To achieve the transformation:
     ```
     %a = esr.reduce(%x)
@@ -219,7 +218,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
     ```
     %worker_local = esr.reduce(%x, *worker_local_args)
     ~~~~~~~~~~~~~
-    %allgather = all_gather(%worker_local)
+    %allgather = all_gather_into_tensor(%worker_local)
     %replica = esr.reduce(%allgather, *replica_args)
 
     %b = continuation1(%replica)
@@ -236,9 +235,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
     """
 
     def if_call_function(self, function):
-        if function not in [
-            esr.sum, esr.prod, esr.norm, esr.max, esr.min
-        ]:
+        if function not in esr.easier_aggregators:
             return
 
         node = self.current_node
@@ -294,10 +291,6 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             )
 
         node.replace_all_uses_with(replica_reduce)
-        # Newly added Nodes have no metadata associated,
-        # and since we replace uses with the newly added Node, we need to copy
-        # node metadata for it.
-        set_node_meta(replica_reduce, get_node_meta(node))
         node.graph.erase_node(node)
 
 
@@ -318,7 +311,7 @@ def load_partitioned_tensors_from_source(modules: List[esr.Module]):
     """
     runtime_device = get_runtime_dist_env().comm_device
 
-    for p in get_easier_tensors_as_parameters(modules):
+    for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_partition:
             assert p.elempart is not None, \
                 "ElemPart must have been bound to esr.Tensor"
@@ -337,7 +330,7 @@ def load_replicated_tensors_from_source(modules: List[esr.Module]):
 
     # This particularly cannot be done via `get_attr` handler, as a replica
     # may be accessed outside the JIT scope.
-    for p in get_easier_tensors_as_parameters(modules):
+    for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_replica:
             p.data = p.easier_data_loader.fully_load(runtime_device)
             p.easier_data_ready = True

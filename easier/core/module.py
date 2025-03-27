@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union, cast, \
+from typing import \
+    Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, cast, \
     overload, TYPE_CHECKING
 import torch.types
 from typing_extensions import TypeAlias
@@ -22,7 +23,7 @@ from torch import fx
 
 import h5py
 
-from easier.core.runtime.dist_env import get_cpu_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
     FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
@@ -30,27 +31,37 @@ from easier.core.utils import logger, get_random_str
 
 
 if TYPE_CHECKING:
-    from easier.core.passes.tensor_partition import ElemPart
+    from easier.core.passes.tensor_group_partition import ElemPart
     from easier.core.passes.tensor_grouping import EasierTensorGroup
 
 
 def hdf5(
     file: str, dataset: str,
     dtype: Optional[torch.dtype] = None,
-    device: Union[torch.device, str] = 'cpu',
+    device: Union[torch.device, str, None] = None,
     **h5_file_kwargs
 ):
     """
+    The call to this function must be collectively.
+
     Create a handle to a HDF5 dataset.
 
     The specified dataset must be accessible from rank-0.
     """
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
     return H5DataLoader(file, dataset, dtype=dtype, device=device,
                         **h5_file_kwargs)
 
 
-def full(size, fill_value, *,
-         dtype: Optional[torch.dtype] = None, device=None):
+def full(
+    size: Sequence[int],
+    fill_value,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
     """
     Args:
     - dtype: Optional[torch.dtype]:
@@ -75,27 +86,114 @@ def full(size, fill_value, *,
     return FulledTensorLoader(fill_value, size, dtype, device)
 
 
-def zeros(size, dtype=None, device=None):
+def zeros(
+    size: Sequence[int],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
     # TODO torch.zeros/ones can have `size` be both tuple and `*size:int`.
     """
     Args:
     - dtype: Optional[torch.dtype]:
         If None, the default dtype is `torch.int64`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
     """
     if dtype is None:
         dtype = torch.float64
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
     return full(size, 0, dtype=dtype, device=device)
 
 
-def ones(size, dtype=None, device=None):
+def ones(
+    size: Sequence[int],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
     """
     Args:
     - dtype: Optional[torch.dtype]:
         If None, the default dtype is `torch.int64`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
     """
     if dtype is None:
         dtype = torch.float64
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
     return full(size, 1, dtype=dtype, device=device)
+
+
+def _dtype_device_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+) -> Tuple[torch.dtype, torch.device]:
+    if dtype is None:
+        dtype = input.dtype
+
+    if device is None:
+        device = input.device
+    device = torch.device(device)
+
+    return dtype, device
+
+
+def full_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    fill_value,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    size = input.shape
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return full(size, fill_value, dtype=dtype, device=device)
+
+
+def zeros_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return zeros(input.shape, dtype=dtype, device=device)
+
+
+def ones_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return ones(input.shape, dtype=dtype, device=device)
 
 
 @overload
@@ -105,10 +203,10 @@ def arange(start, end, step=1, dtype=None, device=None): ...
 
 
 def arange(*args, **kwargs):
-    def _end_matcher(end, dtype, device):
+    def _end_matcher(end, dtype=None, device=None):
         return (0, end, 1, dtype, device)
 
-    def _start_end_matcher(start, end, step, dtype, device):
+    def _start_end_matcher(start, end, step=1, dtype=None, device=None):
         return (start, end, step, dtype, device)
 
     def _resolve():
@@ -142,7 +240,9 @@ def arange(*args, **kwargs):
 
     if dtype is None:
         dtype = default_dtype
-
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
     return ArangeTensorLoader(start, end, step, dtype, device)
 
 
@@ -155,57 +255,14 @@ def _resolve_data_loader(arg) -> DataLoaderBase:
         # "easier_placeholder" attr on the placeholder tensors.
         raise TypeError(
             "Cannot use another easier.Tensor (or its .data property)"
-            " to initialize easier.Tensor")
+            " to initialize easier.Tensor"
+        )
     elif isinstance(arg, torch.Tensor):
+        # This does not require it to be collective. The only collective ctors
+        # e.g. H5DataLoader/esr.hdf5() are always called explicitly by users.
         return InMemoryTensorLoader(arg)
     else:
         raise TypeError(f"Unknown data type {type(arg)}")
-
-
-def _validate_idx(dl: DataLoaderBase, cls_name: str, n: Optional[int]):
-    cpu_dist_env = get_cpu_dist_env()
-    if cpu_dist_env.rank == 0:
-        try:
-            try:
-                iinfo = torch.iinfo(dl.dtype)
-            except TypeError:
-                raise TypeError(
-                    f"The index tensor to {cls_name} must be an integer tensor"
-                )
-
-            idxmin: int = iinfo.max
-            idxmax: int = iinfo.min
-            for chunk in dl.partially_load_by_chunk(1024 * 1024 * 128):
-                chunk_idxmin, chunk_idxmax = torch.aminmax(chunk)
-                idxmin = builtins.min(int(chunk_idxmin), idxmin)
-                idxmax = builtins.max(int(chunk_idxmax), idxmax)
-
-            if not (0 <= idxmin):
-                raise ValueError(
-                    f"The minimum value of the {cls_name} index tensor {idxmin}"
-                    f" must be greater than or equal 0"
-                )
-            if n is not None:
-                if not isinstance(n, int):
-                    raise TypeError(
-                        f"The argument `n` to {cls_name} must be an integer"
-                    )
-                if not (idxmax < n):
-                    raise ValueError(
-                        f"The maximum value of the {cls_name} index tensor"
-                        f" {idxmax} must be smaller than {n} the length of"
-                        " the first dimension of the resultant tensor"
-                    )
-        except Exception as e:
-            logger.exception(e)
-
-            # Aborting one rank-0 will kill all processes and surpass barriers.
-            cpu_dist_env.abort()
-
-        cpu_dist_env.barrier()
-
-    else:
-        cpu_dist_env.barrier()
 
 
 def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
@@ -219,19 +276,22 @@ def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
     """
     assert tensor.elempart is not None
 
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     elempart = tensor.elempart
     subshp = tuple(tensor.shape[1:])
 
     synced = torch.empty(
         (builtins.sum(elempart.lengths),) + subshp,  # type: ignore
-        dtype=tensor.dtype, device='cpu')
+        dtype=tensor.dtype, device=dist_env.comm_device
+    )
 
-    parts = cpu_dist_env.all_gather(
-        tensor.data.to('cpu'),
+    parts = dist_env.all_gather(
+        tensor.data.to(dist_env.comm_device),
         shapes=[(bs,) + subshp for bs in elempart.lengths])
-    idxes = cpu_dist_env.all_gather(
-        elempart.idx, shapes=[(bs,) for bs in elempart.lengths])
+    idxes = dist_env.all_gather(
+        elempart.idx.to(dist_env.comm_device),
+        shapes=[(bs,) for bs in elempart.lengths]
+    )
 
     for part, idx in zip(parts, idxes):
         synced[idx] = part
@@ -243,35 +303,17 @@ IdxStatus: TypeAlias = Literal['placeholder', 'partially_loaded', 'rewritten']
 
 
 class Selector(nn.Module):
-    def __init__(self, idx: Union[torch.Tensor, DataLoaderBase], **kwargs):
+    def __init__(self, idx: Union[torch.Tensor, DataLoaderBase]):
         super().__init__()
 
-        # not going to be shown on the interface.
-        if kwargs.get('easier_noncollective_idx', False) is True:
-            # Both _resolve_data_loader() and _validate_idx() require to
-            # be run collectively. In certain cases like EASIER-injected
-            # reordering Selectors we need to skip those collective steps.
-            assert isinstance(idx, torch.Tensor)
-            assert not (
-                isinstance(idx, Tensor) or hasattr(idx, ATTRIBUTE_PLACEHOLDER)
-            )
-            self.idx = idx
-            self.easier_index_status = 'rewritten'
-            # Let related passes to fill other JIT-only fields.
-
-            return
-
-        idx_dl = _resolve_data_loader(idx)
-        _validate_idx(idx_dl, 'Selector', None)
-        self.easier_data_loader = idx_dl
-        idx_ph: torch.Tensor = idx_dl.get_placeholder()
-
-        self.idx: torch.Tensor = idx_ph
-
+        self.easier_data_loader = _resolve_data_loader(idx)
         self.easier_index_status: IdxStatus = 'placeholder'
+
+        self.idx: torch.Tensor = self.easier_data_loader.get_placeholder()
 
         # ======
         # Fields filled during JIT compilation
+        self.easier_hint_name: str
         self.easier_tensor_group: 'EasierTensorGroup'
 
         # Which part of the data is initially loaded for dist_pass rewriting,
@@ -289,6 +331,9 @@ class Selector(nn.Module):
         if self.easier_index_status != 'rewritten':
             raise RuntimeError("Selector.idx not ready, run compile() first")
 
+        # NOTE at backend==none runtime,
+        # bad cases like `not(self.idx_max < tensor.shape[0])` will be
+        # thrown and reported by the tensor indexing operation.
         return tensor[self.idx]
 
     def to(self, *args, **kwargs):
@@ -308,22 +353,17 @@ class Reducer(nn.Module):
                  ) -> None:
         super().__init__()
 
-        idx_dl = _resolve_data_loader(idx)
-        _validate_idx(idx_dl, 'Reducer', n)
-        self.easier_data_loader = idx_dl
-        idx_ph: torch.Tensor = idx_dl.get_placeholder()
-
-        self.idx: torch.Tensor = idx_ph
-
-        self.easier_index_status: IdxStatus = 'placeholder'
-
         self.n = n
         self.reduce = reduce
 
-        self.set_fullness()
+        self.easier_data_loader = _resolve_data_loader(idx)
+        self.easier_index_status: IdxStatus = 'placeholder'
+
+        self.idx: torch.Tensor = self.easier_data_loader.get_placeholder()
 
         # ======
         # Fields filled during JIT compilation
+        self.easier_hint_name: str
         self.easier_tensor_group: 'EasierTensorGroup'
 
         # Which part of the data is initially loaded for dist_pass rewriting,
@@ -339,54 +379,9 @@ class Reducer(nn.Module):
         self.runtime_halos_local_idxes: List[torch.Tensor]
         self.runtime_halos_recv_lengths: List[int]
 
-    def set_fullness(self):
-        """
-        Calculate and collectively set the score for fullness of
-        the original definition of the Reducer.
-        """
-        dist_env = get_cpu_dist_env()
-
-        if dist_env.rank == 0:
-            nwrites = 0
-
-            # Each time we count output elements with global IDs that fall in
-            # the pack, in case the pack gets too big;
-            # For each such pack, traverse all .idx data and "set the bit" and
-            # count "bits".
-
-            bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
-            bitpack_n, remainder = divmod(self.n, bitpack_maxlen)
-            if remainder > 0:
-                bitpack_n += 1
-
-            # TODO use real bitmap and popcount instead of *bool*pack.
-            for bitpack_i in range(bitpack_n):
-                bitpack_min = bitpack_i * bitpack_maxlen
-                bitpack_max = builtins.min(
-                    (bitpack_i + 1) * bitpack_maxlen, self.n)
-
-                bitpack = torch.zeros(
-                    [bitpack_max - bitpack_min], dtype=torch.bool)
-
-                for chunk in self.easier_data_loader.partially_load_by_chunk(
-                    # load_by_chunk requires to run on rank-0
-                    1024 * 1024 * 128
-                ):
-                    in_bitpack = torch.logical_and(
-                        chunk >= bitpack_min, chunk < bitpack_max)
-                    bitpack[chunk[in_bitpack] - bitpack_min] = 1
-
-                bitpack_nnz = int(torch.count_nonzero(bitpack))
-                nwrites += bitpack_nnz
-
-            [nwrites] = dist_env.broadcast_object_list(0, [nwrites])
-        else:
-            [nwrites] = dist_env.broadcast_object_list(0)
-
-        self.easier_fullness: float = float(nwrites) / float(self.n)
-
     def set_is_full(self):
         """
+        # TODO move this to codegen pass
         Calculate and locally set the flag for if the local Reducer is full.
 
         Remark:
@@ -438,7 +433,6 @@ class Tensor(nn.Parameter):
                 requires_grad: bool = False) -> "Tensor":
         dl = _resolve_data_loader(data)
         data_ph: torch.Tensor = dl.get_placeholder()
-
         tensor = super().__new__(cls, data_ph, requires_grad)  # type: ignore
 
         # store the parsing results to
@@ -464,6 +458,7 @@ class Tensor(nn.Parameter):
 
         # ======
         # Fields filled during JIT compilation
+        self.easier_hint_name: str
 
         # Only distributed tensors have tensor groups
         # (no matter if they are referenced by `get_attr` Nodes),
@@ -474,9 +469,17 @@ class Tensor(nn.Parameter):
 
     def __repr__(self) -> str:
         if self.is_replica:
-            return 'Replicated easier.Tensor\n' + repr(self.data)
+            if not self.easier_data_ready:
+                repr_str = ' ' + repr(self.easier_data_loader)
+            else:
+                repr_str = '\n' + repr(self.data)
+            return 'Replicated easier.Tensor' + repr_str
         else:
-            return 'Managed partitioned easier.Tensor'
+            if not self.easier_data_ready:
+                repr_str = ' ' + repr(self.easier_data_loader)
+            else:
+                repr_str = ''
+            return 'Managed partitioned easier.Tensor' + repr_str
 
     def __setitem__(self, indices, val) -> 'Tensor':
         """
@@ -503,14 +506,20 @@ class Tensor(nn.Parameter):
             " consider defining a new easier.Tensor instance.")
 
     def collect(self) -> torch.Tensor:
+        if not self.easier_data_ready:
+            raise RuntimeError("Tensor data is not ready, run compile() first")
+
         if self.elempart is not None:
             return _dist_collect(self)
         else:
             return self.data.to(self.easier_data_loader.device, copy=True)
 
     def save(self, h5_file_path, h5_dataset_path, **h5_file_kwargs) -> None:
-        cpu_dist_env = get_cpu_dist_env()
-        if cpu_dist_env.rank == 0:
+        if not self.easier_data_ready:
+            raise RuntimeError("Tensor data is not ready, run compile() first")
+
+        dist_env = get_runtime_dist_env()
+        if dist_env.rank == 0:
 
             h5_file_path = os.path.expanduser(h5_file_path)
 
@@ -529,7 +538,7 @@ class Tensor(nn.Parameter):
                 if self.elempart is not None:
                     _dist_save(self, h5d)  # collectively save dist tensor
                 else:
-                    h5d[...] = self.data.to('cpu')  # replica
+                    h5d[...] = self.data.cpu()  # replica
 
         else:
             if self.elempart is not None:
@@ -549,7 +558,7 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
     """
     assert tensor.elempart is not None
 
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     chunk_size = 1024 * 1024 * 128  # roughly 128M elements
 
     orig_len = tensor.easier_data_loader.shape[0]
@@ -577,15 +586,15 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
         slice_len = int(chunk_counts[i])
         idx_end = idx_start + slice_len
 
-        idx_slice = idx[idx_start:idx_end].to('cpu')
-        data_slice = tensor[idx_start:idx_end].to('cpu')
+        idx_slice = idx[idx_start:idx_end].to(dist_env.comm_device)
+        data_slice = tensor[idx_start:idx_end].to(dist_env.comm_device)
 
-        idx_slices = cpu_dist_env.gather(0, idx_slice)
-        data_slices = cpu_dist_env.gather(0, data_slice)
+        idx_slices = dist_env.gather(0, idx_slice)
+        data_slices = dist_env.gather(0, data_slice)
 
         idx_start = idx_end  # for next step
 
-        if cpu_dist_env.rank == 0:
+        if dist_env.rank == 0:
             assert isinstance(idx_slices, list)
             assert isinstance(data_slices, list)
             assert len(idx_slices) == len(data_slices)
@@ -595,13 +604,16 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
             assert builtins.sum(s.shape[0] for s in idx_slices) == chuck_size_i
 
             h5d_slice = torch.empty(
-                (chuck_size_i,) + sub_shape, dtype=tensor.dtype)
+                (chuck_size_i,) + sub_shape,
+                dtype=tensor.dtype,
+                device=dist_env.comm_device
+            )
             for idx_slice, data_slice in zip(idx_slices, data_slices):
                 assert idx_slice.shape[0] == data_slice.shape[0]
                 h5d_slice[idx_slice] = data_slice
 
             assert h5d is not None
-            h5d[(chunk_size*i):(chunk_size*i+chuck_size_i)] = h5d_slice
+            h5d[(chunk_size*i):(chunk_size*i+chuck_size_i)] = h5d_slice.cpu()
 
 
 class Module(nn.Module):
@@ -614,11 +626,14 @@ class Module(nn.Module):
 
         # ======
         # Fields filled during JIT compilation
+        self.easier_hint_name: str
 
-        # Only filled on top modules i.e. inputs to esr.compile()
         self.easier_jit_backend: Literal[
-            'torch', 'cpu', 'gpu', 'none', None
+            'torch', 'cpu', 'cuda', 'none', None
         ] = None
+
+        # Only has value when jit_backend in ['torch','cpu','cuda']
+        self.partition_mode: Literal['metis', 'evenly']
 
         # Each Module shares the ElemPart dict of all Modules in JIT session.
         self.easier_elemparts: 'Dict[EasierTensorGroup, ElemPart]'
@@ -689,3 +704,6 @@ def min(tensor: torch.Tensor) -> torch.Tensor:
         At JIT-time, must be a distributed tensor.
     """
     return _allreduce(torch.min, tensor)
+
+
+easier_aggregators = (sum, prod, norm, max, min)

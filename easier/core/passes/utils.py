@@ -16,6 +16,7 @@ import string
 import dataclasses
 import numpy
 import pickle
+import itertools
 
 import torch
 import torch.fx
@@ -24,11 +25,8 @@ from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
 
 import easier.core.module as esr
-from easier.core.runtime.dist_env import DistEnv, get_cpu_dist_env
 from easier.core.utils import EasierJitException
 
-if TYPE_CHECKING:
-    from easier.core.passes.tensor_partition import ElemPart
 
 _T = TypeVar("_T")
 
@@ -141,11 +139,6 @@ class EasierInterpreter(Generic[_T]):
         elif node.op == FX.CALL_MODULE:
             submod_path = cast(str, node.target)
             callee = root.get_submodule(submod_path)
-
-            if isinstance(callee, esr.Module):
-                raise EasierJitException(
-                    "Currently esr.Modules should have been inlined"
-                )
 
             self.callee_module_path = submod_path
             val = self.if_call_module(callee)
@@ -385,7 +378,7 @@ def get_selector_reducer_idx_partition_pair(
         assert False, "Must be a Selector or Reducer"
 
 
-def get_selectors_reducers_in_ir_order(
+def get_selectors_reducers(
     modules: Sequence[esr.Module], graphs: Sequence[Graph]
 ) -> Dict[
     Union[esr.Selector, esr.Reducer],
@@ -419,52 +412,15 @@ def get_selectors_reducers_in_ir_order(
     return _Getter(modules, graphs).run().invocations
 
 
-def get_selectors_reducers_as_submods(
-    modules: Sequence[esr.Module]
-) -> Dict[Union[esr.Selector, esr.Reducer], List[Tuple[int, str]]]:
-    """
-    Get all Selector/Reducer instances
-    in an order that's the same on all worker.
-
-    Unlike `get_selectors_reducers_in_ir_order`, instances not referenced in
-    IR will be returned.
-
-    Returns:
-    -   dict keys: the instances in a node-consistent order
-    -   dict values: the module index in the parameter `modules` list and
-            attribute paths of the instances.
-    """
-    #                         instance,  root, rooti, name
-    named_submods: List[Tuple[Any, esr.Module, int, str]] = []
-    for i, root in enumerate(modules):
-        for name, m in root.named_modules(remove_duplicate=False):
-            if isinstance(m, (esr.Selector, esr.Reducer)):
-                named_submods.append((m, root, i, name))
-
-    # sort the list (containing duplicates) by (rooti,name)
-    named_submods.sort(key=lambda m_r_i_n: m_r_i_n[2:4])
-
-    submods: Dict[
-        Union[esr.Selector, esr.Reducer],
-        List[Tuple[int, str]]
-    ] = {}
-    for submod, root, rooti, name in named_submods:
-        refs = submods.setdefault(submod, [])
-        refs.append((rooti, name))
-
-    return submods
-
-
-def get_easier_tensors_as_parameters(
+def get_easier_tensors(
     modules: Sequence[esr.Module]
 ) -> Dict[esr.Tensor, List[Tuple[int, str]]]:
     """
     Get all easier.Tensor instances
     in an order that's the same on all worker.
 
-    Unlike `get_selectors_reducers_in_ir_order`,
-    some easier.Tensor may be involved in an EASIER session while
-    not referenced in the IR, we need to pick those instances too.
+    Some easier.Tensor may be involved in an EASIER session while
+    not referenced in the IR, this method returns those instances too.
 
     Returns:
     -   dict keys: the easier.Tensor instances in a node-consistent order
@@ -490,23 +446,58 @@ def get_easier_tensors_as_parameters(
     return tensors
 
 
-def get_sub_easier_modules(
+EasierObj: TypeAlias = Union[
+    esr.Module, esr.Selector, esr.Reducer, esr.Tensor, esr.DataLoaderBase
+]
+
+
+def get_easier_objects(
     top_modules: Sequence[esr.Module]
-) -> 'OrderedSet[esr.Module]':
+) -> Dict[EasierObj, List[str]]:
     """
-    Recursively get all sub easier.Modules into an OrderedSet.
+    Recursively get all EASIER-related objects,
+    and assign hint names for them.
+
+    NOTE some Selectors/Reducers may be out of the scope of EASIER compilation.
+
+    All hint names are made according to the top modules, with explicit indexes
+    in the top modules list and any module list, e.g.
+    ```
+    (modules[2]:GMRES).(update_x.5:UpdateX)
+    (modules[2]:GMRES).(update_x.5.V:Tensor)
+    (modules[2]:GMRES).(A.selector:Selector)
+    ```
+
+    If a sub esr.Module is referenced multiple times, the hint name is made
+    from the first appearance.
     """
-    modules = OrderedSet()
-    for module in top_modules:
-        if not isinstance(module, esr.Module):
+    objs: Dict[EasierObj, List[str]] = {}
+
+    for rooti, topmod in enumerate(top_modules):
+        if not isinstance(topmod, esr.Module):
             raise EasierJitException(
-                f"Instance of {module.__class__} cannot be jitted")
+                f"Instance of {topmod.__class__} cannot be jitted")
 
-        for m in module.modules():
-            if isinstance(m, esr.Module):
-                modules.add(m)
+        # top module may also be a nested module, e.g. mod A is also in Solver
+        topmod_name = f"(modules[{rooti}]:{topmod.__class__.__name__})"
+        objs.setdefault(topmod, []).append(topmod_name)
 
-    return modules
+        # attr path is like 'A.selector' or 'update_x.3.V'
+        for path, obj in itertools.chain(
+            topmod.named_modules(),
+            topmod.named_parameters(),
+        ):
+            if isinstance(obj, EasierObj.__args__):
+                obj_name = f"{topmod_name}.({path}:{obj.__class__.__name__})"
+                objs.setdefault(obj, []).append(obj_name)
+
+                if isinstance(obj, (esr.Selector, esr.Reducer, esr.Tensor)):
+                    dt_name = obj_name + (
+                        ".data" if isinstance(obj, esr.Tensor) else ".idx"
+                    )
+                    objs.setdefault(obj.easier_data_loader, []).append(dt_name)
+
+    return objs
 
 
 # torch.fx constants

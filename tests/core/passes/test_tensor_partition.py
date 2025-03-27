@@ -7,12 +7,16 @@ from unittest.mock import MagicMock, Mock, patch, call, ANY
 import more_itertools
 
 import torch
+
+import easier
+from easier.core import passes
+from easier.core.jit import EasierTracer
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.runtime.dist_env import DistEnv
-from easier.core.passes.tensor_partition import \
+from easier.core.passes.tensor_group_partition import \
     CommPair, partition_tensor_groups_with_adjmat, parallel_partition_graph, \
-    synchronize_partition_result, get_cpu_dist_env
+    synchronize_partition_result, get_runtime_dist_env, ElemPartArangeIdx
 from easier.core.passes.tensor_grouping import \
     EasierTensorGroup
 from tests.utils import assert_tensor_list_equal
@@ -27,7 +31,7 @@ def mock_mpi_dist_env():
     # The module is `...tensor_partition` because we have had
     # `from import MPIDistEnv` therefore this ctor function is a new, standalone
     # symbol in `...tensor_partition` module, no longer `...jit.runtime` module.
-    with patch(f'{CommPair.__module__}.{get_cpu_dist_env.__name__}') as ctor:
+    with patch(f'{CommPair.__module__}.{get_runtime_dist_env.__name__}') as ctor:
         mpi_mock = Mock(spec=_JitRuntimeDistEnv.DistEnv)
         mpi_mock.world_size = 2  # by default world_size = 2
         mpi_mock.comm_device = 'cpu'
@@ -66,7 +70,7 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
     with patch(PAR_PART_GRAPH_FUNCNAME) as mock_partgraph:
 
         mock_partgraph.return_value = [
-            "ncuts_not_used", "local_membership_not_used"
+            "local_membership_not_used"
         ]
 
         # - for each CommPair called four times:
@@ -167,7 +171,7 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
     with patch(PAR_PART_GRAPH_FUNCNAME) as mock_partgraph:
 
         mock_partgraph.return_value = [
-            "ncuts_not_used", "local_membership_not_used"
+            "local_membership_not_used"
         ]
 
         recv_res = [
@@ -257,7 +261,7 @@ def test_partition_tensor_groups(mock_mpi_dist_env):
     with patch(PAR_PART_GRAPH_FUNCNAME) as mock_partgraph:
 
         mock_partgraph.return_value = [
-            "ncuts_not_used", "local_membership_not_used"
+            "local_membership_not_used"
         ]
 
         recv_res = [
@@ -350,11 +354,15 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
     g7 = EasierTensorGroup(fake_defset, 8,  'g7')  # type: ignore
 
     def run(local_membership: torch.Tensor):
-        return synchronize_partition_result(
+        r = synchronize_partition_result(
             {g5: 0, g6: 9, g7: 9 + 26},  # type: ignore
             9 + 26 + 8,  # per_work=[15, 15, 13]
             local_membership
         )
+        for k, v in r.items():
+            assert isinstance(v.idx_desc, torch.Tensor)
+
+        return r
 
     g5_w0_to_w0 = vec(0, 1, 6)
     g5_w0_to_w1 = vec(2, 3, 7)
@@ -454,3 +462,46 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
                              [g6_w2_to_w0, g6_w2_to_w1, g6_w2_to_w2])
     assert_tensor_list_equal(get_call_arg0(next(it)),
                              [g7_w2_to_w0, g7_w2_to_w1, g7_w2_to_w2])
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_evenly_mode():
+    class M(easier.Module):
+        def __init__(self):
+            super().__init__()
+            self.s1 = easier.Selector(torch.ones(10, dtype=torch.int64))
+            self.s2 = easier.Selector(torch.ones(10, dtype=torch.int64))
+            self.s3 = easier.Selector(torch.ones(10, dtype=torch.int64))
+            self.r = easier.Reducer(torch.ones(10, dtype=torch.int64), n=55)
+
+            self.v = easier.Tensor(torch.zeros(55), mode='partition')
+
+        def forward(self):
+            v1 = self.s1(self.v)
+            v2 = self.s2(v1)
+            v3 = self.s3(v2)
+            self.r(v3, out=self.v)
+
+    m = M()
+    m.partition_mode = 'evenly'
+    g = EasierTracer().trace(m)
+    [m], [g] = passes.group_tensors([m], [g])  # type: ignore
+    [m], [g] = passes.partition_tensor_groups(
+        [m], [g]
+    )  # type: ignore
+    m: M
+
+    grpv = m.v.easier_tensor_group
+    grp1 = m.s1.easier_tensor_group
+    grp2 = m.s2.easier_tensor_group
+    grp3 = m.s3.easier_tensor_group
+    grpr = m.r.easier_tensor_group  # == grpv
+
+    assert grpv is grpr
+    grps = set([grpv, grp1, grp2, grp3])
+    assert len(grps) == 4
+
+    assert set(m.easier_elemparts.keys()) == grps
+
+    for k, v in m.easier_elemparts.items():
+        assert isinstance(v.idx_desc, ElemPartArangeIdx)

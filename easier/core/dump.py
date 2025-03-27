@@ -24,19 +24,37 @@ import h5py
 
 import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
-    get_easier_tensors_as_parameters, get_selectors_reducers_in_ir_order, \
-    get_sub_easier_modules, pickle_ir, unpickle_ir, \
+    get_easier_tensors, get_selectors_reducers, \
+    pickle_ir, unpickle_ir, get_easier_objects, \
     fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
-from easier.core.runtime.dist_env import get_cpu_dist_env, get_runtime_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
-from easier.core.passes.tensor_partition import ElemPart, ElemPartArangeIdx
+from easier.core.passes.tensor_group_partition import \
+    ElemPart, ElemPartArangeIdx
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.dataflow_distribution import \
     ConstantTensorMover, load_replicated_tensors_from_source, \
     load_partitioned_tensors_from_source
 from easier.core.utils import logger, get_random_str, EasierJitException
+
+
+class BadDumpFormatException(Exception):
+    """
+    Indicates the input dump file is corrupted or
+    incompatible with the current version of dump/load subprocedure.
+
+    Such specific errors will only be reported to users currently,
+    and EASIER will stop loading and compile from the scratch.
+    """
+    # TODO file can be corrupted in many detailed ways, such as
+    # 1) bad H5, 2) bad H5 path, 3) unexcepted/missed field, 4) bad value, etc.
+    # Some will leads to SkipLoadDump handler, while for some others we'd better
+    # treat them as fatal exceptions.
+    #
+    # Now, we only handle a few of the most significant cases.
+    pass
 
 
 # For easier.core.dump module only.
@@ -103,7 +121,15 @@ def _deserialize_json_dataset(
     """
     assert dataclasses.is_dataclass(dataclass_cls)
     json_str: str = h5grp[dataset_name].asstr()[0]  # type: ignore
-    obj = json.loads(json_str, object_hook=_json_object_hook)
+
+    try:
+        obj = json.loads(json_str, object_hook=_json_object_hook)
+    except TypeError as type_error:
+        # TypeError means the parsed JSON dict does not match the
+        # parameter list of the dataclass constructor, which will occur
+        # when we add/remove fields to the JSON dataclass definition.
+        raise BadDumpFormatException(str(type_error.args[0])) from type_error
+
     assert isinstance(obj, dataclass_cls)
     return obj
 
@@ -127,17 +153,17 @@ class EasierDump(JsonBase):
 
     primitives: List['PrimitiveInfo']
     # array datasets:
-    # - /primitives/0:S:sub.selector/idx
-    # - /primitives/0:S:sub.selector/runtime_halos_local_idxes/3
-    # - /primitives/0:S:sub.selector/in_memory_data_loader_tensor
+    # - /primitives/0:S:(sub.selector:Selector)/idx
+    # - /primitives/0:S:(sub.selector:Selector)/runtime_halos_local_idxes/3
+    # - /primitives/0:S:(sub.selector:Selector)/in_memory_data_loader_tensor
     #   (for validation)
 
     modules: List['ModuleInfo']
     # array datasets:
-    # - /modules/0:M:Model/raw_ir_pickle_bytes
+    # - /modules/0:M:(modules[3]:Model)/raw_ir_pickle_bytes
     #   (for validation)
-    # - /modules/0:M:Model/fw_ir_pickle_bytes
-    # - /modules/0:M:Model/constants/constant_tensor0
+    # - /modules/0:M:(modules[3]:Model)/fw_ir_pickle_bytes
+    # - /modules/0:M:(modules[3]:Model)/constants/constant_tensor0
     #   (for validation, warning only)
 
 
@@ -171,7 +197,7 @@ class GlobalConfig(JsonBase):
     world_size: int
 
     # The version of the dump files.
-    version: Tuple[int, int] = (0, 1)  # v0.1
+    version: Tuple[int, int] = (0, 2)  # v0.2
 
     def __eq__(self, value) -> bool:
         if not isinstance(value, GlobalConfig):
@@ -185,23 +211,25 @@ class GlobalConfig(JsonBase):
 
 
 def _get_current_global_config():
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
     config = GlobalConfig(
-        world_size=cpu_dist_env.world_size,
+        world_size=dist_env.world_size,
     )
     return config
 
 
-def _coll_check(expect: bool, ex_ctor: Type[Exception], ex_msg: str):
+def _coll_check(
+    expect: bool, ex_ctor: Type[Exception], ex_msg: Optional[str] = None
+):
     """
     Collectively decide if:
     -   arguments to `.load()` is wrong; cache format is interrupted
     -   session environment changes, gently stop reusing cache
     """
-    cpu_dist_env = get_cpu_dist_env()
-    all_checks = cpu_dist_env.all_gather_into_tensor(
-        torch.tensor([1 if expect else 0], dtype=torch.int64)
-    ).sum().item() == cpu_dist_env.world_size
+    dist_env = get_runtime_dist_env()
+    all_checks = dist_env.all_gather_into_tensor(torch.tensor(
+        [1 if expect else 0], dtype=torch.int64, device=dist_env.comm_device
+    )).sum().item() == dist_env.world_size
     if not all_checks:
         raise ex_ctor(ex_msg)
 
@@ -236,17 +264,19 @@ def _gather_dump_files(local_dumpfile: str, rank0_jitdir: str) -> None:
     TODO we can detect NFS or shared storage, to leverage currently ununsed
         `dump_dir` parameters on ranks>0, and directly read/write on that dir.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     if rank == 0:
-        for w in range(1, cpu_dist_env.world_size):
+        for w in range(1, dist_env.world_size):
             rank_dumpfile = os.path.join(rank0_jitdir, f'jit_{w}.hdf5')
 
-            length = cpu_dist_env.recv_int64(src=w, tag=w)  # tag source
-            u8 = torch.empty((length,), dtype=torch.uint8)
-            cpu_dist_env.recv(u8, src=w, tag=w)
-            u8.numpy().tofile(rank_dumpfile)
+            length = dist_env.recv_int64(src=w, tag=w)  # tag source
+            u8 = torch.empty(
+                (length,), dtype=torch.uint8, device=dist_env.comm_device
+            )
+            dist_env.recv(u8, src=w, tag=w)
+            u8.cpu().numpy(force=True).tofile(rank_dumpfile)
 
             logger.debug(
                 f'Gather dump file and save to {rank_dumpfile}'
@@ -254,8 +284,11 @@ def _gather_dump_files(local_dumpfile: str, rank0_jitdir: str) -> None:
     else:
         u8 = numpy.fromfile(local_dumpfile, dtype=numpy.uint8)
         length = u8.shape[0]
-        cpu_dist_env.send_int64(length, dst=0, tag=rank)  # tag source
-        cpu_dist_env.send(torch.from_numpy(u8), dst=0, tag=rank)
+        dist_env.send_int64(length, dst=0, tag=rank)  # tag source
+        dist_env.send(
+            torch.from_numpy(u8).to(dist_env.comm_device),
+            dst=0, tag=rank
+        )
 
 
 def _scatter_dump_files(rank0_jitdir: str) -> str:
@@ -263,11 +296,11 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
     Returns:
         The path to the dump file for that rank.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     if rank == 0:
-        for w in range(1, cpu_dist_env.world_size):
+        for w in range(1, dist_env.world_size):
             # The dump file is for runtime data needed by one rank, so it's ok
             # to load it fully into the memory.
             u8 = numpy.fromfile(
@@ -275,8 +308,11 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
             )
             length = u8.shape[0]
 
-            cpu_dist_env.send_int64(length, dst=w, tag=w)  # tag destination
-            cpu_dist_env.send(torch.from_numpy(u8), dst=w, tag=w)
+            dist_env.send_int64(length, dst=w, tag=w)  # tag destination
+            dist_env.send(
+                torch.from_numpy(u8).to(dist_env.comm_device),
+                dst=w, tag=w
+            )
 
         return os.path.join(rank0_jitdir, f'jit_0.hdf5')
 
@@ -285,10 +321,12 @@ def _scatter_dump_files(rank0_jitdir: str) -> str:
         os.makedirs(temp_jitdir, exist_ok=True)
         temp_dumpfile = os.path.join(temp_jitdir, f'jit_{rank}.hdf5')
 
-        length = cpu_dist_env.recv_int64(src=0, tag=rank)  # tag destination
-        u8 = torch.empty((length,), dtype=torch.uint8)
-        cpu_dist_env.recv(u8, src=0, tag=rank)
-        u8.numpy().tofile(temp_dumpfile)
+        length = dist_env.recv_int64(src=0, tag=rank)  # tag destination
+        u8 = torch.empty(
+            (length,), dtype=torch.uint8, device=dist_env.comm_device
+        )
+        dist_env.recv(u8, src=0, tag=rank)
+        u8.cpu().numpy(force=True).tofile(temp_dumpfile)
 
         logger.debug(
             f'Recv scattered dump file and save to {temp_dumpfile}'
@@ -332,7 +370,7 @@ def dump(
     else:
         m1 = Model1(x=easier.zeros(...))  # x data is uninitialized
 
-        [m1, m2, minit] = easier.compile([m1, m2, minit])
+        [m1, m2, minit] = easier.compile([m1, m2, minit], 'torch')
 
         # OK to dump after easier.compile(), and dump a subset of modules
         easier.dump([m1, m2], dump_dir='/mnt/checkpoint')
@@ -364,17 +402,22 @@ def dump(
 
     top_modules = modules
 
-    modules = list(get_sub_easier_modules(top_modules))
+    modules: List[esr.Module] = []
+
+    objs = get_easier_objects(top_modules)
+    for obj, names in objs.items():
+        if isinstance(obj, esr.Module):
+            modules.append(obj)
 
     for root in modules:
-        if root.easier_jit_backend not in ['torch', 'cpu', 'gpu']:
+        if root.easier_jit_backend not in ['torch', 'cpu', 'cuda']:
             raise RuntimeError(
                 "Only easier.Module compiled with backend"
-                " 'torch', 'cpu', 'gpu' can be dumped"
+                " 'torch', 'cpu', 'cuda' can be dumped"
             )
 
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     # We always recommend users to specify a valid dump_dir,
     # but we'll do some renaming to rescue the compiled internal data,
@@ -488,7 +531,7 @@ def dump_elemparts(
     tensors: Dict[
         esr.Tensor,
         List[Tuple[int, str]]
-    ] = get_easier_tensors_as_parameters(modules)
+    ] = get_easier_tensors(modules)
     ep_tensors: Dict[
         ElemPart,
         #   [   (bound_tensor,     [    (modi, tensor_attr) ] ]
@@ -580,7 +623,7 @@ def dump_selectors_reducers(
     submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, fw_graphs)
+    ] = get_selectors_reducers(modules, fw_graphs)
 
     for submodi, (submod, rooti_path_oset) in enumerate(submods.items()):
         # During dump, we need to save all references, so that if an
@@ -596,21 +639,20 @@ def dump_selectors_reducers(
             assert False, "Must be a Selector or Reducer"
 
         typechar = submod_type[0].upper()
-        rep_rooti, rep_path = instance_bindings[0]
         submod_grp = h5_prim_root.create_group(
             # hint only
-            f'{submodi}:{typechar}:{rep_rooti}.{rep_path}'
+            f'{submodi}:{typechar}:{submod.easier_hint_name}'
         )
         # full path e.g. /primitives/0:S:x.x
         grp_basepath: str = submod_grp.name  # type: ignore
 
         submod_grp.create_dataset(
-            H5_DATASET_PRIM_IDX, data=submod.idx.to('cpu')
+            H5_DATASET_PRIM_IDX, data=submod.idx.cpu()
         )
 
         lidx_grp = submod_grp.create_group(H5_GROUP_PRIM_HALOLOCALIDXES)
         for t, lidx_for_t in enumerate(submod.runtime_halos_local_idxes):
-            lidx_grp.create_dataset(str(t), data=lidx_for_t.to('cpu'))
+            lidx_grp.create_dataset(str(t), data=lidx_for_t.cpu())
 
         if not hasattr(submod, 'easier_data_loader'):
             # reordering Selector, will not be validated during loading
@@ -655,9 +697,6 @@ class HaloExchangerInfo(JsonBase):
     # properties to reconstruct HaloXchg instance
     input_elempart_length: int
 
-    # torch.dtype is not serializable by default
-    dtype_str: str  # 'int64' 'float64' etc. without 'torch.' namespace
-
 
 @dataclasses.dataclass
 class ModuleInfo(JsonBase):
@@ -667,6 +706,12 @@ class ModuleInfo(JsonBase):
     constant_names: List[str]
 
     halo_exchangers_bindings: Dict[str, HaloExchangerInfo]
+
+    # These fields are dedicated to validation:
+    #
+    # The globally specified `partition_mode` argument to `compile()`
+    # and is also set on esr.Module itself.
+    partition_mode: Literal['metis', 'evenly']
 
 
 class HaloXchgBindingsCollector(EasierInterpreter):
@@ -678,12 +723,11 @@ class HaloXchgBindingsCollector(EasierInterpreter):
 
     def if_call_module(self, submod):
         if isinstance(submod, HaloExchanger):
-            self.halo_exchangers_bindings[self.callee_module_path] = \
-                HaloExchangerInfo(
-                    bound_prim_path=submod.parent_primitive,
-                    input_elempart_length=submod.input_elempart_length,
-                    # str() == 'torch.int64' => 'int64'
-                    dtype_str=str(submod.chunk_dtype).split('.')[1]
+            self.halo_exchangers_bindings[
+                self.callee_module_path
+            ] = HaloExchangerInfo(
+                bound_prim_path=submod.parent_primitive,
+                input_elempart_length=submod.input_elempart_length
             )
 
 
@@ -708,7 +752,7 @@ class ConstantsCollector(EasierInterpreter):
             assert '.' not in path, \
                 "constant tensors must be attrs of the root module"
 
-            self.constant_values[path] = attr_val.to('cpu')
+            self.constant_values[path] = attr_val.cpu()
 
 
 def dump_modules(
@@ -723,7 +767,7 @@ def dump_modules(
             cast(torch.fx.graph_module.GraphModule, mod.forward.__self__).graph
 
         mod_grp = h5_module_root.create_group(
-            f'{modi}:M:{mod.__class__.__name__}'
+            f'{modi}:M:{mod.easier_hint_name}'
         )
         grp_basepath: str = mod_grp.name  # type: ignore
 
@@ -750,7 +794,8 @@ def dump_modules(
         mod_info = ModuleInfo(
             h5_group_basepath=grp_basepath,
             constant_names=list(const_coll.constant_values.keys()),
-            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings
+            halo_exchangers_bindings=aux_coll.halo_exchangers_bindings,
+            partition_mode=mod.partition_mode
         )
         results.append(mod_info)
 
@@ -766,7 +811,7 @@ def _get_data_loader_repr(data_loader: DataLoaderBase) -> Tuple[
     and a "repr_str" for other DataLoaders.
     """
     if isinstance(data_loader, InMemoryTensorLoader):
-        return 'tensor', data_loader.tensor.to('cpu'), None
+        return 'tensor', data_loader.tensor.cpu(), None
     else:
         return 'repr', None, repr(data_loader)
 
@@ -785,57 +830,63 @@ def load_dumps(
     If the dump is not compatible with the current user programs,
     raise Exceptions.
     """
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     dump_dir = os.path.expanduser(dump_dir)
     jit_dir = os.path.join(dump_dir, 'jit')
 
     try:
-        if rank == 0:
+        def _rank0_checks() -> Optional[str]:
+            """
+            Do multiple stages of checks, on rank-0 only.
+            Return early for any issue detected and return failure reason.
+            """
             jit_fpath0 = os.path.join(jit_dir, 'jit_0.hdf5')
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_info = _deserialize_json_dataset(
                     jit_f0, H5_DATASET_DUMP_INFO, EasierDump
                 )
+
             cur_global_config = _get_current_global_config()
             global_config_is_same = \
                 dump_info.global_config == cur_global_config
-
             if not global_config_is_same:
                 logger.debug(
                     f'{dump_info.global_config} => {cur_global_config}'
                 )
-        else:
-            global_config_is_same = True
+                return "Compilation environment changes"
 
-        _coll_check(
-            global_config_is_same,
-            _SkipLoadingDump,
-            'Compilation environment changes.'
-        )
-
-        if rank == 0:
-            # We have validate graphs are same SPMD in jit.py, so we only
+            # We have validated graphs are same SPMD in jit.py, so we only
             # do loading-time validation on rank-0.
             with h5py.File(jit_fpath0, 'r') as jit_f0:
                 dump_valid = rank0_validates_dumps(
                     modules, raw_graphs, jit_f0, dump_info
                 )
-        else:
-            dump_valid = True
+            if not dump_valid:
+                return "Dump does not match user programs"
 
-        _coll_check(
-            dump_valid,
-            _SkipLoadingDump,
-            "Dump does not match user programs."
-        )
+            return None
+        # end def _check_rank0()
+
+        if rank == 0:
+            try:
+                fail_reason = _rank0_checks()
+            except BadDumpFormatException as bad_format:
+                logger.debug(str(bad_format.args[0]))
+                fail_reason = "Dump is incompatible or is corrupted"
+        else:
+            fail_reason = None
+
+        _coll_check(fail_reason == None, _SkipLoadingDump, fail_reason)
+
     except _SkipLoadingDump as skip:
-        logger.warning(
-            "Skip loading dump and will compile from scratch,"
-            f" because: {skip.args[0]}"
-            '\nPlease set EASIER_LOG_LEVEL=DEBUG for details'
-        )
+        fail_reason = skip.args[0]
+        logger.warning(''.join([
+            "Skip loading dump and will compile from scratch.",
+            f" Because: {fail_reason}." if fail_reason is not None else "",
+            "\nPlease set EASIER_LOG_LEVEL=DEBUG for details"
+        ]))
         return None
 
     # After basic global and session checks finish, scatter rank-based dumps
@@ -906,7 +957,7 @@ def _detect_user_program_changes(
             ))
 
             logger.debug(
-                f'The {mi}-th user program {mod.__class__.__name__} changes'
+                f'The user program {mod.easier_hint_name} changes'
             )
             logger.debug(''.join(difflines))  # lines are \n-terminated
 
@@ -946,13 +997,14 @@ def rank0_validates_dumps(
     modules: List[esr.Module],
     raw_graphs: List[Graph],
     h5root: h5py.Group,
-    dump_info: EasierDump
+    dump_info: EasierDump,
 ) -> bool:
     """
     Rank-0 validates its own dump (i.e. 'jit_0.hdf5').
 
     Validate between dumps and newly initialized modules:
     -   raw IRs are equal
+    -   partition modes are equal
     -   Selector/Reducer.idx definition are equal
     If any of these criteria are not met, we need to warn users about
     the details, and break loading to compile from the scratch using the
@@ -982,6 +1034,14 @@ def rank0_validates_dumps(
     if ir_changes:
         return False
 
+    for mod, mod_info in zip(modules, dump_info.modules):
+        if mod_info.partition_mode != mod.partition_mode:
+            logger.debug(
+                "Partition mode changes:"
+                f" {mod_info.partition_mode} => {mod.partition_mode}"
+            )
+            return False
+
     # 1) We have checked the IR equality,
     # so all call_module Nodes (i.e. attr names) have valid submods bound,
     # get_s_r_in_ir_order() won't trigger e.g. AttributeError
@@ -989,7 +1049,7 @@ def rank0_validates_dumps(
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
 
     # All bindings, i.e. attr paths, mentioned in the IRs:
     # - if a dumped primitive binding is contained, we know it's a user-defined
@@ -1018,8 +1078,7 @@ def rank0_validates_dumps(
         submod = root.get_submodule(prim_path)
 
         hint_submod = \
-            f"{root.__class__.__name__}.{prim_path}" \
-            f" on the {modi}-th easier.Module"
+            f"{prim_path} on {root.easier_hint_name}"
 
         prim_type = \
             esr.Selector if prim_info.type == 'selector' else esr.Reducer
@@ -1069,8 +1128,8 @@ def load_elemparts(
     h5_ep_root: h5py.Group,
     elempart_infos: List[ElemPartInfo]
 ) -> None:
-    cpu_dist_env = get_cpu_dist_env()
-    rank = cpu_dist_env.rank
+    dist_env = get_runtime_dist_env()
+    rank = dist_env.rank
 
     for ep_info in elempart_infos:
         if ep_info.elempart_type == None:
@@ -1098,7 +1157,7 @@ def load_elemparts(
             p = root.get_parameter(tensorpath)
             if not isinstance(p, esr.Tensor):
                 raise EasierJitException(
-                    f'{root.__class__.__name__}.{tensorpath}'
+                    f'{root.easier_hint_name}.{tensorpath}'
                     ' is not an easier.Tensor'
                 )
             p.elempart = elempart
@@ -1110,12 +1169,12 @@ def load_selectors_reducers(
     h5_ep_root: h5py.Group,
     primitives_infos: List[PrimitiveInfo]
 ) -> None:
-    cpu_dist_env = get_cpu_dist_env()
+    dist_env = get_runtime_dist_env()
 
     jit_submods: Dict[
         Union[esr.Selector, esr.Reducer],
         OrderedSet[Tuple[int, str]]
-    ] = get_selectors_reducers_in_ir_order(modules, raw_graphs)
+    ] = get_selectors_reducers(modules, raw_graphs)
     all_submod_bindings: OrderedSet[Tuple[int, str]] = OrderedSet(
         itertools.chain(*jit_submods.values())
     )
@@ -1126,9 +1185,7 @@ def load_selectors_reducers(
         is_injected = rep_binding not in all_submod_bindings  # type: ignore
         if is_injected:
             # Init with arbitrary idx, will soon be rewritten.
-            submod = esr.Selector(
-                torch.empty((0,)), easier_noncollective_idx=True
-            )
+            submod = esr.Selector(torch.empty((0,)))
             for modi, prim_path in prim_info.instance_bindings:
                 parent_path, _, prim_attrname = prim_path.rpartition('.')
                 parent = modules[modi].get_submodule(parent_path)
@@ -1156,7 +1213,7 @@ def load_selectors_reducers(
                 H5_DATASET_PRIM_IDX][...]
         )
         lidxes = []
-        for t in range(cpu_dist_env.world_size):
+        for t in range(dist_env.world_size):
             lidxes.append(torch.from_numpy(
                 h5_ep_root[prim_info.h5_group_basepath][  # type: ignore
                     H5_GROUP_PRIM_HALOLOCALIDXES][str(t)][...]
@@ -1189,7 +1246,6 @@ def load_modules(
                 input_elempart_length=haloxhcg_info.input_elempart_length,
                 runtime_halos_lidxes=prim.runtime_halos_local_idxes,
                 runtime_recv_lengths=prim.runtime_halos_recv_lengths,
-                dtype=getattr(torch, haloxhcg_info.dtype_str),
                 parent_primitive=haloxhcg_info.bound_prim_path
             )
             assert inst.is_needed

@@ -12,27 +12,23 @@ This makes the development of large-scale high-performance physical simulations 
 
 ### Installation
 
-To ensure the compatibility of all dependencies, the Python verion should be fixed to 3.8 for now.
-
-```shell
-# for conda
-conda create -n ENV_NAME python=3.8
-conda activate ENV_NAME
-
-# for conda, run this only when you see compile/link errors with following `pip` commands
-conda install gxx_linux-64
-```
-
-Clone the repo and install EASIER as well as all dependencies:
+Clone the repo:
 
 ```shell
 git clone https://github.com/microsoft/EASIER.git
 cd EASIER
+```
 
-# for Ubuntu
-sudo apt-get install libopenmpi-dev
+Prepare the virtual environment, install dependencies and install EASIER:
 
-pip install Cython==3.0.11 mpi4py==3.1.5    # must be installed separately
+```shell
+# for conda
+conda create -n ENV_NAME python
+conda activate ENV_NAME
+
+# for conda, run this only when you see compile/link errors with following `pip` commands
+conda install gxx_linux-64
+
 pip install -r dev-requirements.txt
 pip install -e .                            # equals `python setup.py develop`
 ```
@@ -44,8 +40,9 @@ Simulating water waves in a square tub by solving shallow water equations with E
 # create folder to store simulation results
 mkdir res
 
-# launch the simulation in a `torchrun` style
-easierrun --nnodes=1 --nproc_per_node=4 tutorial/shallow_water_equation.py --backend=cpu --output=res
+# launch the simulation using `torchrun`,
+# just add `--master_addr` argument to the launcher if there are multiple nodes.
+torchrun --nnodes=1 --nproc_per_node=4 tutorial/shallow_water_equation.py --backend=cpu --output=res
 
 # Visualize simulation results
 python tutorial/swe_plot.py --data_dir res --filename swe.gif
@@ -56,9 +53,6 @@ python tutorial/swe_plot.py --data_dir res --filename swe.gif
   &nbsp &nbsp &nbsp &nbsp &nbsp &nbsp
   <img width="330px" src="tutorial/swe.gif"/>
 </div>
-
-EASIER launcher `easierrun` provides similar user experience to that of `torchrun`.
-Just add `--master_addr` argument to the launcher if there are multiple nodes.
 
 # Tutorial
 Detailed tutorial and more examples are coming soon.

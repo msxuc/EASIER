@@ -5,45 +5,59 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import os
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import numpy
 from typing_extensions import Literal, TypeAlias, TypeVar
 import typing
 import threading
 import time
 import functools
 import copy
+import pickle
 
 import torch
 import torch.distributed as dist
-
-from mpi4py import MPI
 
 from easier.core.utils import logger, EasierJitException
 
 _T = TypeVar("_T")
 
 
-def is_launched_by_easier_launcher():
-    return os.environ.get("EASIER_USE_EASIER_LAUNCHER", None) is not None
-
-
-def _wrap_commapi_pre_filter(prefilter, api):
+def _wrap_function(pre_hook, func):
     """
-    Both `api` and `pre_filter` function objects are not 
+    Both `api` and `pre_hook` function objects are not 
     bound to some DistEnv instance yet, the `self` argument
     will be included at the head in `args` in the wrapper.
+
+    NOTE Python captures capsule by stackframe, a dedicated function like
+    this is required, in case this is called wihtin a loop.
     """
-    @functools.wraps(api)
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        args, kwargs = prefilter(*args, **kwargs)
-        return api(*args, **kwargs)
+        args, kwargs = pre_hook(*args, **kwargs)
+        return func(*args, **kwargs)
     return wrapper
 
 
+"""
+The current hierarchy of DistEnv subclasses:
+
+-DistEnv: the abstract base
+|-DummyDistEnv: uses deepcopy to simulate communication,
+|               mainly for one-process test cases
+|-TorchDistEnv: directly wraps torch.distributed APIs, reimplements some APIs
+ |              to fit it with EASIER use cases
+ |-TorchGlooDistEnv: reimplements some methods specifically for 'gloo' backend
+ |-TorchMpiDistEnv:  reimplements some methods specifically for 'mpi' backend
+"""
+
+
 class DistEnv:
-    def __init__(self,
-                 world_size: int, rank: int, local_rank: int, host_rank: int,
-                 device: Union[str, torch.device]) -> None:
+    def __init__(
+        self,
+        world_size: int, rank: int, local_rank: int,
+        device: Union[str, torch.device]
+    ) -> None:
         """
         Args:
         -   device: To serve as the channel for communication.
@@ -53,7 +67,6 @@ class DistEnv:
         self.world_size = world_size
         self.rank = rank
         self.local_rank = local_rank
-        self.host_rank = host_rank
 
         # existing `torch.device` instance remains unchanged.
         self.comm_device = torch.device(device)
@@ -67,19 +80,14 @@ class DistEnv:
         for member_name, member in list(cls.__dict__.items()):
             # cls.__dict__ doesn't contain inherited methods from DistEnv
             if callable(member):
-                # both `member` and `pre_filter` function objects are not
+                # both `member` and `pre_hook` function objects are not
                 # bound to some DistEnv instance yet, the `self` argument
                 # will be included at the head in `args` in the wrapper.
-                pre_filter = getattr(DistEnv, '_pre_' + member_name, None)
-                if pre_filter is not None:
+                pre_hook = getattr(DistEnv, '_pre_' + member_name, None)
+                if pre_hook is not None:
                     setattr(
-                        cls, member_name,
-                        _wrap_commapi_pre_filter(pre_filter, member)
+                        cls, member_name, _wrap_function(pre_hook, member)
                     )
-
-    @property
-    def is_host(self):
-        return self.rank == self.host_rank
 
     @typing.overload
     def broadcast(self, src: int, tensor: torch.Tensor) -> torch.Tensor: ...
@@ -117,13 +125,13 @@ class DistEnv:
         return (self, src, tensor), {'shape': shape, 'dtype': dtype}
 
     @typing.overload
-    def broadcast_object_list(self, src: int, object_list: List[Any]): ...
+    def broadcast_object_list(self, src: int, object_list: list) -> list: ...
     @typing.overload
-    def broadcast_object_list(self, src: int) -> List[Any]: ...
+    def broadcast_object_list(self, src: int) -> list: ...
 
     def broadcast_object_list(self, src: int,
                               object_list: Optional[list] = None
-                              ) -> Optional[list]:
+                              ) -> list:
         """
         Remark:
         When a CUDA tensor is a part of the broadcasted object, torch.dist
@@ -239,6 +247,8 @@ class DistEnv:
     def _pre_all_to_all(self, tensors):
         assert len(tensors) == self.world_size
         for i, tensor in enumerate(tensors):
+            # all-to-all only used in sparse encoding pass to exchange indexes
+            # where the ndim is always 1.
             assert tensor.ndim == 1
         dtypes = set(t.dtype for t in tensors)
         assert len(dtypes) == 1
@@ -306,22 +316,60 @@ class DistEnv:
             send_tensor = send_tensor.contiguous()
         return (self, dst, send_tensor), {}
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
         raise NotImplementedError()
 
-    def _pre_gather_object(self, dst, obj):
+    def _pre_gather_object_list(self, dst, obj):
         assert 0 <= dst < self.world_size
         return (self, dst, obj), {}
 
     @typing.overload
-    def scatter_object(self, src: int) -> Any: ...
-    @typing.overload
-    def scatter_object(self, src: int, objs: List[_T]) -> _T: ...
+    def scatter(self, src: int) -> torch.Tensor: ...
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+    @typing.overload
+    def scatter(
+        self, src: int, tensors: Sequence[torch.Tensor]
+    ) -> torch.Tensor: ...
+
+    def scatter(
+        self, src: int, tensors: Optional[Sequence[torch.Tensor]] = None
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
-    def _pre_scatter_object(self, src, objs=None):
+    def _pre_scatter(self, src, tensors=None):
+        assert 0 <= src < self.world_size
+
+        if src == self.rank:
+            assert tensors is not None
+            assert len(tensors) == self.world_size
+
+            dtypes = set(t.dtype for t in tensors)
+            assert len(dtypes) == 1
+
+            tensors = list(tensors)  # copy the list
+            for i, tensor in enumerate(tensors):
+                if not tensor.is_contiguous():
+                    # Ensure contiguousness for the last time.
+                    logger.debug(
+                        f'The {i}-th tensor to scatter is non-contiguous'
+                    )
+                    tensors[i] = tensor.contiguous()
+        else:
+            tensors = None  # unused
+
+        return (self, src, tensors), {}
+
+    @typing.overload
+    def scatter_object_list(self, src: int) -> Any: ...
+    @typing.overload
+    def scatter_object_list(self, src: int, objs: List[_T]) -> _T: ...
+
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
+        raise NotImplementedError()
+
+    def _pre_scatter_object_list(self, src, objs=None):
         assert 0 <= src < self.world_size
 
         if src == self.rank:
@@ -331,14 +379,6 @@ class DistEnv:
             objs = None  # unused
 
         return (self, src, objs), {}
-
-    def abort(self):
-        """
-        Abort all processes.
-
-        This method is not required to be called collectively.
-        """
-        raise NotImplementedError()
 
     def barrier(self):
         raise NotImplementedError()
@@ -366,8 +406,7 @@ class DummyDistEnv(DistEnv):
             comm_device = torch.device(device_type, 0)
             torch.cuda.set_device(comm_device)
 
-        super().__init__(world_size=1, rank=0, local_rank=0, host_rank=0,
-                         device=comm_device)
+        super().__init__(world_size=1, rank=0, local_rank=0, device=comm_device)
 
     def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
                   *,
@@ -381,9 +420,10 @@ class DummyDistEnv(DistEnv):
 
     def broadcast_object_list(self, src: int,
                               object_list: Optional[list] = None
-                              ) -> Optional[list]:
+                              ) -> list:
         assert src == 0, \
             "Broadcast in dummy environment is from rank 0 to rank 0"
+        assert isinstance(object_list, list)
         return copy.deepcopy(object_list)
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
@@ -421,10 +461,18 @@ class DummyDistEnv(DistEnv):
                ) -> Optional[List[torch.Tensor]]:
         return [send_tensor.clone()]
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
         return [copy.deepcopy(obj)]
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
+    def scatter(
+        self, src: int, tensors: Optional[Sequence[torch.Tensor]]
+    ) -> torch.Tensor:
+        assert tensors is not None
+        return tensors[0].clone()
+
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
         assert objs is not None
         return copy.deepcopy(objs[0])
 
@@ -436,30 +484,20 @@ class DummyDistEnv(DistEnv):
 
 
 class TorchDistEnv(DistEnv):
-    def __init__(self, device_type: Literal['cpu', 'cuda'],
-                 torch_dist_init_kwargs={}) -> None:
-        world_size = int(os.environ["WORLD_SIZE"])
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        host_rank = 0
+    """
+    Note:
+    NCCL backend does not support CPU communication.
+    We'd better reject backend=NCCL + device_type=CPU combination for JIT.
 
-        if device_type == 'cpu':
-            comm_device = torch.device('cpu')
-        else:
-            comm_device = torch.device(device_type, local_rank)
-            torch.cuda.set_device(comm_device)
+    Also, GLOO backend (via TorchGlooDistEnv) does not support CUDA
+    communication well.
+    We'd better reject backend=GLOO + device_type=CUDA combination too.
+    """
 
-        super().__init__(world_size, rank, local_rank, host_rank, comm_device)
-
-        # TODO as we have enabled MPI, consider remove GLOO backend
-        backend = 'nccl' if device_type == 'cuda' else 'gloo'
-        self.backend = backend
-        dist.destroy_process_group
-
-        dist.init_process_group(backend, **torch_dist_init_kwargs)
-        logger.info(
-            f"Init torch.distributed "
-            f"backend={backend} rank={rank} local_rank={local_rank}")
+    def __init__(
+        self, world_size: int, rank: int, local_rank: int, device: torch.device
+    ) -> None:
+        super().__init__(world_size, rank, local_rank, device)
 
     def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
                   *,
@@ -478,7 +516,7 @@ class TorchDistEnv(DistEnv):
 
     def broadcast_object_list(self, src: int,
                               object_list: Optional[list] = None,
-                              ) -> Optional[list]:
+                              ) -> list:
         """
         Remark:
         When a CUDA tensor is a part of the broadcasted object, torch.dist
@@ -490,12 +528,14 @@ class TorchDistEnv(DistEnv):
         ensure those tensors are with `device='cpu'`.
         """
         if src == self.rank:
-            dist.broadcast_object_list([object_list], src)
-            return object_list
+            dist.broadcast_object_list(
+                [object_list], src, device=self.comm_device
+            )
+            return object_list  # type: ignore
         else:
-            recv_list = [None]  # type: ignore
-            dist.broadcast_object_list(recv_list, src)
-            return recv_list[0]
+            recv_list = [None]
+            dist.broadcast_object_list(recv_list, src, device=self.comm_device)
+            return recv_list[0]  # type: ignore
 
     def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> dist.P2POp:
         return dist.P2POp(dist.isend, tensor, peer=dst, tag=tag)
@@ -516,37 +556,6 @@ class TorchDistEnv(DistEnv):
         dist.all_to_all_single(local_output, local_input)
         return local_output
 
-    def _gloo_all_to_all(self, tensors: Sequence[torch.Tensor],
-                         send_lengths: torch.Tensor,
-                         recv_lengths: torch.Tensor,
-                         dtype) -> List[torch.Tensor]:
-        p2ps = []
-
-        for u in range(self.world_size):
-            if u != self.rank:
-                if send_lengths[u] > 0:
-                    isend_op = self.def_isend(tensors[u], u, tag=u)
-                    p2ps.append(isend_op)
-
-        buffers: List[torch.Tensor] = []
-        for w in range(self.world_size):
-            if w != self.rank:
-                recv_length = int(recv_lengths[w])
-                buffer = torch.empty(
-                    (recv_length,), dtype=dtype, device=self.comm_device)
-                buffers.append(buffer)
-
-                if recv_length > 0:
-                    irecv_op = self.def_irecv(buffer, w, tag=self.rank)
-                    p2ps.append(irecv_op)
-            else:
-                buffers.append(tensors[self.rank])
-
-        for p2p in self.batch_isend_irecv(p2ps):
-            p2p.wait()
-
-        return buffers
-
     def all_to_all(self, tensors: Sequence[torch.Tensor]
                    ) -> List[torch.Tensor]:
         """
@@ -559,10 +568,8 @@ class TorchDistEnv(DistEnv):
                                     dtype=torch.int64, device=self.comm_device)
         recv_lengths = self.all_to_all_single(send_lengths)
 
-        if self.backend == 'gloo':
-            return self._gloo_all_to_all(tensors, send_lengths, recv_lengths,
-                                         dtype)
-
+        # used in sparse encoding to exchange indexes, also has been asserted
+        # in _pre_all_to_all filter.
         buffers = [
             torch.empty((recv_length,), dtype=dtype, device=self.comm_device)
             for recv_length in recv_lengths.tolist()
@@ -571,28 +578,18 @@ class TorchDistEnv(DistEnv):
 
         return buffers
 
-    def _gloo_all_gather_into_tensor(
-        self, send_tensor: torch.Tensor,
-        form: Literal['concat', 'stack'] = 'concat'
-    ) -> torch.Tensor:
-        # PyTorch GLOO communication backend doesn't support this primitive.
-        tensors = [
-            torch.empty_like(send_tensor, device=self.comm_device)
-            for _ in range(self.world_size)
-        ]
-        dist.all_gather(tensors, send_tensor)
-
-        if form == 'concat':
-            return torch.concat(tensors)
-        else:
-            return torch.stack(tensors)
-
     def all_gather_into_tensor(self, send_tensor: torch.Tensor,
                                form: Literal['concat', 'stack'] = 'concat'):
-        if self.backend == 'gloo':
-            return self._gloo_all_gather_into_tensor(send_tensor, form)
-
+        """
+        torch.distributed doc says all tensor sizes must be the same,
+        Currently we only use all_gather_into_tensor for runtime aggregators,
+        we explicitly exclude cases of different sizes.
+        """
         shape = list(send_tensor.shape)
+
+        if shape[0] != 1:
+            raise NotImplementedError("Support different tensor sizes")
+
         if form == 'concat':
             shape[0] = shape[0] * self.world_size
         else:
@@ -604,13 +601,19 @@ class TorchDistEnv(DistEnv):
         dist.all_gather_into_tensor(recv_buffer, send_tensor)
         return recv_buffer
 
-    def _gloo_all_gather_different_shapes(
-        self,
-        send_tensor: torch.Tensor,
-        shapes: List[Tuple[int, ...]]
-    ):
-        # PyTorch GLOO communication backend doesn't support all_gather with
-        # different shapes.
+    def all_gather(
+        self, send_tensor: torch.Tensor,
+        # NOTE base method has `shape: Seq[Seq[int]]` but here we have made it
+        # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
+        shapes: Sequence[Sequence[int]]
+    ) -> List[torch.Tensor]:
+        """
+        torch.distributed doc does not say it, but GLOO and MPI backends
+        do not support all_gather with different shapes (even batch sizes).
+        Use broadcast to implement.
+
+        This method is used in Tensor.collect.
+        """
         recv_buffers = []
         for i in range(self.world_size):
             if i == self.rank:
@@ -622,344 +625,518 @@ class TorchDistEnv(DistEnv):
                 recv_buffers.append(recv)
         return recv_buffers
 
-    def all_gather(
-        self, send_tensor: torch.Tensor,
-        # NOTE base method has `shape: Seq[Seq[int]]` but here we have made it
-        # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
-        shapes: List[Tuple[int, ...]]
-    ) -> List[torch.Tensor]:
-        if self.backend == 'gloo' and len(set(shapes)) > 1:
-            return self._gloo_all_gather_different_shapes(
-                send_tensor, shapes
-            )
+    def gather(
+        self, dst: int, send_tensor: torch.Tensor
+    ) -> Optional[List[torch.Tensor]]:
+        """
+        torch.distributed doc says all tensor sizes must be the same,
+        in EASIER cases the sizes are generally different.
+        Use P2P to reimplement.
 
-        recv_buffers = [
-            torch.empty(shape, dtype=send_tensor.dtype,
-                        device=self.comm_device)
-            for shape in shapes
-        ]
-        dist.all_gather(recv_buffers, send_tensor)
-        return recv_buffers
-
-    def gather(self, dst: int, send_tensor: torch.Tensor
-               ) -> Optional[List[torch.Tensor]]:
+        P.S. NCCL can still take different shapes however GLOO cannot.
+        """
         shape = tuple(send_tensor.shape)
-        shapes = self.gather_object(dst, shape)
+
+        # But for current use cases we still have the same subshapes
+        from easier.core.runtime.utils import check_collective_equality
+        check_collective_equality("subshape", shape[1:], dist_env=self)
 
         if self.rank == dst:
-            assert shapes is not None
-            recv_buffers = [
-                torch.empty(shape, dtype=send_tensor.dtype,
-                            device=self.comm_device)
-                for shape in shapes
-            ]
-        else:
-            recv_buffers = None
+            recv_buffers = []
+            for w in range(self.world_size):
+                if w != self.rank:
+                    batch_size_w = self.recv_int64(w, w)
 
-        dist.gather(send_tensor, recv_buffers, dst)
+                    buffer = torch.empty(
+                        (batch_size_w,) + shape[1:],
+                        dtype=send_tensor.dtype,
+                        device=self.comm_device
+                    )
+                    recv_buffers.append(buffer)
+                    # since we are sending/recving twice per node,
+                    # TODO we'd use blocking recv here.
+                    self.recv(buffer, w, w)
 
-        if self.rank == dst:
+                else:
+                    recv_buffers.append(send_tensor.clone())
+
             return recv_buffers
+
         else:
+            self.send_int64(shape[0], dst, self.rank)
+            self.send(send_tensor, dst, self.rank)
             return None
 
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
+    def gather_object_list(self, dst: int, obj: _T) -> Optional[List[_T]]:
+        """
+        torch.distributed.gather_object_list does not take device parameter,
+        we should pickle the obj manually.
+        """
+        u8 = self._pickle_obj(obj)
+        u8s = self.gather(dst, u8)
+
         if self.rank == dst:
-            recvs = [None] * self.world_size  # type: ignore
+            assert u8s is not None
+            recvs = [self._unpickle_obj(u8) for u8 in u8s]
         else:
-            # in this case it must be None as torch.dist.gather_object requires
-            recvs = None   # type: ignore
+            recvs = None
+        return recvs
 
-        dist.gather_object(obj, recvs, dst)
+    def _pickle_obj(self, obj):
+        """
+        Serialize the object into the comm device
+        """
+        u8 = torch.from_numpy(
+            # numpy.frombuffer creates a view, without taking ownership of the
+            # memory, and will trigger non-writable warning
+            # during torch.from_numpy. copy() to deprecate the warning.
+            numpy.frombuffer(pickle.dumps(obj), dtype=numpy.uint8).copy()
+        ).to(device=self.comm_device)
+        return u8
 
-        return recvs  # type: ignore
+    def _unpickle_obj(self, u8_tensor: torch.Tensor):
+        assert u8_tensor.dtype == torch.uint8
+        obj = pickle.loads(
+            u8_tensor.cpu().numpy().tobytes()
+        )
+        return obj
 
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
-        recvs = [None]
-        dist.scatter_object_list(recvs, objs, src=src)
-        return recvs[0]  # type: ignore
+    def scatter(
+        self, src: int, tensors: Optional[Sequence[torch.Tensor]]
+    ) -> torch.Tensor:
+        """
+        torch.distributed doc says all tensor sizes must be the same,
+        NCCL can take different shapes but GLOO cannot. Use P2P to unify.
+        """
+        if self.rank == src:
+            assert tensors is not None
+            shapes_dtypes = [(t.shape, t.dtype) for t in tensors]
 
-    def abort(self):
-        raise NotImplementedError("Consider aborting using CPU dist env.")
+            # Lightweight objects, just broadcast.
+            self.broadcast_object_list(src, shapes_dtypes)
+
+            # But for current use cases we still have the same subshapes
+            assert len(set(t.shape[1:] for t in tensors)) == 1
+
+            ops = []
+            for w in range(self.world_size):
+                if w != self.rank:
+                    isend = self.def_isend(tensors[w], w, w)
+                    ops.append(isend)
+            for req in self.batch_isend_irecv(ops):
+                req.wait()
+
+            return tensors[src].clone()
+
+        else:
+            shape, dtype = self.broadcast_object_list(src)[self.rank]
+            buffer = self.recv(torch.empty(
+                shape, dtype=dtype, device=self.comm_device
+            ), src=src, tag=self.rank)
+            return buffer
+
+    def scatter_object_list(
+        self, src: int, objs: Optional[List[_T]] = None
+    ) -> _T:
+        """
+        torch.distributed.scatter_object_list does not take device parameter,
+        we should pickle the obj manually.
+        """
+        if self.rank == src:
+            assert objs is not None
+            u8s = [self._pickle_obj(obj) for obj in objs]
+            self.scatter(src, u8s)
+            u8 = u8s[self.rank]
+        else:
+            u8 = self.scatter(src, None)
+
+        obj = self._unpickle_obj(u8)
+        return obj
 
     def barrier(self):
         dist.barrier()
 
 
-# TODO seems used in many place, move to utils.
-def torch_dtype_to_numpy_dtype(torch_dtype: torch.dtype):
-    return torch.empty([0], dtype=torch_dtype).numpy().dtype
-
-
-class MPIDistEnv(DistEnv):
-    def __init__(self, local_rank: Optional[int] = None) -> None:
-        self.comm: MPI.Comm = get_mpi_communicator()
-
-        if local_rank is None:
-            # mpi4py.MPI.Comm does not have an API to get local rank,
-            # so when read the local rank from OMPI mpirun env vars.
-            # In cases that EASIER programs are not launched by mpirun,
-            # mpi4py.MPI.Comm.WORLD still work (i.e. singleton world),
-            # but the mpirun env vars does not exist, where we need to figure
-            # out local rank ourselves.
-            local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-
-        super().__init__(self.comm.size, self.comm.rank,
-                         local_rank=local_rank,
-                         host_rank=0,
-                         device='cpu')
-
-        self._mpi_dtypes: Dict[torch.dtype, Optional[MPI.Datatype]] = {}
-
-    def _check_unsupported_buffer_dtype(self, dtype: torch.dtype, method: str):
+class TorchDistGlooDistEnv(TorchDistEnv):
+    def all_to_all(self, tensors: Sequence[torch.Tensor]) -> List[torch.Tensor]:
         """
-        TODO MPI buffer-based APIs (capitalized APIs like Irecv) do not support
-        torch.float16 etc. directly.
-        We may need to bypass DLPack (if input is torch Tensor not numpy array)
-        and specify it as uint8.
-        """
-        from mpi4py.util import dtlib
+        GLOO doesn't support all to all.
 
-        if dtype not in self._mpi_dtypes:
-            try:
-                mpi_dtype = dtlib.from_numpy_dtype(
-                    torch_dtype_to_numpy_dtype(dtype)
+        Use P2P to implement the all-to-all data exchange.
+        """
+        dtype = tensors[0].dtype
+        send_lengths = torch.tensor([t.shape[0] for t in tensors],
+                                    dtype=torch.int64, device=self.comm_device)
+        recv_lengths = self.all_to_all_single(send_lengths)
+
+        p2ps = []
+
+        for u in range(self.world_size):
+            if u != self.rank:
+                if send_lengths[u] > 0:
+                    isend_op = self.def_isend(tensors[u], u, tag=u)
+                    p2ps.append(isend_op)
+
+        buffers: List[torch.Tensor] = []
+        for w in range(self.world_size):
+            if w != self.rank:
+                recv_length = int(recv_lengths[w])
+                # ndim is always 1, for sparse encoding to exchange indexes,
+                # has been asserted in _pre_all_to_all filter.
+                buffer = torch.empty(
+                    (recv_length,), dtype=dtype, device=self.comm_device)
+                buffers.append(buffer)
+
+                if recv_length > 0:
+                    irecv_op = self.def_irecv(buffer, w, tag=self.rank)
+                    p2ps.append(irecv_op)
+            else:
+                buffers.append(tensors[self.rank].clone())
+
+        for p2p in self.batch_isend_irecv(p2ps):
+            p2p.wait()
+
+        return buffers
+
+
+class TorchDistMpiDistEnv(TorchDistEnv):
+    def all_gather_into_tensor(
+        self,
+        send_tensor: torch.Tensor,
+        form: Literal['concat', 'stack'] = 'concat'
+    ):
+        """
+        torch.distributed.all_gather_into_tensor API is not supported by
+        the MPI backend. Use all_gather to implement (causing unnecessry
+        split and concat).
+        Currently we only use all_gather_into_tensor for runtime aggregators,
+        we explicitly exclude cases of different sizes.
+
+        TODO all_gather_into_tensor only serves for EASIER aggregators,
+        we should change it to use all_reduce primitive when possible.
+        """
+        shape = list(send_tensor.shape)
+
+        if shape[0] != 1:
+            raise NotImplementedError("Support different tensor sizes")
+
+        recv_buffers = [
+            torch.empty(
+                shape, dtype=send_tensor.dtype, device=self.comm_device
+            ) for w in range(self.world_size)
+        ]
+
+        # In our use cases of aggregators all input tensors have the same size.
+        # Don't call self.all_gather because we have reimplemented it
+        # using broadcast in base TorchDistEnv.
+        # Just call the slightly faster dist.all_gather.
+        dist.all_gather(recv_buffers, send_tensor)
+
+        if form == 'concat':
+            return torch.concat(recv_buffers)
+        else:
+            return torch.stack(recv_buffers)
+
+    def def_isend(self, tensor: torch.Tensor, dst: int, tag: int) -> Any:
+        return (dist.isend, tensor, dst, tag)
+
+    def def_irecv(self, buffer: torch.Tensor, src: int, tag: int) -> Any:
+        return (dist.irecv, buffer, src, tag)
+
+    def batch_isend_irecv(self, p2p_ops: List[tuple]) -> List[dist.Work]:
+        """
+        We override def_isend/def_irecv/batch_isend_irecv mainly for
+        CUDA cases in MPI, where torch.distributed.batch_isend_irecv
+        tries to group all P2P requests.
+        torch.distributed MPI backend does not support grouping.
+
+        Now we simply keep the definition-only semantics of def_isend/irecv
+        and invoke all at once here.
+
+        TODO mpi (including mpi-cuda) and gloo backends do not require
+        a batch sends/recvs, then we can take advantage of asynchronous
+        tensor slicing and sending (p.s. tensor slicing is in HaloExchangers).
+        Specifically, this is used in runtime HaloExchangers, we need to
+        implement it with best possible performance.
+
+        TODO However, MPI supports both CPU/GPU ops, including P2P,
+        (if it's CUDA-aware and all_gather_into_tensor fix is still needed)
+        unlike GLOO/NCCL doesn't support GPU/CPU P2P.
+        """
+        works = []
+        for tp in p2p_ops:
+            op, tensor, peer, tag = tp
+            work = op(tensor, peer, tag=tag)
+            works.append(work)
+        return works
+
+
+# must be explicitly supported by EASIER
+DistBackendStr: TypeAlias = Literal['gloo', 'nccl', 'mpi']
+
+
+class CommBackendConfig:
+    def __init__(
+        self,
+        comm_backend_config_str: str
+    ) -> None:
+        self._config: Union[DistBackendStr, Dict[str, DistBackendStr]]
+
+        def _check_backend(x) -> DistBackendStr:
+            if x not in ['gloo', 'nccl', 'mpi']:
+                raise EasierJitException(
+                    f"Unsupported communication backend {x}"
                 )
-            except ValueError:  # conversion fails
-                mpi_dtype = None
+            return x
 
-            self._mpi_dtypes[dtype] = mpi_dtype
+        if ',' not in comm_backend_config_str:
+            self._config = _check_backend(comm_backend_config_str)
 
-        unsupported = self._mpi_dtypes[dtype] is None
-        if unsupported:
-            raise NotImplementedError(
-                f'MPI method {method} does not support dtype {dtype}'
+        else:
+            self._config = {}
+
+            def _bad_format():
+                raise EasierJitException(
+                    f"Communication backend '{comm_backend_config_str}'"
+                    " is bad-format"
+                )
+            for channel in comm_backend_config_str.split(','):
+                kv = channel.split(':')
+                if len(kv) == 2:
+                    device_type, backend = kv
+                    backend = _check_backend(backend)
+                    self._ensure_known_backend_devicetype_compatibility(
+                        backend, device_type
+                    )
+                    self._config[device_type] = backend
+
+                else:
+                    _bad_format()
+            else:
+                _bad_format()
+
+    def get_backends(self) -> List[DistBackendStr]:
+        if isinstance(self._config, str):
+            return [self._config]
+        else:
+            return list(self._config.values())
+
+    def backend_specific_setup(self):
+        for backend in self.get_backends():
+            if backend == 'nccl':
+                # Validate if CUDA is available and CUDA device number
+                # NCCL requires each rank has an individual card.
+                if not torch.cuda.is_available():
+                    raise EasierJitException(
+                        "The communication backend 'nccl' is specified"
+                        " but CUDA is not available"
+                    )
+
+                if self.get_local_rank() >= torch.cuda.device_count():
+                    raise EasierJitException(
+                        "The communication backend 'nccl' requires each process"
+                        " has a dedicated CUDA device. This machine has only"
+                        f" {torch.cuda.device_count()} CUDA device(s).\n"
+                        "If CUDA devices are not the intended computing"
+                        "devices, consider explicitly specifying communication"
+                        " backends excluding 'nccl' to `easier.init()`"
+                    )
+
+                # Although EASIER always explicitly specifies the CUDA index,
+                # if users call pickle-based torch.distributed APIs, this is
+                # required, (only NCCL needs, CUDA-aware MPI does not)
+                # and this can help avoid CUDA:0 OOM.
+                #
+                # TODO benefits the CUDA MPI, but since MPI is not strongly
+                # bound with CUDA, we need to avoid enforcing dedicated
+                # CUDA devices in case users do not intend to use CUDA at all.
+                if torch.cuda.is_available():
+                    cuda_device = torch.device('cuda', self.get_local_rank())
+                    logger.info(f"Set default CUDA device: {cuda_device}")
+                    torch.cuda.set_device(cuda_device)
+
+            if backend == 'mpi':
+                if not torch.distributed.is_mpi_available():
+                    raise EasierJitException(
+                        "The communication backend 'mpi' is not supported by"
+                        " the PyTorch package"
+                    )
+
+    def _ensure_known_backend_devicetype_compatibility(
+        self, comm_backend, device_type
+    ) -> None:
+        """
+        Check if a single combination is known to be incompatible.
+
+        However, we don't know the compatibility for all kinds of device types,
+        especially for 'torch' compilation backend,
+        and we don't know if MPI is CUDA-aware.
+        """
+        if (comm_backend, device_type) in [
+            ('gloo', 'cuda'),  # No P2P ops
+            ('nccl', 'cpu')    # not supported at all
+        ]:
+            raise EasierJitException(
+                f"EASIER does not support use the device type '{device_type}'"
+                f" with the communication backend '{comm_backend}'"
             )
 
-    def broadcast(self, src: int, tensor: Optional[torch.Tensor] = None,
-                  *,
-                  shape: Optional[Sequence[int]] = None,
-                  dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        if src == self.rank:
-            assert tensor is not None
-
-            self._check_unsupported_buffer_dtype(tensor.dtype, 'Bcast')
-
-            # uppercase, buffer-based mpi4py op can be used on torch.Tensor,
-            # via __dlpack__ protocol.
-            self.comm.Bcast(tensor, src)
-            return tensor
+    def ensure_device_type_compatibility(self, device_type: str) -> None:
+        if isinstance(self._config, str):
+            self._ensure_known_backend_devicetype_compatibility(
+                self._config, device_type
+            )
         else:
-            assert shape is not None and dtype is not None
-
-            self._check_unsupported_buffer_dtype(dtype, 'Bcast')
-
-            recv_buffer = torch.empty(shape, dtype=dtype,
-                                      device=self.comm_device)
-            self.comm.Bcast(recv_buffer, src)  # uppercase, buffer-based
-            return recv_buffer
-
-    def broadcast_object_list(self, src: int,
-                              object_list: Optional[list] = None,
-                              ) -> Optional[list]:
-        if src == self.rank:
-            return self.comm.bcast(object_list, src)  # pickle-based
-        else:
-            object_list = None  # unused
-            return self.comm.bcast(None, src)  # pickle-based
-
-    # TODO MPIDistEnv.def_isend/def_irecv/batch_isend_irecv have very different
-    # semantics than TorchDistEnv. As the abstraction of torch.distributed over
-    # NCCL requires the non-blocking communication is defined-then-invoked
-    # within a context of a "batch" (e.g. with NCCL these p2p ops become
-    # a single ring-topo call).
-    #
-    # We definitely need to re-evaluate the network performance, and adapt
-    # the DistEnv code for that. So for now let's simply invoke MPI p2p
-    # immediately.
-
-    def def_isend(self, tensor: torch.Tensor, dst: int, tag: int
-                  ) -> MPI.Request:
-
-        self._check_unsupported_buffer_dtype(tensor.dtype, 'Isend')
-
-        return self.comm.Isend(tensor, dst, tag)
-
-    def def_irecv(self, buffer: torch.Tensor, src: int, tag: int
-                  ) -> MPI.Request:
-
-        self._check_unsupported_buffer_dtype(buffer.dtype, 'Irecv')
-        # mpi4py has very different usage on pickle-based recv method, where
-        # the input must still be a memory buffer, but should be **big enough**
-        # to store the pickle bytesstream.
-        # TODO We may need to:
-        # - cast float16 to float32 and send/recv;
-        # - for torch Tensor, it's handled by DLPack protocol, where dtype is
-        #   respected, we may "reinterpret cast" it to uint8 Tensor and Irecv.
-
-        return self.comm.Irecv(buffer, src, tag)
-
-    def batch_isend_irecv(self, p2p_ops: List[MPI.Request]
-                          ) -> List[MPI.Request]:
-        # TODO MPIDistEnv.batch_isend_irecv is a NO-OP.
-        return p2p_ops
-
-    def all_to_all_single(self, local_input: torch.Tensor) -> torch.Tensor:
-        # We use mpi4py lowercase `alltoall` since `local_input` is a
-        # small vector and cheap to pickle.
-        return torch.tensor(self.comm.alltoall(local_input.tolist()))
-
-    def all_to_all(self, tensors: Sequence[torch.Tensor]
-                   ) -> List[torch.Tensor]:
-        # TODO we use mpi4py lowercase, pickle-based `alltoall` to avoid
-        # manage the concat-ed buffer for upper-case, buffer-based `Alltoallv`,
-        # it's ok since this is only called JIT-time.
-        return self.comm.alltoall(tensors)
-
-    def all_gather_into_tensor(self, send_tensor: torch.Tensor,
-                               form: Literal['concat', 'stack'] = 'concat'):
-
-        self._check_unsupported_buffer_dtype(send_tensor.dtype, 'Allgather')
-
-        shape = list(send_tensor.shape)
-        if form == 'concat':
-            shape[0] = shape[0] * self.world_size
-        else:
-            shape.insert(0, self.world_size)
-
-        recv_buffer = torch.empty(
-            shape, dtype=send_tensor.dtype, device=self.comm_device)
-
-        # `all_gather_into_tensor` requires all send_tensors have the same
-        # shape, as long as they are C-layout we don't need to specify the
-        # mpi4py buffer spec.
-        self.comm.Allgather(send_tensor, recv_buffer)
-
-        return recv_buffer
-
-    def all_gather(
-        self, send_tensor: torch.Tensor,
-        # NOTE base method has `shape: Seq[Seq[int]]` but here we have made it
-        # `shape: List[Tuple[int]]` by the _pre_all_gather filter.
-        shapes: List[Tuple[int, ...]]
-    ) -> List[torch.Tensor]:
-        # TODO `send_tensor` may have different batch sizes, we simply use
-        # lowercase, pickle-baed `allgather` to do it. It's ok since
-        # `dist_env.all_gather` is used only in `easier.Tensor.collect()`.
-        recv_tensors = self.comm.allgather(send_tensor)
-        return recv_tensors
-
-    def gather(self, dst: int, send_tensor: torch.Tensor
-               ) -> Optional[List[torch.Tensor]]:
-        # TODO use pickle-based `comm.gather`.
-        # Actually `dist_env.gather` is only used in `esr.Tensor.save()` where
-        # it does not require to split the resultant buffer into tensors.
-        # TODO send_tensor may have different batch sizes, use buffer-based
-        # `comm.Gatherv`.
-        return self.comm.gather(send_tensor, dst)
-
-    def gather_object(self, dst: int, obj: _T) -> Optional[List[_T]]:
-        return self.comm.gather(obj, dst)
-
-    def scatter_object(self, src: int, objs: Optional[List[_T]] = None) -> _T:
-        return self.comm.scatter(objs, src)  # type: ignore
-
-    def abort(self):
-        self.comm.Abort(-1)
-
-    def barrier(self):
-        self.comm.Barrier()
-
-
-_dist_envs: Dict[str, DistEnv] = {}
-_runtime_backend: Literal['cpu', 'cuda', None] = None
-
-
-def set_runtime_dist_env_backend(
-    backend: Literal['cpu', 'cuda']
-):
-    logger.info(f"Set runtime dist env backend type to {backend}")
-
-    global _runtime_backend
-    _runtime_backend = backend
-
-
-def _get_or_init_dist_env(backend: Literal['cpu', 'cuda']) -> DistEnv:
-    """
-    If EASIER JIT backend is CUDA:
-    -   We rely on `torch.distributed` with CUDA backend that encapsulates NCCL
-        for runtime halo exchange.
-        This requires environment variables like WORLD_SIZE RANK MASTER_ADDR
-        MASTER_PORT etc. to be set correctly.
-
-    If EASIER JIT backend is CPU:
-    -   We rely on a MPI-based DistEnv for runtime halo exchange.
-
-    P.S. About MPIRUN:
-    For diagnostic purposes, we may launch EASIER programs with `mpirun`
-    where no environment variables like RANK or MASTER_ADDR exist.
-    In such cases, we can omit the wiring-up process for MPI communicator and
-    directly use MPI_COMM_WORLD, and EASIER CPU backend is immediately ready.
-    """
-    dist_env = _dist_envs.get(backend, None)
-    if dist_env is None:
-        if os.getenv('EASIER_USE_MPIRUN') is not None:
-            # Allow directly launching with `mpirun`, for debug purposes.
-            comm: MPI.Intracomm = MPI.COMM_WORLD
-            os.environ["WORLD_SIZE"] = str(comm.size)
-            os.environ["RANK"] = str(comm.rank)
-
-            # NOTE MPI standard doesn't define the concept "local rank" and
-            # mpi4py doesn't offer such an API either.
-            # Read OpenMPI-specific environment variable instead.
-            os.environ["LOCAL_RANK"] = os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]
-
-            if not ("MASTER_ADDR" in os.environ and
-                    "MASTER_PORT" in os.environ):
-                # The MASTER_ADDR:MASTER_PORT pair is only needed by
-                # NCCL communication backend via `torch.distributed`.
-                logger.warning(
-                    "Environment variables MASTER_ADDR and MASTER_PORT are"
-                    " not set under `mpirun`"
-                    " (e.g."
-                    " `mpirun -x MASTER_ADDR=ip -x MASTER_PORT=port ...`)"
-                    "\n"
-                    "'localhost:23456' will be set for single-node"
-                    " multiprocessing."
-                    " For multi-node, please set them correcly."
+            if device_type not in self._config.keys():
+                raise EasierJitException(
+                    f"No communication backend is specified for {device_type}"
                 )
-                os.environ["MASTER_ADDR"] = "localhost"
-                os.environ["MASTER_PORT"] = "23456"
 
-            if backend == 'cpu':
-                dist_env = MPIDistEnv()
-            elif backend == 'cuda':
-                dist_env = TorchDistEnv('cuda')
-            else:
-                raise EasierJitException(f"Unsupported JIT backend {backend}")
+    def warn_if_device_type_is_unknown(self, device_type: str):
+        # TODO although torch.distributed supports custom added backends,
+        # EASIER cannot directly use them due to the inconsistent supports on
+        # each comm API, therefore we don't actually allow devices beyond
+        # what are supported by GLOO/NCCL/MPI backends, that are: CUDA & CUDA.
+        if device_type not in ['cpu', 'cuda']:
+            logger.warning(
+                f"The device type {device_type} is not known by EASIER,"
+                " please ensure the data are properly assigned to each device"
+            )
 
-        elif is_launched_by_easier_launcher():
-            # easier launcher would inject env vars like torchrun does,
-            # e.g. RANK, LOCAL_RANK, LOCAL_WORLD_SIZE
-            # see `/easier/launcher/setup_template.sh`
-            if backend == 'cpu':
-                dist_env = MPIDistEnv()
-            elif backend == 'cuda':
-                dist_env = TorchDistEnv('cuda')
-            else:
-                raise EasierJitException(f"Unsupported JIT backend {backend}")
-
+    @functools.cache
+    def get_local_rank(self) -> int:
+        # If MPI is mentioned, it must be launched by MPIRUN.
+        #
+        # Nonetheless, it's possible to use MPIRUN and use `nccl`,
+        # but users need to set WORLD_SIZE RANK LOCAL_RANK MASTER_ADDR etc.
+        # to reconstruct the environment that `torch.distributed + nccl` need.
+        if 'mpi' in self.get_backends():
+            local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
         else:
-            if backend == 'cpu':
-                dist_env = MPIDistEnv(local_rank=0)
-            elif backend == 'cuda':
-                dist_env = DummyDistEnv(backend)
+            local_rank = int(os.environ['LOCAL_RANK'])
+
+        return local_rank
+
+    def get_torch_dist_backend_for(self, device_type: str) -> DistBackendStr:
+        if isinstance(self._config, str):
+            self._ensure_known_backend_devicetype_compatibility(
+                self._config, device_type
+            )
+            return self._config
+        else:
+            return self._config[device_type]
+
+    def get_default_device_type(self) -> str:
+        if isinstance(self._config, str):
+            if self._config == 'nccl':
+                return 'cuda'
             else:
-                raise EasierJitException(f"Unsupported JIT backend {backend}")
+                return 'cpu'
+        else:
+            # TODO by prioritizing checking CUDA, we are actually trying to
+            # leverage CUDA in the pre-AOT and AOT stages.
+            # And we are sure CUDA is capable for vectorized ops in AOT
+            # (but still may CUDA OOM)
+            # TODO make AOT passes retrieve the default DistEnv
+            for default_device_type in ['cuda', 'cpu']:
+                if default_device_type in self._config:
+                    return default_device_type
 
-        _dist_envs[backend] = dist_env
+            default_device_type = next(iter(self._config.keys()))
+            return default_device_type
 
-    return dist_env
+    def __str__(self) -> str:
+        if isinstance(self._config, str):
+            return self._config
+        else:
+            return ','.join(f'{k}:{v}' for k, v in self._config.items())
+
+
+_comm_backend_config: Optional[CommBackendConfig] = None
+
+# whatever device type, may be other than 'cpu' and 'cuda'
+_runtime_device_type: Optional[str] = None
+
+# Keys are (backend, devicetype) tuples
+_dist_envs: Dict[Tuple[str, str], DistEnv] = {}
+
+
+def set_dist_env_runtime_backend_config(
+    comm_backend_config_str: str
+) -> CommBackendConfig:
+    # TODO will data-to-send still be too big for CUDA memory, even though
+    # we move AOT-compilation data back to CPU each time after comm?
+    global _comm_backend_config
+    if _comm_backend_config is not None:
+        raise EasierJitException(
+            "`easier.init()` should be called only once"
+        )
+
+    _comm_backend_config = CommBackendConfig(comm_backend_config_str)
+
+    _comm_backend_config.backend_specific_setup()
+
+    return _comm_backend_config
+
+
+def set_dist_env_runtime_device_type(
+    comm_device_type: str
+) -> None:
+    if _comm_backend_config is None:
+        raise EasierJitException(
+            "The runtime communication backend isn't set,"
+            " please ensure `easier.init()` has been called properly."
+        )
+
+    _comm_backend_config.ensure_device_type_compatibility(comm_device_type)
+    _comm_backend_config.warn_if_device_type_is_unknown(comm_device_type)
+
+    global _runtime_device_type
+    # TODO leaving this unchecked enable multiple runs of esr.compile
+    # assert _runtime_device_type is None
+    _runtime_device_type = comm_device_type
+
+
+def _get_or_init_dist_env(device_type: str) -> DistEnv:
+    if _comm_backend_config is None:
+        raise EasierJitException("The backend for runtime isn't set")
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    local_rank = _comm_backend_config.get_local_rank()
+    comm_device = torch.device(device_type, local_rank)
+
+    comm_backend = _comm_backend_config.get_torch_dist_backend_for(device_type)
+
+    key = (comm_backend, device_type)
+    if key not in _dist_envs:
+        if comm_backend == 'gloo':
+            dist_env_cls = TorchDistGlooDistEnv
+        elif comm_backend == 'mpi':
+            dist_env_cls = TorchDistMpiDistEnv
+        else:
+            dist_env_cls = TorchDistEnv
+
+        dist_env = dist_env_cls(world_size, rank, local_rank, comm_device)
+        _dist_envs[key] = dist_env
+
+    return _dist_envs[key]
+
+
+def get_default_dist_env() -> DistEnv:
+    """
+    Get a working DistEnv on the default device of the comm backend.
+    Typically used when the device of the most performance is not decided yet
+    or may not exist.
+    """
+    if _comm_backend_config is None:
+        raise EasierJitException(
+            "The runtime communication backend isn't set,"
+            " please ensure `easier.init()` has been called properly."
+        )
+
+    device_type = _comm_backend_config.get_default_device_type()
+    return _get_or_init_dist_env(device_type)
 
 
 def get_runtime_dist_env() -> DistEnv:
@@ -967,18 +1144,11 @@ def get_runtime_dist_env() -> DistEnv:
     Get the DistEnv instance for communication during JIT runtime.
     This instance can be retrieved only during or after JIT process.
     """
-    if _runtime_backend is None:
-        raise EasierJitException("The backend for runtime isn't set")
-    return _get_or_init_dist_env(_runtime_backend)
-
-
-def get_cpu_dist_env() -> DistEnv:
-    """
-    Get the DistEnv instance for communication between CPUs.
-    This instance is ready from the very beginning.
-    """
-    return _get_or_init_dist_env('cpu')
-
-
-def get_mpi_communicator():
-    return MPI.COMM_WORLD
+    if _comm_backend_config is None:
+        raise EasierJitException(
+            "The runtime communication backend isn't set,"
+            " please ensure `easier.init()` has been called properly."
+        )
+    if _runtime_device_type is None:
+        raise EasierJitException("The device type for runtime isn't set")
+    return _get_or_init_dist_env(_runtime_device_type)

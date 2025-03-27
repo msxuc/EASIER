@@ -6,11 +6,8 @@ import logging
 import random
 import string
 
-if os.getenv('EASIER_USE_MPIRUN') is not None:
-    rank = os.environ.get("OMPI_COMM_WORLD_RANK", "0")
-else:
-    rank = os.environ.get("RANK", "0")
-logger = logging.getLogger(f"Rank{rank}")
+logger: logging.Logger = logging.getLogger("easier.init")
+
 # DEBUG, INFO, WARNING, ERROR, CRITICAL
 # NOTE environ variable EASIER_LOG_LEVEL can be specified on `torchrun` process
 # and will be inherited by all worker processes.
@@ -22,6 +19,15 @@ formatter = logging.Formatter(
 
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+
+def init_logger(rank: int):
+    """
+    Due to multiple launching methods (torchrun or mpirun) may exist
+    hierarchically on the cloud environment, we need easier.init to provide
+    a reliable rank.
+    """
+    logger.name = f"Rank{rank}"
 
 
 class EasierJitException(Exception):

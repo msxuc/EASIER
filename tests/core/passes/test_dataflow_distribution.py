@@ -12,7 +12,7 @@ from torch.fx.node import Node
 from easier.core import passes
 from easier.core.jit import EasierTracer
 from easier.core.passes.tensor_grouping import EasierTensorGroup
-from easier.core.passes.tensor_partition import ElemPart
+from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.runtime.dist_env import DistEnv
 from easier.core.module import Selector, Reducer
@@ -22,7 +22,7 @@ from easier.core.passes.sparse_encoding.sparse_encoding import \
     reorder_input_by_reducer, rewrite_reducer_instance
 from easier.core.passes.dataflow_distribution import \
     HaloExchangerInserter, ReorderingSelectorInserter, HaloExchanger
-from tests.utils import assert_tensor_list_equal, mpirun_singlenode
+from tests.utils import assert_tensor_list_equal, torchrun_singlenode
 import easier
 
 
@@ -30,11 +30,16 @@ def vec(*longs):
     return torch.LongTensor(longs)
 
 
+def ElemPart(idx, lengths):
+    return _EP_raw(idx, lengths, 'NOHINT')
+
+
 def worker__test_halo_exchanger_insertion_for_selector(
     local_rank: int, world_size: int
 ):
     idx = vec(0)  # doesn't matter
     selector = Selector(idx)
+    selector.easier_hint_name = 'targetSelector'
 
     input_elempart_idxes = torch.arange(18).split(6)
     input_elempart = ElemPart(input_elempart_idxes[local_rank], [6, 6, 6])
@@ -93,10 +98,8 @@ def worker__test_halo_exchanger_insertion_for_selector(
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
     [jm], [graph] = passes.group_tensors([m], [graph])
 
-    _JitRuntimeDistEnv.set_runtime_dist_env_backend('cpu')
     elemparts = {m.v.easier_tensor_group: output_elempart}
     HaloExchangerInserter(
         [jm], [graph], elemparts,  # type: ignore
@@ -108,7 +111,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is None
+        assert haloxchg.concat_buffer_length is None
 
     elif local_rank == 1:
         getattr_v, call_selector, setitem_v, out = graph.nodes
@@ -117,7 +120,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
         getattr_v, call_haloxchg, call_selector, setitem_v, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
+        assert haloxchg.concat_buffer_length == 8
 
     assert getattr_v.op == FX.GET_ATTR
     assert call_selector.op == FX.CALL_MODULE
@@ -125,7 +128,7 @@ def worker__test_halo_exchanger_insertion_for_selector(
 
 
 def test_halo_exchanger_insertion_for_selector():
-    mpirun_singlenode(3, worker__test_halo_exchanger_insertion_for_selector)
+    torchrun_singlenode(3, worker__test_halo_exchanger_insertion_for_selector)
 
 
 def worker__test_halo_exchanger_insertion_for_reducer(
@@ -133,6 +136,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
 ):
     idx = torch.arange(6)  # doesn't matter
     reducer = Reducer(idx, 6)  # assume to be local Reducer to pass metaprop
+    reducer.easier_hint_name = 'targetReducer'
 
     class M(easier.Module):
         def __init__(self):
@@ -145,7 +149,6 @@ def worker__test_halo_exchanger_insertion_for_reducer(
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
     [jm], [graph] = passes.group_tensors([m], [graph])
 
     input_elempart_idxes = torch.arange(18).split(6)
@@ -200,7 +203,6 @@ def worker__test_halo_exchanger_insertion_for_reducer(
             torch.arange(6)
         ])
 
-    _JitRuntimeDistEnv.set_runtime_dist_env_backend('cpu')
     elemparts = {m.v.easier_tensor_group: output_elempart}
     HaloExchangerInserter(
         [jm], [graph], elemparts,  # type: ignore
@@ -214,8 +216,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
         getattr_v, call_haloxchg, call_reducer, out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
-        assert haloxchg.chunk_v.shape[0] == 4
+        assert haloxchg.concat_buffer_length == 4
 
     elif local_rank == 1:
         getattr_v, call_reordering_selector, call_reducer, \
@@ -231,8 +232,7 @@ def worker__test_halo_exchanger_insertion_for_reducer(
             out = graph.nodes
 
         haloxchg = jm.get_submodule(call_haloxchg.target)  # type: ignore
-        assert haloxchg.chunk_v is not None
-        assert haloxchg.chunk_v.shape[0] == 8
+        assert haloxchg.concat_buffer_length == 8
 
         assert isinstance(
             jm.get_submodule(call_reordering_selector.target),  # type: ignore
@@ -246,4 +246,4 @@ def worker__test_halo_exchanger_insertion_for_reducer(
 
 
 def test_halo_exchanger_insertion_for_reducer():
-    mpirun_singlenode(3, worker__test_halo_exchanger_insertion_for_reducer)
+    torchrun_singlenode(3, worker__test_halo_exchanger_insertion_for_reducer)

@@ -7,8 +7,8 @@ import h5py
 
 import numpy as np
 import torch
+import torch.distributed
 from tqdm import tqdm
-from mpi4py import MPI
 
 import easier as esr
 from easier.examples.mesh import get_triangular_mesh
@@ -165,16 +165,18 @@ class ShallowWaterEquation(esr.Module):
     def __init__(self, mesh_size: int = 100, dt=0.005, device='cpu') -> None:
         super().__init__()
 
-        comm = MPI.COMM_WORLD
-        rank = comm.Get_rank()
-        if rank == 0:
+        if torch.distributed.get_rank() == 0:
             mesh_path = get_triangular_mesh(mesh_size)
             assembler = ShallowWaterAssembler(mesh_path)
             sw_path = assembler.assemble()
             assembler = None
-            mesh_path, sw_path = comm.bcast([mesh_path, sw_path])
+            torch.distributed.broadcast_object_list([mesh_path, sw_path], 0)
         else:
-            mesh_path, sw_path = comm.bcast(None)
+            recv_objs = [None, None]
+            torch.distributed.broadcast_object_list(recv_objs, 0)
+            mesh_path, sw_path = recv_objs
+        mesh_path: str
+        sw_path: str
 
         self.dt = dt
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
@@ -296,7 +298,7 @@ class ShallowWaterEquation(esr.Module):
 
 if __name__ == "__main__":
     """
-    easierrun --nnodes=1 --nproc_per_node=4 \
+    torchrun --nnodes=1 --nproc_per_node=4 \
         shallow_water_equation.py --backend=cpu --plot=true
     """
     parser = argparse.ArgumentParser()
@@ -304,13 +306,19 @@ if __name__ == "__main__":
         "--device", type=str, choices=["cpu", "cuda"], default="cpu"
     )
     parser.add_argument(
-        "--backend", type=str, choices=["none", "torch", "cpu", "gpu"],
-        default=None
+        "--backend", type=str, choices=["none", "torch", "cpu", "cuda"],
+        default='torch'
+    )
+    parser.add_argument(
+        "--comm_backend", type=str, choices=["gloo", "nccl"],
+        default='gloo'
     )
     parser.add_argument("--scale", type=int, default=100)
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--output", type=str)
     args = parser.parse_args()
+
+    esr.init(args.comm_backend)
 
     eqn = ShallowWaterEquation(args.scale, args.dt, args.device)
     [eqn] = esr.compile([eqn], args.backend)

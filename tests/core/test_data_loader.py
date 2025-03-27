@@ -15,7 +15,7 @@ from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 
-from ..utils import mpirun_singlenode, get_random_str
+from ..utils import torchrun_singlenode, get_random_str
 
 
 def get_in_memory_tensor_loader(
@@ -92,6 +92,8 @@ have_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
     pytest.param('cuda', marks=have_cuda)
 ])
 class TestDataLoader:
+
+    @pytest.mark.usefixtures('dummy_dist_env')
     def test_load_chunk(self, data_loader_ctor, dtype: torch.dtype,
                         device_type: str):
         # rank-0 only
@@ -114,19 +116,18 @@ class TestDataLoader:
 
     def test_load_by_rank(self, data_loader_ctor, dtype: torch.dtype,
                           device_type: str):
-        mpirun_singlenode(2, worker__test_load_by_rank,
-                          (data_loader_ctor, dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_by_rank,
+                            (data_loader_ctor, dtype, device_type))
 
     def test_load_by_index(self, data_loader_ctor, dtype: torch.dtype,
                            device_type: str):
-        mpirun_singlenode(2, worker__test_load_by_index,
-                          (data_loader_ctor, dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_by_index,
+                            (data_loader_ctor, dtype, device_type))
 
+    @pytest.mark.usefixtures('dummy_dist_env')
     @pytest.mark.parametrize('target_device_type', [
-        None,
         'cpu',
-        pytest.param(
-            'cuda', marks=have_cuda)
+        pytest.param('cuda', marks=have_cuda)
     ])
     def test_fully_load(self, data_loader_ctor, dtype: torch.dtype,
                         device_type: str, target_device_type: str):
@@ -188,6 +189,8 @@ def worker__test_load_full_by_index(local_rank: int, world_size: int,
     pytest.param('cuda', marks=have_cuda)
 ])
 class TestFulledLoader:
+
+    @pytest.mark.usefixtures('dummy_dist_env')
     def test_load_chunk(self, dtype: torch.dtype, device_type: str):
         dl = FulledTensorLoader(
             42, shape=[17, 2], dtype=dtype, device=torch.device(device_type))
@@ -207,12 +210,12 @@ class TestFulledLoader:
         assert torch.equal(torch.full([3, 2], 42, dtype=dtype), chunks[2])
 
     def test_load_by_rank(self, dtype: torch.dtype, device_type: str):
-        mpirun_singlenode(2, worker__test_load_full_by_rank,
-                          (dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_full_by_rank,
+                            (dtype, device_type))
 
     def test_load_by_index(self, dtype: torch.dtype, device_type: str):
-        mpirun_singlenode(2, worker__test_load_full_by_index,
-                          (dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_full_by_index,
+                            (dtype, device_type))
 
 
 def worker__test_load_arange_by_rank(local_rank: int, world_size: int,
@@ -260,6 +263,8 @@ def worker__test_load_arange_by_index(local_rank: int, world_size: int,
     pytest.param('cuda', marks=have_cuda)
 ])
 class TestArangeLoader:
+
+    @pytest.mark.usefixtures('dummy_dist_env')
     def test_load_chunk(self, dtype: torch.dtype, device_type: str):
         dl = ArangeTensorLoader(0, 34, 2,
                                 dtype=dtype, device=torch.device(device_type))
@@ -279,9 +284,9 @@ class TestArangeLoader:
         assert torch.equal(torch.arange(28, 34, 2, dtype=dtype), chunks[2])
 
     def test_load_by_rank(self, dtype: torch.dtype, device_type: str):
-        mpirun_singlenode(2, worker__test_load_arange_by_rank,
-                          (dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_arange_by_rank,
+                            (dtype, device_type))
 
     def test_load_by_index(self, dtype: torch.dtype, device_type: str):
-        mpirun_singlenode(2, worker__test_load_arange_by_index,
-                          (dtype, device_type))
+        torchrun_singlenode(2, worker__test_load_arange_by_index,
+                            (dtype, device_type))
