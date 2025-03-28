@@ -129,12 +129,12 @@ class EasierInterpreter(Generic[_T]):
             val = self.if_get_attr(submod_path, attr_name, obj)
 
         elif node.op == FX.CALL_FUNCTION:
+            assert callable(node.target)
             val = self.if_call_function(node.target)
 
         elif node.op == FX.CALL_METHOD:
-            # Currently we assume all methods are torch.Tensor methods
-            method_func = getattr(torch.Tensor, cast(str, node.target))
-            val = self.if_call_method(method_func)
+            assert isinstance(node.target, str)
+            val = self.if_call_method(node.target)
 
         elif node.op == FX.CALL_MODULE:
             submod_path = cast(str, node.target)
