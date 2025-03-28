@@ -13,10 +13,6 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-from easier.core.passes.metadata_propagation.metadata import \
-    EasierTensorMeta, Role, View, ViewType, get_node_meta
-from easier.core.passes.metadata_propagation.utils import \
-    Validation as MetaV
 
 from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr

@@ -112,6 +112,7 @@ class JitEvaluator(RuntimeEvaluator):
     def if_call_module(self, submod: nn.Module):
         if isinstance(submod, GraphModule):
             # TODO check size dtype, trigger JIT
+            pass
         return super().if_call_module(submod)
     
     
@@ -130,4 +131,8 @@ class EasierJitEngine:
             self.first_run = False
         
         else:
-            jitter = JitEvaluator()
+            # modules, graphs = passes.analyze_data_dependency(modules, graphs)
+
+            # modules, graphs = passes.fuse_dataflow(modules, graphs)
+
+            # modules, graphs = passes.generate_code(modules, backend, graphs)

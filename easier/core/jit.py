@@ -27,6 +27,8 @@ from easier.core.passes.utils import \
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
     set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type
+from easier.core.runtime.jit_engine import \
+    EasierJitEngine
 
 
 class EasierProxy(Proxy):
@@ -349,7 +351,7 @@ def compile(
         device_type = backend
 
     esr.logger.info(
-        f"EASIER just-in-time compilation has started, backend={backend}"
+        f"EASIER ahead-of-time compilation has started, backend={backend}"
         f", device_type={device_type}"
     )
 
@@ -377,7 +379,7 @@ def compile(
         loaded_graphs = load_dumps(modules, load_dir, graphs)
 
     if loaded_graphs is not None:
-        # successfully load, skip AOT passes
+        # successfully load, skip some AOT passes
         graphs = loaded_graphs
 
     else:  # the default case: run ahead-of-time passes
@@ -388,21 +390,19 @@ def compile(
         modules, graphs = passes.bind_reducer(modules, graphs)
         modules, graphs = passes.group_tensors(modules, graphs)
 
-        # modules, graphs = passes.analyze_data_dependency(modules, graphs)
 
         modules, graphs = passes.partition_tensor_groups(modules, graphs)
         modules, graphs = passes.encode_sparsity(modules, graphs)
 
         modules, graphs = passes.distribute_dataflow(modules, graphs)
 
-        # modules, graphs = passes.fuse_dataflow(modules, graphs)
-
-        # modules, graphs = passes.generate_code(modules, backend, graphs)
+    # More AOT passes that run on both loaded and AOT-rewritten graphs
+    modules, graphs = passes.propagate_roles(modules, graphs)
 
     for m, g in zip(modules, graphs):
-        gm = GraphModule(m, g)
-        m.forward = gm.forward
+        jit_engine = EasierJitEngine(m, g)
+        m.forward = jit_engine.forward
 
-    esr.logger.info("EASIER just-in-time compilation has completed")
+    esr.logger.info("EASIER ahead-of-time compilation has completed")
 
     return top_modules

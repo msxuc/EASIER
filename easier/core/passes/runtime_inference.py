@@ -60,7 +60,7 @@ class RolePropagator(EasierInterpreter[Role]):
             return Role.REPLICATED
 
     def if_function_or_method(self, function_or_method_name) -> Role:
-        # TODO currently it's the torch.reduce (before
+        # TODO currently it's the esr.reduce (before
         # easier.runtime.all_gather_into_tensor) to be the conversion point
         # frrom DIST to REPLICA.
         # However, when it comes to future refinement e.g. using all_reduce,
@@ -68,7 +68,19 @@ class RolePropagator(EasierInterpreter[Role]):
         # And perhaps dataflow_dist pass is more suitable to figure out the
         # Role, and it can store the Role e.g. using a special wrapper function
         # easier.all_reduce and the information remains in the dump.
-        raise NotImplementedError()
+        in_roles = set(
+            self.node2role[n] for n in self.current_node.all_input_nodes
+        )
+
+        if function_or_method_name in _EsrMod.easier_aggregators:
+            assert in_roles == set([Role.DISTRIBUTED]), \
+                "EASIER aggregator input should be distributed"
+            return Role.REPLICATED
+        
+        if Role.DISTRIBUTED in in_roles:
+            return Role.DISTRIBUTED
+        else:
+            return Role.REPLICATED
     
     
     def if_call_module(self, submod: nn.Module) -> Role:
