@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from typing import Tuple
 from unittest.mock import patch
 import torch
 from torch.fx.graph_module import GraphModule
@@ -300,3 +301,105 @@ class TestJittedUsage:
             2, worker__test_save, (dev_type,),
             init_type=dev_type  # type: ignore
         )
+
+def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
+    torch.manual_seed(2345)
+    m = Model(3, 'cpu')
+    [m] = esr.compile([m], backend='none')
+    m()
+
+    orig_vertex = m.vertex_tensor.clone().cpu()
+    orig_edge = m.edge_tensor.clone().cpu()
+    orig_replica = m.tensor.clone().cpu()
+
+    torch.manual_seed(2345)
+    m = Model(3, 'cpu')
+
+    from easier.core.distpart import metis_wrapper as _orig_metis_wrapper
+    def _metis_wrapper(
+        nparts, rowptr, colidx, vwgt, adjwgt
+    ) -> Tuple[int, torch.Tensor]:
+        # Always called on rank-0
+        ncuts, membership = _orig_metis_wrapper(
+            nparts, rowptr, colidx, vwgt,adjwgt
+        )
+        membership[membership == (world_size - 1)] = 0
+        return ncuts + 999, membership
+
+    with patch(
+        f'{_orig_metis_wrapper.__module__}.metis_wrapper', new=_metis_wrapper
+    ):
+        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
+    jitted: Model
+    jitted()
+
+    # Simple test that partition is really done.
+    assert jitted.vertex_tensor.shape[0] < orig_vertex.shape[0]
+
+    collected_vertex = jitted.vertex_tensor.collect()
+    collected_edge = jitted.edge_tensor.collect()
+    collected_replica = jitted.tensor.collect()
+    assert collected_vertex.device.type == dev_type
+    assert collected_edge.device.type == dev_type
+    assert collected_vertex.device.type == dev_type
+    torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
+    torch.testing.assert_close(collected_edge.cpu(), orig_edge)
+    torch.testing.assert_close(collected_replica.cpu(), orig_replica)
+
+
+def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
+    model_dev = torch.device(dev_type)
+
+    torch.manual_seed(2345)
+    m, = esr.compile([Model(3, model_dev)], backend='none')
+    m()
+
+    orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
+    orig_edge = m.edge_tensor.data.to(device='cpu', copy=True)
+    orig_replica = m.tensor.data.to(device='cpu', copy=True)
+
+    torch.manual_seed(2345)
+    jitted, = esr.compile(
+        [Model(3, model_dev)], backend='torch')  # type: ignore
+    jitted: Model
+    jitted()
+
+    # Simple test that partition is really done.
+    assert jitted.vertex_tensor.shape[0] < orig_vertex.shape[0]
+
+    if local_rank == 0:
+        fn = get_random_str() + ".hdf5"
+        dir = os.path.join(tempfile.gettempdir(), "easier", "tests")
+        os.makedirs(dir, exist_ok=True)
+        fpath = os.path.join(dir, fn)
+    else:
+        fpath = None
+
+    jitted.vertex_tensor.save(fpath, 'vertex')
+    jitted.edge_tensor.save(fpath, 'edge')
+    jitted.tensor.save(fpath, 'replica')
+
+    if local_rank == 0:
+        with h5py.File(fpath, 'r') as h5f:
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['vertex'][:]), orig_vertex)
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['edge'][:]), orig_edge)
+            torch.testing.assert_close(
+                torch.from_numpy(h5f['replica'][:]), orig_replica)
+
+@pytest.mark.parametrize('dev_type', [
+    'cpu',
+    pytest.param('cuda', marks=when_ngpus_ge_2)
+])
+class TestZeroLengthPartition:
+    def test_zerolength_collect(self, dev_type):
+        torchrun_singlenode(
+            2, worker__test_zerolength_collect, (dev_type,), init_type=dev_type
+        )
+
+    def test_zerolength_save(self, dev_type):
+        pass
+        # torchrun_singlenode(
+        #     2, , (dev_type,), init_type=dev_type
+        # )

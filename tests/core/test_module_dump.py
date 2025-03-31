@@ -207,3 +207,14 @@ class TestModuleDump:
             (dev_type, dumpdir,),
             init_type=dev_type
         )
+
+
+@pytest.mark.parametrize('dev_type', [
+    'cpu',
+    pytest.param('cuda', marks=when_ngpus_ge_2)
+])
+def test_zerolength_dump(dev_type):
+    pass
+    # torchrun_singlenode(
+    #     2, worker__test_zerolength_collect, (dev_type,), init_type=dev_type
+    # )
