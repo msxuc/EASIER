@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Tuple
 from unittest.mock import patch
 import torch
 from torch.fx.graph_module import GraphModule
@@ -312,24 +311,39 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     orig_edge = m.edge_tensor.clone().cpu()
     orig_replica = m.tensor.clone().cpu()
 
+    from easier.core.passes.tensor_group_partition import \
+        ElemPart, ElemPartArangeIdx, \
+        get_even_elemparts as _orig_get_even_elemparts
+    def _get_even_elemparts_zerolength(modules, graphs):
+        elemparts = _orig_get_even_elemparts(modules, graphs)
+        for grp, ep in list(elemparts.items()):
+            end: int = sum(ep.lengths)
+            ep.lengths[-2] += ep.lengths[-1]
+            ep.lengths[-1] = 0
+            if local_rank == world_size - 1:
+                # make last worker have zero-length partition
+                ep = ElemPart(ElemPartArangeIdx(end, end), ep.lengths, ep.hint)
+            elif local_rank == world_size - 2:
+                # transfer the element to the prev worker
+                ep = ElemPart(
+                    ElemPartArangeIdx(ep.idx_desc.start, end),  # type: ignore
+                    ep.lengths, ep.hint
+                )
+
+            elemparts[grp] = ep
+
+        return elemparts
+
     torch.manual_seed(2345)
     m = Model(3, 'cpu')
 
-    from easier.core.distpart import metis_wrapper as _orig_metis_wrapper
-    def _metis_wrapper(
-        nparts, rowptr, colidx, vwgt, adjwgt
-    ) -> Tuple[int, torch.Tensor]:
-        # Always called on rank-0
-        ncuts, membership = _orig_metis_wrapper(
-            nparts, rowptr, colidx, vwgt,adjwgt
-        )
-        membership[membership == (world_size - 1)] = 0
-        return ncuts + 999, membership
-
     with patch(
-        f'{_orig_metis_wrapper.__module__}.metis_wrapper', new=_metis_wrapper
+        f'{_orig_get_even_elemparts.__module__}.get_even_elemparts',
+        new=_get_even_elemparts_zerolength
     ):
-        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
+        [jitted] = esr.compile(
+            [m], backend=dev_type, partition_mode='evenly'
+        )  # type: ignore
     jitted: Model
     jitted()
 
@@ -395,7 +409,8 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
 class TestZeroLengthPartition:
     def test_zerolength_collect(self, dev_type):
         torchrun_singlenode(
-            2, worker__test_zerolength_collect, (dev_type,), init_type=dev_type
+            4 if dev_type == 'cpu' else 2,
+            worker__test_zerolength_collect, (dev_type,), init_type=dev_type
         )
 
     def test_zerolength_save(self, dev_type):
