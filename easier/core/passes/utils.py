@@ -225,6 +225,31 @@ class EasierInterpreter(Generic[_T]):
         pass
 
 
+class EvaluationHandlerBase:
+    def __init__(self) -> None:
+        self.next: Optional[EvaluationHandlerBase] = None
+
+    def _call_next(self, cls_method, *args):
+        assert self.next is not None, \
+            "The innermost Handler shouldn't super().if_xxx method" \
+            " (normally the innermost Handler is the NodeEvaluationHandler)"
+        return cls_method(self, *args)
+
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+        return self._call_next(EvaluationHandlerBase.if_get_attr, submod_path, attr_name, attr_val)
+
+    def if_call_function(self, function):
+        return self._call_next(EvaluationHandlerBase.if_call_function,  function)
+    
+    def if_call_method(self, method_name):
+        return self._call_next(EvaluationHandlerBase.if_call_method,  method_name)
+    
+    def if_call_module(self, submod):
+        return self._call_next(EvaluationHandlerBase.if_call_module, submod)
+
+class NodeEvaluationHandler(EvaluationHandlerBase):
+    1
+
 class SubmodNameAllocator:
     def __init__(self, prefix: str) -> None:
         self.id = 0
@@ -304,6 +329,12 @@ def zipsort_using_order(order: torch.Tensor, to_sort: torch.Tensor,
     sort(zip(to_sort, to_follow), key=lambda (s,f): order.index(s))
     ```
     """
+    if order.shape[0] == 0:
+        assert to_sort.shape[0] == 0
+        assert to_follow.shape[0] == 0
+        return \
+            to_sort.clone(), to_follow.clone(), \
+            to_sort.to(dtype=torch.int64, copy=True)
 
     # TODO in extreme cases, if on some rank there is no element at all,
     # calls like `order.max()` will throw. Check spenc robustness on empty size.

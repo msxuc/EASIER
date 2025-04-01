@@ -15,9 +15,10 @@ from easier.core.passes.utils import OrderedSet
 from easier.examples import Poisson
 from easier.core.runtime.dist_env import DummyDistEnv
 
-from ..utils import \
+from tests.utils import \
     torchrun_singlenode, get_random_str, \
     mpi_e2e, mpirun_singlenode
+from tests.core.utils import multi_stage_zero_length_partition
 
 
 class Model(esr.Module):
@@ -311,44 +312,18 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     orig_edge = m.edge_tensor.clone().cpu()
     orig_replica = m.tensor.clone().cpu()
 
-    from easier.core.passes.tensor_group_partition import \
-        ElemPart, ElemPartArangeIdx, \
-        get_even_elemparts as _orig_get_even_elemparts
-    def _get_even_elemparts_zerolength(modules, graphs):
-        elemparts = _orig_get_even_elemparts(modules, graphs)
-        for grp, ep in list(elemparts.items()):
-            end: int = sum(ep.lengths)
-            ep.lengths[-2] += ep.lengths[-1]
-            ep.lengths[-1] = 0
-            if local_rank == world_size - 1:
-                # make last worker have zero-length partition
-                ep = ElemPart(ElemPartArangeIdx(end, end), ep.lengths, ep.hint)
-            elif local_rank == world_size - 2:
-                # transfer the element to the prev worker
-                ep = ElemPart(
-                    ElemPartArangeIdx(ep.idx_desc.start, end),  # type: ignore
-                    ep.lengths, ep.hint
-                )
-
-            elemparts[grp] = ep
-
-        return elemparts
-
     torch.manual_seed(2345)
     m = Model(3, 'cpu')
 
-    with patch(
-        f'{_orig_get_even_elemparts.__module__}.get_even_elemparts',
-        new=_get_even_elemparts_zerolength
-    ):
-        [jitted] = esr.compile(
-            [m], backend=dev_type, partition_mode='evenly'
-        )  # type: ignore
+    with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
+        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
     jitted()
 
     # Simple test that partition is really done.
-    assert jitted.vertex_tensor.shape[0] < orig_vertex.shape[0]
+    if local_rank == 0:
+        assert jitted.vertex_tensor.shape[0] == 0
+        assert jitted.edge_tensor.shape[0] == 0
 
     collected_vertex = jitted.vertex_tensor.collect()
     collected_edge = jitted.edge_tensor.collect()
@@ -362,10 +337,8 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
 
 
 def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
-    model_dev = torch.device(dev_type)
-
     torch.manual_seed(2345)
-    m, = esr.compile([Model(3, model_dev)], backend='none')
+    m, = esr.compile([Model(3, 'cpu')], backend='none')
     m()
 
     orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
@@ -373,13 +346,17 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
     orig_replica = m.tensor.data.to(device='cpu', copy=True)
 
     torch.manual_seed(2345)
-    jitted, = esr.compile(
-        [Model(3, model_dev)], backend='torch')  # type: ignore
+    m = Model(3, 'cpu')
+
+    with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
+        [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
     jitted()
 
     # Simple test that partition is really done.
-    assert jitted.vertex_tensor.shape[0] < orig_vertex.shape[0]
+    if local_rank == 0:
+        assert jitted.vertex_tensor.shape[0] == 0
+        assert jitted.edge_tensor.shape[0] == 0
 
     if local_rank == 0:
         fn = get_random_str() + ".hdf5"
@@ -402,6 +379,7 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
             torch.testing.assert_close(
                 torch.from_numpy(h5f['replica'][:]), orig_replica)
 
+
 @pytest.mark.parametrize('dev_type', [
     'cpu',
     pytest.param('cuda', marks=when_ngpus_ge_2)
@@ -414,7 +392,7 @@ class TestZeroLengthPartition:
         )
 
     def test_zerolength_save(self, dev_type):
-        pass
-        # torchrun_singlenode(
-        #     2, , (dev_type,), init_type=dev_type
-        # )
+        torchrun_singlenode(
+            4 if dev_type == 'cpu' else 2,
+            worker__test_zerolength_save, (dev_type,), init_type=dev_type
+        )
