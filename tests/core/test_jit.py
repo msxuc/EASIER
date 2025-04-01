@@ -318,6 +318,10 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
         [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
+    
+    import easier.core.runtime.dist_env as D
+    D.start = True
+
     jitted()
 
     # Simple test that partition is really done.
@@ -380,6 +384,22 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
                 torch.from_numpy(h5f['replica'][:]), orig_replica)
 
 
+class VerySmallModel(esr.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.vertex = esr.Tensor(torch.arange(2).double(), mode='partition')
+        self.selector = esr.Selector(torch.arange(3) // 2)
+        self.reducer = esr.Reducer(torch.ones(3), n=2)
+
+    def forward(self):
+        self.vertex[:] = self.reducer(self.selector(self.vertex))
+
+def worker__test_zerolength_smoke(local_rank, world_size, dev_type):
+    m = VerySmallModel()
+    [jitted] = esr.compile([m], backend=dev_type)
+    jitted()
+
 @pytest.mark.parametrize('dev_type', [
     'cpu',
     pytest.param('cuda', marks=when_ngpus_ge_2)
@@ -395,4 +415,10 @@ class TestZeroLengthPartition:
         torchrun_singlenode(
             4 if dev_type == 'cpu' else 2,
             worker__test_zerolength_save, (dev_type,), init_type=dev_type
+        )
+    
+    def test_zerolength_smoke(self, dev_type):
+        torchrun_singlenode(
+            8 if dev_type == 'cpu' else 2,
+            worker__test_zerolength_smoke, (dev_type,), init_type=dev_type
         )

@@ -185,9 +185,13 @@ class HaloExchanger(torch.nn.Module):
                     isend = dist_env.def_isend(local[lidx], u, tag=u)
                     p2p_ops.append(isend)
 
-        # When Selector has no recvs,
+        # When Selector has no recvs, 
+        # send halos if there are any, then,
         # don't bother writing a chunk, but directly return the input tensor.
         if self.concat_buffer is None:
+            for req in dist_env.batch_isend_irecv(p2p_ops):
+                req.wait()
+
             return local
 
         recv_buffers: List[torch.Tensor] = []

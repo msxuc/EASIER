@@ -155,7 +155,6 @@ def multi_stage_zero_length_partition(
                 ep_idxes[dst_rank] = dst_ep_idx
 
                 lengths = [p.shape[0] for p in ep_idxes][:world_size]
-                print(lengths)
 
                 ep_idx = dist_env.scatter_object_list(0, ep_idxes[:world_size])
                 lengths = dist_env.broadcast_object_list(0, lengths)
