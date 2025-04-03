@@ -6,7 +6,7 @@ import math
 import operator
 from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
+    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
 from typing_extensions import Literal
 import more_itertools
 import os
@@ -22,46 +22,37 @@ from torch.fx.graph import Graph
 import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
-from easier.core.passes.static_metadata_propagation import \
-    StaticTensorMeta, get_static_metadata, Role
+from easier.core.passes.metadata_propagation import \
+    StaticNodeMeta, get_static_node_metadata, Role, \
+    get_runtime_tensor_metadata, set_runtime_tensor_metadata, RuntimeTensorMeta
 from easier.core.passes.utils import \
     FX, get_easier_objects, EasierInterpreter, tree_map
 from easier.core.utils import EasierJitException, logger
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, tuple_getitem
 
-KEY__JITENGINE_RUNTIMEMETA = 'easier_jitEngine_runtimeMeta'
 
 
-@dataclasses.dataclass
-class RuntimeTensorMetadata:
-    """
-    For distributed Nodes only.
-    May be nested.
-    """
-    shape: Tuple[int, ...]
-    dtype: torch.dtype
-
-
-def get_runtime_metadata(node: Node) -> RuntimeTensorMetadata:
-    return node.meta[KEY__JITENGINE_RUNTIMEMETA]
-
-
-def get_runtime_metadata_from_value(
+def _get_runtime_metadata_from_value(
+    node_role: Role,
     val: Union[torch.Tensor, int, float]
-) -> RuntimeTensorMetadata:
+) -> RuntimeTensorMeta:
     if isinstance(val, torch.Tensor):
-        return RuntimeTensorMetadata(tuple(val.shape), val.dtype)
+        return RuntimeTensorMeta(node_role, tuple(val.shape), val.dtype)
+
+    if node_role != Role.REPLICATED:
+        raise EasierJitException()
+
     elif isinstance(val, bool):
-        return RuntimeTensorMetadata((), torch.bool)
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.bool)
     elif isinstance(val, int):
         # PyTorch Python wrapper isn't aware of Python int precision,
         # so we treat ints as current minimum int32 dtype
         # so they are compatible with any torch tensor with int-kind dtype.
-        return RuntimeTensorMetadata((), torch.int32)
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32)
     elif isinstance(val, float):
         # Same as int32, treat Python float as current minimum float32.
-        return RuntimeTensorMetadata((), torch.float32)
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.float32)
     else:
         # NOTE for types that cannot explicitly appear on `Node.args`,
         # (`torch.Tensor` is one of such types), their metadata is always
@@ -69,31 +60,103 @@ def get_runtime_metadata_from_value(
         # We don't expect to see them here.
         raise EasierJitException(f'Value {val} cannot have associated metadata')
 
+class _Skipped:
+    pass
 
+_skipped = _Skipped()
+
+
+# NOTE it's possible that FX trace `Tensor.item()` call which results in
+# a pure int/float scalar rather than a [0]-shape tensor.
+RuntimeValue: TypeAlias = Union[
+    torch.Tensor,
+    _Skipped,
+    Sequence['RuntimeValue']
+]
 
 class EvaluationHandlerBase:
+    """
+    A Handler can be registered into the JitEngine to serve as
+    pre/post-evaluation hooks of a single Node in the runtime.
+
+    All handlers are run in a recursion manner. The NodeEvaluationHandler
+    that really evaluates the Node (i.e. resulting in Tensor(s)) must be
+    the innermost of the recursion.
+
+    For implementers:
+
+    Any Handler if_xxx method (e.g. if_call_function) can call
+    `super().if_call_function()` to enter the recursion, like:
+    ```
+    class MyHandler(EvaluationHandlerBase):
+        def if_call_function(self, function):
+            # pre hooks
+            # derived Handlers may inspect the IR Node here
+            if function in easier.aggregator:
+                function = easier.runtime.my_new_function
+
+                # may change the self.current_node
+                self.current_node.target = function
+
+            # enter the recursion
+            # the `if_call_function` method of the next Handler will be called
+            result = super().if_call_function(self, function)
+            # ~~~~                                  ~~~~~~~~
+            # get the result                when needed, transform the arg
+
+            # post hooks
+            print(result)
+
+            return result
+    ```
+
+    P.S. self.dispatch_node() will also enter recursion.
+    """
     def __init__(self) -> None:
         # Let JitEngine initialize and wire up all registered Handlers.
         self.next: Optional[EvaluationHandlerBase] = None
         self.current_module: esr.Module
         self.current_graph: Graph
 
-        # IR-level session data
-        self.stackframe: Dict[Node, torch.Tensor]
+        # 
+        # Context variables, the lifetime is the scope of `Module.forward()`
+        # =================
+        #
+        # All Handlers share the same stackframe dict, which is normally
+        # created and managed by the JitEngine
+        self.stackframe: Dict[Node, RuntimeValue]
 
-        # Node-level session data
+        # 
+        # Context variables, the lifetime is the execution period of a Node.
+        # =================
         self.current_node: Node
 
     def _dispatch_next(self):
         assert self.next is not None, \
-            "The innermost Handler shouldn't super().if_xxx method" \
-            " (normally the innermost Handler is the NodeEvaluationHandler)"
-        return self.next.dispatch_node(self.current_node)
+            "The innermost Handler shouldn't call super().if_xxx method" \
+            " (normally we need to put a NodeEvaluationHandler innermost)"
+
+        result = self.next.dispatch_node(self.current_node)
+
+        assert self.current_node is self.next.current_node, \
+            "Currently we don't expect Handlers rebind self.current_node"
+        # TODO if we expect recursively run Handlers rebind self.current_node
+        # we may enable:
+        # self.current_node = self.next.current_node
+
+        return result
+
     
-    def eval_arg_node(self, arg: Node):
+    def eval_arg_node(self, arg: Node) -> RuntimeValue:
         return self.stackframe[arg]
     
-    def eval_args_kwargs(self):
+    def eval_args_kwargs(self) -> Tuple[
+        Tuple[RuntimeValue, ...], Dict[str, RuntimeValue]
+    ]:
+        # NOTE positional arguments can be passed in as keyword args.
+        # For Selector/Reducer, we can use `normalize_selector_call_into_args`
+        # etc. to _normalize_ `*args **kwargs` into all positional args.
+
         def _eval(x):
             if isinstance(x, Node):
                 return self.eval_arg_node(x)
@@ -104,19 +167,16 @@ class EvaluationHandlerBase:
             k: tree_map(v, _eval)
             for k, v in self.current_node.kwargs.items()
         }
-        return args, kwargs
+        return args, kwargs  # type: ignore
     
-    def dispatch_node(self, node: Node):
+    def dispatch_node(self, node: Node) -> RuntimeValue:
         self.current_node = node
 
         root = self.current_module
 
         if node.op == FX.GET_ATTR:
-            path = cast(str, node.target)
-            submod_path, _sep, attr_name = path.rpartition(".")
-            submod = root.get_submodule(submod_path)
-            obj = getattr(submod, attr_name)
-            val = self.if_get_attr(submod_path, attr_name, obj)
+            assert isinstance(node.target, str)
+            val = self.if_get_attr(node.target)
 
         elif node.op == FX.CALL_FUNCTION:
             assert callable(node.target)
@@ -134,52 +194,72 @@ class EvaluationHandlerBase:
         else:
             assert False, f"Unexpected FX Node op {node.op}"
 
-        # NOTE handler subprocedure may change the self.current_node
+        # The same Node key will be written multiple times by all Handlers
         self.stackframe[self.current_node] = val
         return val
 
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+    def if_get_attr(self, attr_path: str) -> RuntimeValue:
         return self._dispatch_next()
 
-    def if_call_function(self, function):
+    def if_call_function(self, function: Callable) -> RuntimeValue:
         return self._dispatch_next()
     
-    def if_call_method(self, method_name):
+    def if_call_method(self, method_name: str) -> RuntimeValue:
         return self._dispatch_next()
     
-    def if_call_module(self, submod):
+    def if_call_module(self, submod: torch.nn.Module) -> RuntimeValue:
         return self._dispatch_next()
 
 
 class NodeEvaluationHandler(EvaluationHandlerBase):
     """
+    The most essential Handler to evaluate each Node.
+
+    If a Node has StaticNodeMeta(Role.DISTRIBUTED, batch_size=0) it will be
+    skipped and a debug marker object _Skipped() will be put to the stackframe.
+    (But HaloExchangers are still evaluated)
+
     Must be the innermost Handler.
     No more dispatch_next() i.e. super().if_xxx() is called.
     """
     def dispatch_node(self, node: Node):
-        smeta = get_static_metadata(node)
-        if smeta.role == Role.DISTRIBUTED and smeta.batch_size == 0:
-            # Skip according to the static metadata, so the result will be
-            # consistent among sessions.
-            return _skipped  # type: ignore
-
-        prev_rmeta = get_runtime_metadata(node)
-
-        v = super().dispatch_node(node)
-
-        new_rmeta = tree_map(v, get_runtime_metadata_from_value)
-        if prev_rmeta != new_rmeta:
-            raise EasierJitException(
-                "The properties of the result value of the operation"
-                f" {node.target} changes: {prev_rmeta} => {new_rmeta}"
+        is_halo_exchanger = \
+            node.op == FX.CALL_MODULE and isinstance(
+                self.current_module.get_submodule(cast(str, node.target)),
+                HaloExchanger
             )
 
-        return v
+        node_meta = get_static_node_metadata(node)
+        if node_meta.role == Role.DISTRIBUTED \
+        and node_meta.batch_size == 0 \
+        and (not is_halo_exchanger):
+            # Skip according to the static metadata, so the result will be
+            # consistent among sessions.
+            return _skipped
 
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        return attr_val
+        prev_runtime_meta = get_runtime_tensor_metadata(node)
 
-    def if_call_function(self, function):
+        val = super().dispatch_node(node)
+
+        new_runtime_meta = tree_map(
+            val, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
+        )
+        if prev_runtime_meta != new_runtime_meta:
+            raise EasierJitException(
+                "The properties of the result value of the operation"
+                f" {node.target} changes:"
+                f" {prev_runtime_meta} => {new_runtime_meta}"
+            )
+
+        return val
+
+    def if_get_attr(self, attr_path: str) -> RuntimeValue:
+        submod_path, _sep, attr_name = attr_path.rpartition(".")
+        submod = self.current_module.get_submodule(submod_path)
+        obj = getattr(submod, attr_name)
+        return obj
+
+    def if_call_function(self, function) -> RuntimeValue:
         args, kwargs = self.eval_args_kwargs()
         res = function(*args, **kwargs)
 
@@ -188,13 +268,13 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             return args[0]
         
         if function in _EsrMod.easier_aggregators:
-            # The input to he aggregator may have been skipped,
-            # we need to broadcast the shape[1:] from other Node.
+            # Inserted by EASIER, input always on args[0]
             (arg, *_args), *_kwargs = self.eval_args_kwargs()
             if isinstance(arg, _Skipped):
                 dist_env = get_runtime_dist_env()
 
-                prev_rmeta = get_runtime_metadata(self.current_node)
+                prev_rmeta = get_runtime_tensor_metadata(self.current_node)
+                assert isinstance(prev_rmeta, RuntimeTensorMeta)
                 vneutral = get_aggregator_neutral_value(
                     function, prev_rmeta.dtype
                 )
@@ -206,11 +286,12 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
 
         return res
     
-    def if_call_method(self, method_name):
+    def if_call_method(self, method_name) -> RuntimeValue:
         (this, *args), kwargs = self.eval_args_kwargs()
 
         if isinstance(this, torch.Tensor):
-            # TODO are there any cases pytorch returns a non-Tensor object?
+            # TODO any cases in FX that non-tensor methods are called?
+            # maybe `a.split().index(3)` -- `tuple.index` is called?
             raise EasierJitException(
                 "expect a method of torch.Tensor to be called"
             )
@@ -221,39 +302,29 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         res = method(*args, **kwargs)
         return res
     
-    def if_call_module(self, submod):
+    def if_call_module(self, submod) -> RuntimeValue:
         args, kwargs = self.eval_args_kwargs()
 
-
         if isinstance(submod, HaloExchanger):
+            # Inserted by EASIER, input always on args[0]
             arg = args[0]
-            if isinstance(arg, torch.Tensor):
-                arg_skipped = torch.tensor([0], device=dist_env.comm_device)
-
-            elif isinstance(arg, _Skipped):
-                arg_skipped = torch.tensor([1], device=dist_env.comm_device)
-
-            else:
-                raise EasierJitException(
-                    f"runtime value {arg} is not expected"
-                )
+            if isinstance(arg, _Skipped):
+                args = (submod.zero_length_input,) + args[1:]
 
         res = submod(*args, **kwargs)
         return res
 
 
-class _Skipped:
-    pass
-
-_skipped = _Skipped()
-
 
 def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
+    if dtype.is_complex:
+        raise NotImplementedError()
+
     if dtype.is_floating_point:
         finfo = torch.finfo(dtype)
         vmax = finfo.max
         vmin = finfo.min
-    else:  # TODO exclude complex dtype, it's not float too
+    else:
         iinfo = torch.iinfo(dtype)
         vmax = iinfo.max
         vmin = iinfo.min
@@ -262,21 +333,21 @@ def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
         esr.sum: 0,
         esr.prod: 1,
         esr.norm: 0,
-        esr.max: vmax,
-        esr.min: vmin
+        esr.max: vmin,
+        esr.min: vmax
     }[aggregator]
     return vneutral
 
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
     def dispatch_node(self, node: Node):
-        smeta = get_static_metadata(node)
+        smeta = get_static_node_metadata(node)
         if smeta.role == Role.DISTRIBUTED and smeta.batch_size == 0:
             # Skip this node. Store a debug marker object
             return _skipped  # type: ignore
 
         v = super().dispatch_node(node)
         
-        rmeta = tree_map(v, get_runtime_metadata_from_value)
+        rmeta = tree_map(v, _get_runtime_metadata_from_value)
         node.meta[KEY__JITENGINE_RUNTIMEMETA] = rmeta
 
         return v
@@ -410,27 +481,37 @@ class JitEngine:
             RewriteTupleGetItemHandler(),
             FisrtRunNodeEvaluationHandler()  # always last
         ]
-        self._init_handlers(self.first_run_handlers)
-
         self.runtime_handlers: List[EvaluationHandlerBase] = [
             NodeEvaluationHandler()  # always last
         ]
-        self._init_handlers(self.runtime_handlers)
-    
-    def _init_handlers(self, handlers: List[EvaluationHandlerBase]):
+
+    def _update_handlers(self, handlers: List[EvaluationHandlerBase]):
+        """
+        Wire up Handlers.
+        Bind Handlers with latest instances of self.module/graph -- in case
+        the instances are changed by the JIT passes.
+        """
+        for i in range(len(handlers) - 1):
+            prev = handlers[i]
+            next = handlers[i + 1]
+            prev.next = next
+        
         for h in handlers:
             h.current_module = self.module
             h.current_graph = self.graph
 
-        last = handlers[-1]
-        for h in reversed(handlers[:-1]):
-            h.next = last
-            last = h
-
     
     def forward(self):
         if self.run_count == 0:
+            ms, gs = [self.module], [self.graph]
+
+            ms, gs = passes.propagate_static_node_metadata(ms, gs)
+
+            [self.module], [self.graph] = ms, gs
+
+            self._update_handlers(self.first_run_handlers)
             handlers = self.first_run_handlers
+
         else:
             handlers = self.runtime_handlers
         
@@ -442,6 +523,16 @@ class JitEngine:
         for node in list(self.graph.nodes):
             outermost_handler.dispatch_node(node)
 
-        self.run_count += 1
+        if self.run_count == 0:
+            ms, gs = [self.module], [self.graph]
+
+            # ms, gs = passes.fuse(ms, gs)
+            # ms, gs = passes.codegen(ms, gs)
+
+            [self.module], [self.graph] = ms, gs
+            self._update_handlers(self.runtime_handlers)
+
         stackframe.clear()
+
+        self.run_count += 1
 

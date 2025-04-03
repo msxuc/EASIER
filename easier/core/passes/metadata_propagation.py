@@ -7,7 +7,7 @@ import math
 import operator
 from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
+    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
 from typing_extensions import Literal
 import more_itertools
 import os
@@ -28,7 +28,8 @@ from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 
 
-KEY__STATICMETADATA_META = "easier_staticMetadata_meta"
+KEY__METADATA_STATIC = "easier_metadata_staticNodeMeta"
+KEY__METADATA_RUNTIME = 'easier_metadata_runtimeTensorMeta'
 
 
 class Role(enum.Enum):
@@ -36,13 +37,20 @@ class Role(enum.Enum):
     REPLICATED = 0
 
     # Has batch dim, if batch size == 0 the Node is not runnable
+    # (but if it's HaloExchanger, even if batch size == 0 it must be run)
     DISTRIBUTED = 1
 
-    # Has batch dim, even if batch size == 0 the Node must be run
-    HALO_EXCHANGER = 2
-
 @dataclasses.dataclass(frozen=True, eq=True)
-class StaticTensorMeta:
+class StaticNodeMeta:
+    """
+    Static metadata is associated with the Node,
+    because during ahead-of-time compilation (or before the first run
+    in JitEngine) we don't know if a Node returns a nested structure
+    (e.g. `maxval, maxpos = torch.max(dim=1)`).
+
+    EASIER will assume, in the runtime, all nested tensors will have
+    the same role/batch_size info.
+    """
     role: Role
     
     # For Role.REPLICATED, batch_size is always 0
@@ -51,21 +59,42 @@ class StaticTensorMeta:
     def __post_init__(self):
         if self.role == Role.REPLICATED:
             assert self.batch_size == 0
-        elif self.role == Role.DISTRIBUTED or self.role == Role.HALO_EXCHANGER:
+        elif self.role == Role.DISTRIBUTED:
             assert self.batch_size >= 0
         else:
             assert f'bad value {self}'
 
-_replica = StaticTensorMeta(Role.REPLICATED, 0)
-_halo_exchanger = StaticTensorMeta(Role.HALO_EXCHANGER, 0)
 
-class StaticMetadataPropagator(EasierInterpreter[StaticTensorMeta]):
+@dataclasses.dataclass(frozen=True, eq=True)
+class RuntimeTensorMeta:
     """
-    This class propagates Roles, in a relatively simpler way than the
+    Runtime metadata is associated with a Tensor instance.
+
+    In contrast to StaticNodeMeta, at runtime we may encounter with cases
+    that a single PyTorch operator returns a tuple/list of Tensors
+    (e.g. `maxval, maxpos = torch.max(dim=1)`).
+
+    Therefore we need to be aware of the potential nested structure of
+    runtime metadata.
+    """
+    role: Role
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+StructuredTensorMeta: TypeAlias = Union[
+    RuntimeTensorMeta,
+    Sequence['StructuredTensorMeta']
+]
+
+_replica = StaticNodeMeta(Role.REPLICATED, 0)
+
+class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
+    """
+    This class propagates StaticNodeMeta, in a relatively simpler way than the
     tensor_grouping pass.
     And RolePropagator will handle EASIER-inserted Nodes like
-    the reordering Selectors for Reducers or HaloExchangers, which do not
-    have EasierTensorGroup objects related.
+    the reordering Selectors for Reducers or HaloExchangers, which are not
+    aware or accepted by tensor_grouping.
 
     This class should only be used on well-validated and rewritten Graphs,
     so we don't need to validate with details again.
@@ -73,22 +102,22 @@ class StaticMetadataPropagator(EasierInterpreter[StaticTensorMeta]):
     def __init__(self, modules, graphs) -> None:
         super().__init__(modules, graphs)
 
-    def for_each_node(self) -> StaticTensorMeta:
+    def for_each_node(self) -> StaticNodeMeta:
         meta = super().for_each_node()
-        self.current_node.meta[KEY__STATICMETADATA_META] = meta
+        self.current_node.meta[KEY__METADATA_STATIC] = meta
         return meta
     
     def if_get_attr(
         self, submod_path: str, attr_name: str, attr_val
-    ) -> StaticTensorMeta:
+    ) -> StaticNodeMeta:
         if isinstance(attr_val, _EsrMod.Tensor) and attr_val.is_partition:
-            return StaticTensorMeta(Role.DISTRIBUTED, attr_val.shape[0])
+            return StaticNodeMeta(Role.DISTRIBUTED, attr_val.shape[0])
         else:
             return _replica
 
     def if_function_or_method(
         self, function_or_method_name
-    ) -> StaticTensorMeta:
+    ) -> StaticNodeMeta:
         # TODO currently it's the _EsrMod.reduce (before
         # easier.runtime.all_gather_into_tensor) to be the conversion point
         # frrom DIST to REPLICA.
@@ -98,7 +127,7 @@ class StaticMetadataPropagator(EasierInterpreter[StaticTensorMeta]):
         # Role, and it can store the Role e.g. using a special wrapper function
         # easier.all_reduce and the information remains in the dump.
         in_metas = set(
-            get_static_metadata(n) for n in self.current_node.all_input_nodes
+            get_static_node_metadata(n) for n in self.current_node.all_input_nodes
         )
         dist_in_metas = in_metas - set([_replica])
 
@@ -110,49 +139,55 @@ class StaticMetadataPropagator(EasierInterpreter[StaticTensorMeta]):
         assert len(dist_in_metas) <= 1
         if len(dist_in_metas) == 1:
             meta = dist_in_metas.pop()
-            assert meta.role is not Role.HALO_EXCHANGER
             return meta
         else:
             return _replica
     
     
-    def if_call_module(self, submod: nn.Module) -> StaticTensorMeta:
-        in_metas = set(
-            get_static_metadata(n) for n in self.current_node.all_input_nodes
-        )
-
+    def if_call_module(self, submod: nn.Module) -> StaticNodeMeta:
         if isinstance(submod, _EsrMod.Module):
-            assert len(in_metas) == 0
             return _replica
         
         if isinstance(submod, _EsrMod.Selector):
-            return StaticTensorMeta(Role.DISTRIBUTED, submod.idx.shape[0])
+            return StaticNodeMeta(Role.DISTRIBUTED, submod.idx.shape[0])
 
         if isinstance(submod, _EsrMod.Reducer):
-            return StaticTensorMeta(Role.DISTRIBUTED, submod.n)
-
+            # NOTE if we need to inspect the input StaticNodeMetas,
+            # we must be aware of the case `Reducer.foward(halos_concat, out)`
+            # that the two input metas are not the same, therefore we'll have
+            # `len(in_metas) == 2`
+            return StaticNodeMeta(Role.DISTRIBUTED, submod.n)
+        
         if isinstance(submod, HaloExchanger):
-            return StaticTensorMeta(
-                Role.HALO_EXCHANGER, 0  #submod.output_batch_size
+            return StaticNodeMeta(
+                Role.DISTRIBUTED, submod.output_batch_size
             )
 
-        assert False, f'unreachable {submod}'
+        assert False, 'unreachable'
     
-    def if_output(self) -> StaticTensorMeta:
+    def if_output(self) -> StaticNodeMeta:
         return _replica
 
 
-def propagate_static_metadata(modules: List[_EsrMod.Module], graphs: List[Graph]):
-    logger.info(str(graphs[0]))
+def propagate_static_node_metadata(
+    modules: List[_EsrMod.Module], graphs: List[Graph]
+):
     propagator = StaticMetadataPropagator(modules, graphs)
     propagator.run()
 
     return modules, graphs
 
 
-def get_static_metadata(node: Node) -> StaticTensorMeta:
+def get_static_node_metadata(node: Node) -> StaticNodeMeta:
     """
-    After role propagation, every Node should have a Role assigned.
+    After static metadata propagation, every Node should be assigned.
     """
-    role = node.meta[KEY__STATICMETADATA_META]
+    role = node.meta[KEY__METADATA_STATIC]
     return role
+
+
+def set_runtime_tensor_metadata(node: Node, tensor_meta: StructuredTensorMeta):
+    node.meta[KEY__METADATA_RUNTIME] = tensor_meta
+
+def get_runtime_tensor_metadata(node: Node) -> StructuredTensorMeta:
+    return node.meta[KEY__METADATA_RUNTIME]

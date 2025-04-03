@@ -74,6 +74,10 @@ class HaloExchanger(torch.nn.Module):
         self.recv_buffers: List[Optional[torch.Tensor]]
         self.concat_buffer: Optional[torch.Tensor] = None
 
+        # An empty buffer whose shape[1:] and dtype are the same
+        # with the expected input.
+        self.zero_length_input: torch.Tensor
+
     def analyze_halo_properties(self):
         # In certain cases we should avoid preallocation or avoid inserting
         # HaloExchanger at all:
@@ -132,6 +136,17 @@ class HaloExchanger(torch.nn.Module):
     def prepare_buffers(self, element_tensor_shape: tuple, dtype: torch.dtype):
         self.assert_is_needed()
 
+        dist_env = get_runtime_dist_env()
+        device = dist_env.comm_device
+
+        def _get_buffer(batchsize: int):
+            return torch.empty(
+                (batchsize,) + element_tensor_shape,
+                dtype=dtype, device=device
+            )
+        
+        self.zero_length_input = _get_buffer(0)
+
         if self.concat_buffer_length is None:
             # For Selector having no recvs, we don't use chunk but directly
             # go on with the input tensor.
@@ -143,22 +158,13 @@ class HaloExchanger(torch.nn.Module):
                     and self.concat_buffer.dtype == dtype:
                 return
 
-        def _get_buffer_shape(batchsize: int):
-            return (batchsize,) + element_tensor_shape
-
-        dist_env = get_runtime_dist_env()
-        device = dist_env.comm_device
-
         self.recv_buffers: List[Optional[torch.Tensor]] = \
             [None] * dist_env.world_size
         for u in range(dist_env.world_size):
             uninum = self.runtime_recv_lengths[u]
             if u != dist_env.rank:
                 if uninum > 0:
-                    buf = torch.empty(
-                        size=_get_buffer_shape(uninum),
-                        dtype=dtype, device=device
-                    )
+                    buf = _get_buffer(uninum)
                     self.recv_buffers[u] = buf
 
             # recv_buffers[dist_env.rank] is always None.
@@ -170,10 +176,7 @@ class HaloExchanger(torch.nn.Module):
         #
         # WARNING But if the HaloExchanger instance is called twice,
         # the 2nd writing may invalidate the 1st result.
-        self.concat_buffer = torch.empty(
-            size=_get_buffer_shape(self.concat_buffer_length),
-            dtype=dtype, device=device
-        )
+        self.concat_buffer = _get_buffer(self.concat_buffer_length)
 
     def forward(self, local: torch.Tensor) -> torch.Tensor:
         self.assert_is_needed()

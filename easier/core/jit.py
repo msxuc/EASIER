@@ -399,8 +399,6 @@ def compile(
 
         # modules, graphs = passes.generate_code(modules, backend, graphs)
 
-    modules, graphs = passes.propagate_static_metadata(modules, graphs)
-
     for m, g in zip(modules, graphs):
         gm = JitEngine(m, g)
         m.forward = gm.forward
