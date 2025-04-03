@@ -66,12 +66,16 @@ class _Skipped:
 _skipped = _Skipped()
 
 
-# NOTE it's possible that FX trace `Tensor.item()` call which results in
-# a pure int/float scalar rather than a [0]-shape tensor.
-RuntimeValue: TypeAlias = Union[
+_RuntimeValue: TypeAlias = Union[
     torch.Tensor,
-    _Skipped,
-    Sequence['RuntimeValue']
+    Sequence['_RuntimeValue']
+
+    # NOTE it's possible that FX trace `Tensor.item()` call which results in
+    # a pure int/float scalar rather than a [0]-shape tensor.
+]
+RuntimeValue: TypeAlias = Union[
+    _RuntimeValue,
+    _Skipped  # Skipped won't be nested
 ]
 
 class EvaluationHandlerBase:
@@ -193,6 +197,9 @@ class EvaluationHandlerBase:
 
         else:
             assert False, f"Unexpected FX Node op {node.op}"
+
+        assert self.current_node is node, \
+            "Currently we don't expect Handlers rebind self.current_node"
 
         # The same Node key will be written multiple times by all Handlers
         self.stackframe[self.current_node] = val
@@ -408,20 +415,65 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
         
 
     def if_call_module(self, submod):
-        # TODO HaloExchanger input may be 0-length. exchange subshape like aggregators
+        dist_env = get_runtime_dist_env()
+        rank = dist_env.rank
+
         if isinstance(submod, HaloExchanger):
             (arg, *_args), *_kwargs = self.eval_args_kwargs()
             if isinstance(arg, torch.Tensor):
-                arg_skipped = torch.tensor([0], device=dist_env.comm_device)
+                arg_ndim = torch.tensor([arg.ndim], device=dist_env.comm_device)
 
             elif isinstance(arg, _Skipped):
-                arg_skipped = torch.tensor([1], device=dist_env.comm_device)
+                arg_ndim = torch.tensor([0], device=dist_env.comm_device)
 
             else:
                 raise EasierJitException(
                     f"runtime value {arg} is not expected"
                 )
-            pass 
+
+            recv_ndims = [
+                torch.tensor([0], device=dist_env.comm_device)
+                for _ in range(dist_env.world_size)
+            ]
+            p2ps = []
+
+            # P2P twice:
+            # 1. which rank can send shape info i.e. its arg is not skipped;
+            #   this rank can recv from which rank;
+            # 2. send and recv on active paths in #1
+            for w in range(dist_env.rank):
+                lidx_w = submod.runtime_halos_lidxes[w]
+                if lidx_w.shape[0] > 0:
+                    isend = dist_env.def_isend(arg_ndim, w, w)
+                    p2ps.append(isend)
+
+                if submod.runtime_recv_lengths[w] > 0:
+                    irecv = dist_env.def_irecv(recv_ndims[w], w, rank)
+                    p2ps.append(irecv)
+            
+            for p2p in dist_env.batch_isend_irecv(p2ps):
+                p2p.wait()
+
+            
+
+            recv_shapes = [
+                torch
+            ]
+            p2ps = []
+            for w in range(dist_env.rank):
+                if arg_ndim > 0:
+                    isend = dist_env.def_isend(
+                        torch.tensor(
+                            list(arg.shape), device=dist_env.comm_device
+                        ), w, w
+                    )
+                    p2ps.append(isend)
+                
+                if recv_ndims[w] > 0:
+                    irecv = dist_env.de
+
+
+
         return super().if_call_module(submod)
 
 
