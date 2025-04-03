@@ -249,11 +249,8 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             replica_allreduce_args = node.args[1:]
             replica_allreduce_kwargs = node.kwargs.copy()
         else:
-            # param `vertex_tensor` is a keyword arg
-            replica_allreduce_args = ()
-            # If the 1st param `vertex_tensor` is passed as a keyword arg,
-            # generally there will be no positional args.
-            assert len(node.args) == 0
+            # param `tensor` is a keyword arg
+            replica_allreduce_args = node.args
             replica_allreduce_kwargs = node.kwargs.copy()
             replica_allreduce_kwargs.pop('tensor')
 
@@ -272,7 +269,9 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             # EASIER reduce primitives are equivalent to
             # `torch.reduce(..., keepdim=True, dim=0)`
             worker_local_reduce = node.graph.call_function(
-                dist_reduce_prim, tuple(node.args), dict(node.kwargs)
+                dist_reduce_prim,
+                (input_tensor,) + replica_allreduce_args,
+                replica_allreduce_kwargs
             )
 
             allgather = node.graph.call_function(

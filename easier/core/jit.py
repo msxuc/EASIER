@@ -27,6 +27,8 @@ from easier.core.passes.utils import \
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
     set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type
+from easier.core.runtime.jit_engine import \
+    JitEngine
 
 
 class EasierProxy(Proxy):
@@ -397,8 +399,10 @@ def compile(
 
         # modules, graphs = passes.generate_code(modules, backend, graphs)
 
+    modules, graphs = passes.propagate_static_metadata(modules, graphs)
+
     for m, g in zip(modules, graphs):
-        gm = GraphModule(m, g)
+        gm = JitEngine(m, g)
         m.forward = gm.forward
 
     esr.logger.info("EASIER just-in-time compilation has completed")

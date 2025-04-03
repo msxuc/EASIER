@@ -63,6 +63,7 @@ class HaloExchanger(torch.nn.Module):
         # Both send and recv lengths do not count the local-to-local comm.
         self.total_recv_length: int
         self.total_send_length: int
+        self.output_batch_size: int
 
         # None means we don't need to concat into the chunk.
         self.concat_buffer_length: Optional[int]
@@ -105,6 +106,7 @@ class HaloExchanger(torch.nn.Module):
                     # For Selector having no recvs, we don't use chunk
                     # but directly go on with the input tensor.
                     self.concat_buffer_length = None
+                    self.output_batch_size = self.input_elempart_length
                 else:
                     # If we need to recv halos for Selector,
                     # we don't slice input tensor for local halo of Selector,
@@ -114,10 +116,12 @@ class HaloExchanger(torch.nn.Module):
 
                     self.concat_buffer_length = \
                         self.total_recv_length + local_size
+                    self.output_batch_size = self.concat_buffer_length
             else:
                 # For Reducer, if this HaloExchanger is needed, we'll either
                 # send or recv, in both cases we need concat with halos.
                 self.concat_buffer_length = self.total_recv_length + local_size
+                self.output_batch_size = self.concat_buffer_length
 
     def assert_is_needed(self):
         assert self.is_needed, \
@@ -215,6 +219,11 @@ class HaloExchanger(torch.nn.Module):
                         recv_buffers.append(
                             local[self.runtime_halos_lidxes[dist_env.rank]]
                         )
+                
+                else:
+                    # No local element is read, add an empty tensor.
+                    # Because the list to concat needs at least one tensor
+                    recv_buffers.append(local[:0])
 
         for req in dist_env.batch_isend_irecv(p2p_ops):
             req.wait()
@@ -231,3 +240,7 @@ def all_gather_into_tensor(
     # with a global instance and under a function.
     dist_env = get_runtime_dist_env()
     return dist_env.all_gather_into_tensor(send_tensor, 'concat')
+
+
+def tuple_getitem(collection: tuple, idx: int):
+    return collection[idx]

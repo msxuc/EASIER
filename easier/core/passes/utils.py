@@ -129,12 +129,12 @@ class EasierInterpreter(Generic[_T]):
             val = self.if_get_attr(submod_path, attr_name, obj)
 
         elif node.op == FX.CALL_FUNCTION:
+            assert callable(node.target)
             val = self.if_call_function(node.target)
 
         elif node.op == FX.CALL_METHOD:
-            # Currently we assume all methods are torch.Tensor methods
-            method_func = getattr(torch.Tensor, cast(str, node.target))
-            val = self.if_call_method(method_func)
+            assert isinstance(node.target, str)
+            val = self.if_call_method(node.target)
 
         elif node.op == FX.CALL_MODULE:
             submod_path = cast(str, node.target)
@@ -173,37 +173,44 @@ class EasierInterpreter(Generic[_T]):
         """
         pass
 
-    def if_call_function(self, function) -> _T:
+    def if_call_function(self, function: Callable) -> _T:  # type: ignore
         """
         The handler for Node `curent_node.op=='call_function'`
 
         Args:
-        -   function: the function callable
+        -   function: the function callable, e.g. `operator.add, torch.add`
 
-        By default dispatch to EASIER-specific call_operation handler.
+        By default dispatch to the unified `if_function_or_method` handler.
         """
-        return self.if_function_or_method(self.current_node.target)
+        return self.if_function_or_method(function)
 
-    def if_call_method(self, method) -> _T:
+    def if_call_method(self, method_name: str) -> _T:  # type: ignore
         """
         The handler for Node `curent_node.op=='call_method'`
 
         Args:
-        -   method: the callable of torch.Tensor method like
-                `torch.Tensor.repeat`.
+        -   method_name: the name of the method, e.g. "repeat", "sum"
 
-        By default dispatch to EASIER-specific call_operation handler.
-        """
-        return self.if_function_or_method(method)
+        By default dispatch to the unified `if_function_or_method` handler.
 
-    def if_function_or_method(self, op_callable) -> _T:  # type: ignore
+        NOTE
+        Derived interpreters should take care of whether the method is really
+        a method of the torch.Tensor.
         """
-        The EASIER-specific handler for operation invocation.
+        return self.if_function_or_method(method_name)
+
+    def if_function_or_method(
+        self, function_or_method_name: Union[Callable, str]
+    ) -> _T:  # type: ignore
+        """
+        The unified handler for operation invocation.
 
         Args:
-        -   op_callable:
-                The operation callable, e.g. `operator.add, torch.add`
-                or `torch.Tensor.repeat`.
+        -   function_or_method_name:
+                The function callable e.g. `operator.add, torch.add` if 
+                `curent_node.op=='call_function'`.
+                Or the name of the method e.g. "repeat", "sum" if 
+                `curent_node.op=='call_method'`.
         """
         pass
 
@@ -224,31 +231,6 @@ class EasierInterpreter(Generic[_T]):
         """
         pass
 
-
-class EvaluationHandlerBase:
-    def __init__(self) -> None:
-        self.next: Optional[EvaluationHandlerBase] = None
-
-    def _call_next(self, cls_method, *args):
-        assert self.next is not None, \
-            "The innermost Handler shouldn't super().if_xxx method" \
-            " (normally the innermost Handler is the NodeEvaluationHandler)"
-        return cls_method(self, *args)
-
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        return self._call_next(EvaluationHandlerBase.if_get_attr, submod_path, attr_name, attr_val)
-
-    def if_call_function(self, function):
-        return self._call_next(EvaluationHandlerBase.if_call_function,  function)
-    
-    def if_call_method(self, method_name):
-        return self._call_next(EvaluationHandlerBase.if_call_method,  method_name)
-    
-    def if_call_module(self, submod):
-        return self._call_next(EvaluationHandlerBase.if_call_module, submod)
-
-class NodeEvaluationHandler(EvaluationHandlerBase):
-    1
 
 class SubmodNameAllocator:
     def __init__(self, prefix: str) -> None:
