@@ -243,7 +243,3 @@ def all_gather_into_tensor(
     # with a global instance and under a function.
     dist_env = get_runtime_dist_env()
     return dist_env.all_gather_into_tensor(send_tensor, 'concat')
-
-
-def tuple_getitem(collection: tuple, idx: int):
-    return collection[idx]

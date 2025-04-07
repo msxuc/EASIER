@@ -278,8 +278,10 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
                 all_gather_into_tensor, (worker_local_reduce,)
             )
 
+            prim_name = dist_reduce_prim.__name__
             replica_reduce_op: FunctionType = getattr(
-                torch, dist_reduce_prim.__name__
+                torch,
+                'a' + prim_name if prim_name in ['max', 'min'] else prim_name
             )
             replica_allreduce_kwargs['keepdim'] = True
             replica_allreduce_kwargs['dim'] = 0

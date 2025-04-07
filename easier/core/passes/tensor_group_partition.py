@@ -340,6 +340,10 @@ def partition_tensor_groups_with_adjmat(
     # Invoke partition
     #
 
+    # TODO tensor_group_partition didn't handle the cases well 
+    # where the number of vertexes is less than the world size.
+    # (although such lightweight cases do not need distribution at all)
+
     # e.g. [0, N, 2N, ..., min(accum_n, wN)]
     vtxdist = torch.arange(world_size + 1) * per_worker_n
     vtxdist[-1].clamp_(max=accum_n)

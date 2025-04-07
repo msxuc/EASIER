@@ -17,7 +17,7 @@ import easier as esr
 from ..utils import \
     torchrun_singlenode, get_random_str, assert_tensor_list_equal, \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode
-
+from tests.core.utils import multi_stage_zero_length_partition
 
 class Model(esr.Module):
     def __init__(self, nf, device='cpu') -> None:
@@ -209,12 +209,49 @@ class TestModuleDump:
         )
 
 
+def worker__test_smoke_zerolength_dump(
+    local_rank: int, world_size: int, dev_type: str, dumpdir: str
+):
+    model_dev = torch.device(dev_type)
+
+    torch.manual_seed(2345)
+    m = Model(3, model_dev)  # type: ignore
+
+    with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
+        jm1, = esr.compile([m], 'torch')  # type: ignore
+    esr.dump([jm1], dumpdir)
+    jm1: Model
+    jm1()
+
+    orig_vertex = jm1.vertex_tensor.collect()
+    orig_edge = jm1.edge_tensor.collect()
+    orig_replica = jm1.tensor.collect()
+
+    torch.manual_seed(2345)
+    m = Model(3, model_dev)  # type: ignore
+    jm2, = esr.compile([m], 'torch', load_dir=dumpdir)  # type: ignore
+    jm2: Model
+    jm2()
+
+    collected_vertex = jm2.vertex_tensor.collect()
+    collected_edge = jm2.edge_tensor.collect()
+    collected_replica = jm2.tensor.collect()
+    torch.testing.assert_close(collected_vertex, orig_vertex)
+    torch.testing.assert_close(collected_edge, orig_edge)
+    torch.testing.assert_close(collected_replica, orig_replica)
+
+
 @pytest.mark.parametrize('dev_type', [
     'cpu',
     pytest.param('cuda', marks=when_ngpus_ge_2)
 ])
-def test_zerolength_dump(dev_type):
-    pass
-    # torchrun_singlenode(
-    #     2, worker__test_zerolength_collect, (dev_type,), init_type=dev_type
-    # )
+def test_smoke_zerolength_dump(dev_type):
+    dumpdir = os.path.join(
+        tempfile.gettempdir(), "easier", "tests", get_random_str()
+    )
+    torchrun_singlenode(
+        4 if dev_type == 'cpu' else 2,
+        worker__test_smoke_zerolength_dump,
+        (dev_type, dumpdir),
+        init_type=dev_type
+    )

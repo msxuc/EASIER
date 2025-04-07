@@ -311,7 +311,7 @@ def zipsort_using_order(order: torch.Tensor, to_sort: torch.Tensor,
     sort(zip(to_sort, to_follow), key=lambda (s,f): order.index(s))
     ```
     """
-    if order.shape[0] == 0:
+    if order.shape[0] == 0 or to_sort.shape[0] == 0:
         assert to_sort.shape[0] == 0
         assert to_follow.shape[0] == 0
         return \

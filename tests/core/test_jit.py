@@ -196,7 +196,7 @@ def worker__test_collect(local_rank: int, world_size: int,
     collected_replica = jitted.tensor.collect()
     assert collected_vertex.device == model_dev
     assert collected_edge.device == model_dev
-    assert collected_vertex.device == model_dev
+    assert collected_replica.device == model_dev
     torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
     torch.testing.assert_close(collected_edge.cpu(), orig_edge)
     torch.testing.assert_close(collected_replica.cpu(), orig_replica)
@@ -334,7 +334,7 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     collected_replica = jitted.tensor.collect()
     assert collected_vertex.device.type == dev_type
     assert collected_edge.device.type == dev_type
-    assert collected_vertex.device.type == dev_type
+    assert collected_replica.device.type == dev_type
     torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
     torch.testing.assert_close(collected_edge.cpu(), orig_edge)
     torch.testing.assert_close(collected_replica.cpu(), orig_replica)
@@ -384,21 +384,40 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
                 torch.from_numpy(h5f['replica'][:]), orig_replica)
 
 
-class VerySmallModel(esr.Module):
+class NotFullModel(esr.Module):
     def __init__(self):
         super().__init__()
 
-        self.vertex = esr.Tensor(torch.arange(2).double(), mode='partition')
+        self.vertex = esr.Tensor(torch.arange(2, 20).double(), mode='partition')
         self.selector = esr.Selector(torch.arange(3) // 2)
-        self.reducer = esr.Reducer(torch.ones(3), n=2)
+        self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)
+        self.replica = esr.Tensor(torch.zeros([1]).double(), mode='replicate')
 
     def forward(self):
-        self.vertex[:] = self.reducer(self.selector(self.vertex))
+        self.vertex[:] += self.reducer(self.selector(self.vertex))
 
-def worker__test_zerolength_smoke(local_rank, world_size, dev_type):
-    m = VerySmallModel()
+        self.replica[:] \
+            = esr.sum(self.vertex) * 1.2 \
+            + esr.prod(self.vertex) * 2.3 \
+            + esr.max(self.vertex) * 3.4 \
+            + esr.min(self.vertex) * 4.5 \
+            + esr.norm(self.vertex, p=2)
+
+def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
+    m = NotFullModel()
+    [jitted] = esr.compile([m], backend='none')
+    jitted()
+    orig_v = jitted.vertex.clone().cpu()
+    orig_r = jitted.replica.clone().cpu()
+
+    m = NotFullModel()
     [jitted] = esr.compile([m], backend=dev_type)
     jitted()
+    collected_v = jitted.vertex.collect().cpu()
+    collected_r = jitted.replica.collect().cpu()
+
+    torch.testing.assert_close(collected_v, orig_v)
+    torch.testing.assert_close(collected_r, orig_r)
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',
@@ -417,8 +436,10 @@ class TestZeroLengthPartition:
             worker__test_zerolength_save, (dev_type,), init_type=dev_type
         )
     
-    def test_zerolength_smoke(self, dev_type):
+    def test_smoke_zerolength_notfull(self, dev_type):
         torchrun_singlenode(
-            8 if dev_type == 'cpu' else 2,
-            worker__test_zerolength_smoke, (dev_type,), init_type=dev_type
+            4 if dev_type == 'cpu' else 2,
+            worker__test_smoke_zerolength_notfull,
+            (dev_type,),
+            init_type=dev_type
         )

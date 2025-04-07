@@ -4,13 +4,11 @@
 import dataclasses
 import math
 import operator
-from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
+    Callable, Dict, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
 import numpy
 from typing_extensions import Literal
 import more_itertools
-import os
 import pickle
 
 import torch
@@ -28,10 +26,10 @@ from easier.core.passes.metadata_propagation import \
     StaticNodeMeta, get_static_node_metadata, Role, \
     get_runtime_tensor_metadata, set_runtime_tensor_metadata, RuntimeTensorMeta
 from easier.core.passes.utils import \
-    FX, get_easier_objects, EasierInterpreter, tree_map
+    FX, get_easier_objects, tree_map, normalize_reducer_call_into_args
 from easier.core.utils import EasierJitException, logger
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.runtime.modules import HaloExchanger, tuple_getitem
+from easier.core.runtime.modules import HaloExchanger
 
 
 def _get_runtime_metadata_from_value(
@@ -42,7 +40,9 @@ def _get_runtime_metadata_from_value(
         return RuntimeTensorMeta(node_role, tuple(val.shape), val.dtype)
 
     if node_role == Role.DISTRIBUTED:
-        raise EasierJitException(f"Unexpected distributed value {val}")
+        raise EasierJitException(
+            f"Unexpected distributed value {val} of type {type(val)}"
+        )
 
     if val is None:
         # Replica Nodes: Output, nested esr.Module calls
@@ -63,7 +63,9 @@ def _get_runtime_metadata_from_value(
         # (`torch.Tensor` is one of such types), their metadata is always
         # propagated and carried by their corresponding `Node[op='get_attr']`.
         # We don't expect to see them here.
-        raise EasierJitException(f'Value {val} cannot have associated metadata')
+        raise EasierJitException(
+            f'Value {val} of type {type(val)} cannot have associated metadata'
+        )
 
 class _Skipped:
     """
@@ -209,7 +211,7 @@ def exchange_meta_for_halo_exchanger(
     else:
         if not isinstance(input, _Skipped):
             raise EasierJitException(
-                f"runtime value {input} is not expected"
+                f"runtime value {input} of type {type(input)} is not expected"
             )
         
         if not torch.any(can_recv_from):
@@ -292,6 +294,10 @@ def allgather_meta_for_aggregator(
     function,
     input: Union[torch.Tensor, _Skipped]
 ) -> Tuple[Tuple[int, ...], torch.dtype]:
+    """
+    This will be a fully collective call, all ranks must be involved in
+    EASIER aggregators.
+    """
     dist_env = get_runtime_dist_env()
 
     if isinstance(input, torch.Tensor):
@@ -506,30 +512,25 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         and (not is_halo_exchanger):
             # Skip according to the static metadata, so the result will be
             # consistent among sessions.
-            self.stackframe[node] = _skipped
-            return _skipped
+            res = _skipped
 
+        else:
+            res = super().dispatch_node(node, args, kwargs)
 
-        # TODO detect input meta changes on the fly, especially dtype/shape[1:]
-        # incoming_runtime_meta = tree_map(
-        #     args, lambda x: _get_runtime_metadata_from_value(role, x)
-        # )
-        # if prev_runtime_meta[1:] != incoming_runtime_meta[1:]:
-        #     pass
-
-        res = super().dispatch_node(node, args, kwargs)
-
-        result_runtime_meta = tree_map(
-            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
-        )
-        self.handle_result_runtime_metadata(node, res, result_runtime_meta)
+            # TODO handle _SKipped here
+            self.handle_result_runtime_metadata(node, res)
 
         self.stackframe[node] = res
 
         return res
     
-    def handle_result_runtime_metadata(self, node, res, result_runtime_meta):
+    def handle_result_runtime_metadata(self, node, res):
+        node_meta = get_static_node_metadata(node)
         prev_runtime_meta = get_runtime_tensor_metadata(node)
+
+        result_runtime_meta = tree_map(
+            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
+        )
 
         # TODO if we support meta changes on the fly, we can just check
         # if batch sizes change.
@@ -576,13 +577,15 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                 )
                 args = (arg_neutral,) + args[1:]
 
+        logger.info(self.current_node.format_node())
         res = function(*args, **kwargs)
 
         if function is operator.setitem:
             # By default operator.setitem will return None
             # Since the args[0] may be both DISTRIBUTED and REPLICA,
-            # we'd better return the concrete value to not get mixed with None.
-            # (None is normally identified as REPLICA only)
+            # we'd better return the concrete value to avoid dealing with None
+            # (None is normally identified as REPLICA-only)
+            # and align with the Node's role.
             return args[0]
 
         return res
@@ -590,11 +593,12 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
     def if_call_method(self, method_name, args, kwargs) -> RuntimeValue:
         this, *other_args = args
 
-        if isinstance(this, torch.Tensor):
+        if not isinstance(this, torch.Tensor):
             # TODO any cases in FX that non-tensor methods are called?
             # maybe `a.split().index(3)` -- `tuple.index` is called?
             raise EasierJitException(
-                "expect a method of torch.Tensor to be called"
+                "expect a method of torch.Tensor to be called,"
+                f" but method '{method_name}' of {type(this)} is called"
             )
         
         this_method = getattr(this, method_name)
@@ -609,21 +613,56 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             arg = args[0]
             if isinstance(arg, _Skipped):
                 args = (submod.zero_length_input,) + args[1:]
+        
+        if isinstance(submod, esr.Reducer):
+            # For not-full Reducer, on some workers, the rewritten idx may be
+            # empty, meaning all input elemparts are sent to other workers,
+            # and no output elempart are reduced into
+            # -- these cases are handled by Reducer.forward(), to return the
+            # given `out` or forward()-created zero tensors.
+            # TODO first handle the creation of out if input is SKipped
+            # TODO will the idx.shape[0] == 0 still matter?
 
+            input, opt_out = normalize_reducer_call_into_args(*args, **kwargs)
+            if isinstance(input, _Skipped):
+                if opt_out is not None:
+                    return opt_out  # may be _Skipped too
+
+                else:
+                    dist_env = get_runtime_dist_env()
+
+                    out = torch.zeros(
+                        (submod.n),
+                        dtype=torch.float64,
+                        device=dist_env.comm_device
+                    )
+                    return out
+
+                    result_runtime_meta = get_runtime_tensor_metadata(
+                        self.current_node
+                    )
+                    assert isinstance(result_runtime_meta, RuntimeTensorMeta)
+                    assert result_runtime_meta.role == Role.DISTRIBUTED
+                    out = torch.zeros(
+                        result_runtime_meta.shape,
+                        dtype=result_runtime_meta.dtype,
+                        device=dist_env.comm_device
+                    )
+                    return out
+        
         res = submod(*args, **kwargs)
         return res
 
 
-
-
-
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
-    def handle_result_runtime_metadata(self, node, res, result_runtime_meta):
+    def handle_result_runtime_metadata(self, node, res):
+        node_meta = get_static_node_metadata(node)
+        result_runtime_meta = tree_map(
+            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
+        )
         set_runtime_tensor_metadata(node, result_runtime_meta)
 
     def if_call_function(self, function, args, kwargs):
-        dist_env = get_runtime_dist_env()
-
         if function in _EsrMod.easier_aggregators:
             # Set resultant runtime tensor metadata in advance.
             # If on some ranks the input Node is skipped, NodeEvalHandler
@@ -639,12 +678,12 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
         
 
     def if_call_module(self, submod, args: tuple, kwargs: dict):
-        dist_env = get_runtime_dist_env()
-        rank = dist_env.rank
-
         if isinstance(submod, HaloExchanger):
             subshape, dtype = exchange_meta_for_halo_exchanger(submod, args[0])
             submod.prepare_buffers(subshape, dtype)
+        
+        if isinstance(submod, esr.Reducer):
+            pass
 
         return super().if_call_module(submod, args, kwargs)
 
