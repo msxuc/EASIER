@@ -7,9 +7,11 @@ import operator
 from types import ModuleType
 from typing import \
     Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
+import numpy
 from typing_extensions import Literal
 import more_itertools
 import os
+import pickle
 
 import torch
 from torch import nn
@@ -32,17 +34,20 @@ from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, tuple_getitem
 
 
-
 def _get_runtime_metadata_from_value(
     node_role: Role,
-    val: Union[torch.Tensor, int, float]
+    val: Union[torch.Tensor, bool, int, float, None]
 ) -> RuntimeTensorMeta:
     if isinstance(val, torch.Tensor):
         return RuntimeTensorMeta(node_role, tuple(val.shape), val.dtype)
 
-    if node_role != Role.REPLICATED:
-        raise EasierJitException()
+    if node_role == Role.DISTRIBUTED:
+        raise EasierJitException(f"Unexpected distributed value {val}")
 
+    if val is None:
+        # Replica Nodes: Output, nested esr.Module calls
+        # may return None
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32)
     elif isinstance(val, bool):
         return RuntimeTensorMeta(Role.REPLICATED, (), torch.bool)
     elif isinstance(val, int):
@@ -61,6 +66,10 @@ def _get_runtime_metadata_from_value(
         raise EasierJitException(f'Value {val} cannot have associated metadata')
 
 class _Skipped:
+    """
+    We use a special runtime object `_skipped = _Skipped()` to represent
+    values of skipped Nodes.
+    """
     pass
 
 _skipped = _Skipped()
@@ -75,253 +84,9 @@ _RuntimeValue: TypeAlias = Union[
 ]
 RuntimeValue: TypeAlias = Union[
     _RuntimeValue,
+    None,  # output Nodes, nested esr.Module calls
     _Skipped  # Skipped won't be nested
 ]
-
-class EvaluationHandlerBase:
-    """
-    A Handler can be registered into the JitEngine to serve as
-    pre/post-evaluation hooks of a single Node in the runtime.
-
-    All handlers are run in a recursion manner. The NodeEvaluationHandler
-    that really evaluates the Node (i.e. resulting in Tensor(s)) must be
-    the innermost of the recursion.
-
-    For implementers:
-
-    Any Handler if_xxx method (e.g. if_call_function) can call
-    `super().if_call_function()` to enter the recursion, like:
-    ```
-    class MyHandler(EvaluationHandlerBase):
-        def if_call_function(self, function):
-            # pre hooks
-            # derived Handlers may inspect the IR Node here
-            if function in easier.aggregator:
-                function = easier.runtime.my_new_function
-
-                # may change the self.current_node
-                self.current_node.target = function
-
-            # enter the recursion
-            # the `if_call_function` method of the next Handler will be called
-            result = super().if_call_function(self, function)
-            # ~~~~                                  ~~~~~~~~
-            # get the result                when needed, transform the arg
-
-            # post hooks
-            print(result)
-
-            return result
-    ```
-
-    P.S. self.dispatch_node() will also enter recursion.
-    """
-    def __init__(self) -> None:
-        # Let JitEngine initialize and wire up all registered Handlers.
-        self.next: Optional[EvaluationHandlerBase] = None
-        self.current_module: esr.Module
-        self.current_graph: Graph
-
-        # 
-        # Context variables, the lifetime is the scope of `Module.forward()`
-        # =================
-        #
-        # All Handlers share the same stackframe dict, which is normally
-        # created and managed by the JitEngine
-        self.stackframe: Dict[Node, RuntimeValue]
-
-        # 
-        # Context variables, the lifetime is the execution period of a Node.
-        # =================
-        self.current_node: Node
-
-    def _dispatch_next(self):
-        assert self.next is not None, \
-            "The innermost Handler shouldn't call super().if_xxx method" \
-            " (normally we need to put a NodeEvaluationHandler innermost)"
-
-        result = self.next.dispatch_node(self.current_node)
-
-        assert self.current_node is self.next.current_node, \
-            "Currently we don't expect Handlers rebind self.current_node"
-        # TODO if we expect recursively run Handlers rebind self.current_node
-        # we may enable:
-        # self.current_node = self.next.current_node
-
-        return result
-
-    
-    def eval_arg_node(self, arg: Node) -> RuntimeValue:
-        return self.stackframe[arg]
-    
-    def eval_args_kwargs(self) -> Tuple[
-        Tuple[RuntimeValue, ...], Dict[str, RuntimeValue]
-    ]:
-        # NOTE positional arguments can be passed in as keyword args.
-        # For Selector/Reducer, we can use `normalize_selector_call_into_args`
-        # etc. to _normalize_ `*args **kwargs` into all positional args.
-
-        def _eval(x):
-            if isinstance(x, Node):
-                return self.eval_arg_node(x)
-            else:
-                return x
-        args = tuple(tree_map(v, _eval) for v in self.current_node.args)
-        kwargs = {
-            k: tree_map(v, _eval)
-            for k, v in self.current_node.kwargs.items()
-        }
-        return args, kwargs  # type: ignore
-    
-    def dispatch_node(self, node: Node) -> RuntimeValue:
-        self.current_node = node
-
-        root = self.current_module
-
-        if node.op == FX.GET_ATTR:
-            assert isinstance(node.target, str)
-            val = self.if_get_attr(node.target)
-
-        elif node.op == FX.CALL_FUNCTION:
-            assert callable(node.target)
-            val = self.if_call_function(node.target)
-
-        elif node.op == FX.CALL_METHOD:
-            assert isinstance(node.target, str)
-            val = self.if_call_method(node.target)
-
-        elif node.op == FX.CALL_MODULE:
-            submod_path = cast(str, node.target)
-            callee = root.get_submodule(submod_path)
-            val = self.if_call_module(callee)
-
-        else:
-            assert False, f"Unexpected FX Node op {node.op}"
-
-        assert self.current_node is node, \
-            "Currently we don't expect Handlers rebind self.current_node"
-
-        # The same Node key will be written multiple times by all Handlers
-        self.stackframe[self.current_node] = val
-        return val
-
-    def if_get_attr(self, attr_path: str) -> RuntimeValue:
-        return self._dispatch_next()
-
-    def if_call_function(self, function: Callable) -> RuntimeValue:
-        return self._dispatch_next()
-    
-    def if_call_method(self, method_name: str) -> RuntimeValue:
-        return self._dispatch_next()
-    
-    def if_call_module(self, submod: torch.nn.Module) -> RuntimeValue:
-        return self._dispatch_next()
-
-
-class NodeEvaluationHandler(EvaluationHandlerBase):
-    """
-    The most essential Handler to evaluate each Node.
-
-    If a Node has StaticNodeMeta(Role.DISTRIBUTED, batch_size=0) it will be
-    skipped and a debug marker object _Skipped() will be put to the stackframe.
-    (But HaloExchangers are still evaluated)
-
-    Must be the innermost Handler.
-    No more dispatch_next() i.e. super().if_xxx() is called.
-    """
-    def dispatch_node(self, node: Node):
-        is_halo_exchanger = \
-            node.op == FX.CALL_MODULE and isinstance(
-                self.current_module.get_submodule(cast(str, node.target)),
-                HaloExchanger
-            )
-
-        node_meta = get_static_node_metadata(node)
-        if node_meta.role == Role.DISTRIBUTED \
-        and node_meta.batch_size == 0 \
-        and (not is_halo_exchanger):
-            # Skip according to the static metadata, so the result will be
-            # consistent among sessions.
-            return _skipped
-
-        prev_runtime_meta = get_runtime_tensor_metadata(node)
-
-        val = super().dispatch_node(node)
-
-        new_runtime_meta = tree_map(
-            val, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
-        )
-        if prev_runtime_meta != new_runtime_meta:
-            raise EasierJitException(
-                "The properties of the result value of the operation"
-                f" {node.target} changes:"
-                f" {prev_runtime_meta} => {new_runtime_meta}"
-            )
-
-        return val
-
-    def if_get_attr(self, attr_path: str) -> RuntimeValue:
-        submod_path, _sep, attr_name = attr_path.rpartition(".")
-        submod = self.current_module.get_submodule(submod_path)
-        obj = getattr(submod, attr_name)
-        return obj
-
-    def if_call_function(self, function) -> RuntimeValue:
-        args, kwargs = self.eval_args_kwargs()
-        res = function(*args, **kwargs)
-
-        if function is operator.setitem:
-            # by default operator.setitem will return None
-            return args[0]
-        
-        if function in _EsrMod.easier_aggregators:
-            # Inserted by EASIER, input always on args[0]
-            (arg, *_args), *_kwargs = self.eval_args_kwargs()
-            if isinstance(arg, _Skipped):
-                dist_env = get_runtime_dist_env()
-
-                prev_rmeta = get_runtime_tensor_metadata(self.current_node)
-                assert isinstance(prev_rmeta, RuntimeTensorMeta)
-                vneutral = get_aggregator_neutral_value(
-                    function, prev_rmeta.dtype
-                )
-                v = torch.full(
-                    prev_rmeta.shape, fill_value=vneutral,
-                    dtype=prev_rmeta.dtype, device=dist_env.comm_device
-                )
-                return v
-
-        return res
-    
-    def if_call_method(self, method_name) -> RuntimeValue:
-        (this, *args), kwargs = self.eval_args_kwargs()
-
-        if isinstance(this, torch.Tensor):
-            # TODO any cases in FX that non-tensor methods are called?
-            # maybe `a.split().index(3)` -- `tuple.index` is called?
-            raise EasierJitException(
-                "expect a method of torch.Tensor to be called"
-            )
-        
-        method = getattr(this, method_name)
-        # `getattr` on the instance `this` already binds the method to the obj
-        # so we don't pass `this` as an argument.
-        res = method(*args, **kwargs)
-        return res
-    
-    def if_call_module(self, submod) -> RuntimeValue:
-        args, kwargs = self.eval_args_kwargs()
-
-        if isinstance(submod, HaloExchanger):
-            # Inserted by EASIER, input always on args[0]
-            arg = args[0]
-            if isinstance(arg, _Skipped):
-                args = (submod.zero_length_input,) + args[1:]
-
-        res = submod(*args, **kwargs)
-        return res
-
-
 
 def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
     if dtype.is_complex:
@@ -345,180 +110,543 @@ def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
     }[aggregator]
     return vneutral
 
-class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
-    def dispatch_node(self, node: Node):
-        smeta = get_static_node_metadata(node)
-        if smeta.role == Role.DISTRIBUTED and smeta.batch_size == 0:
-            # Skip this node. Store a debug marker object
-            return _skipped  # type: ignore
 
-        v = super().dispatch_node(node)
+
+def exchange_meta_for_halo_exchanger(
+    halo_xchg: HaloExchanger,
+    input: Union[torch.Tensor, _Skipped]
+) -> Tuple[Tuple[int, ...], torch.dtype]:
+    """
+    Exchange shape/dtype info for recv buffers of HaloExchangers.
+
+    On some workers the batch size of the input ElemPart is zero and the input
+    Node is skipped, then we cannot get a valid input Tensor to the halo_xchg.
+    However, the halo_xchg may need to receive, then it need valid shape/dtype
+    info the allocate the recv buffers.
+    For such cases, we'll exchange the shape/dtype info from other ranks.
+
+    NOTE
+    -   HaloExchanger itself is not a fully collective call, it may be called
+        on some ranks and not on others.
+        Therefore the call to this function may not be a fully collective call.
+
+    -   Keep using P2P with the same src/dst ranks as the halo_xchg.
+        Because on the ranks without HaloExchangers, they may have entered
+        and been waiting in dist.all_gather_into_tensor (the high-level API)
+        or ncclAllGathr (the low-level API) etc.
+        Any communication APIs than P2P may incorrectly be mixed with them.
+    """
+    dist_env = get_runtime_dist_env()
+
+    # Flags reflecting halo_xchg's original P2P connectivity.
+    #
+    # Remarkably, if a rank has zero-batch-size input, it cannot send or
+    # be received-from (but if can recv from others).
+    can_send_to = torch.zeros((dist_env.world_size,), dtype=torch.bool)
+    can_recv_from = torch.zeros((dist_env.world_size,), dtype=torch.bool)
+    for u in range(dist_env.world_size):
+        lidx = halo_xchg.runtime_halos_lidxes[u]
+        if u != dist_env.rank:
+            if lidx.shape[0] > 0:
+                can_send_to[u] = True
+    for u in range(dist_env.world_size):
+        recv_len = halo_xchg.runtime_recv_lengths[u]
+        if u != dist_env.rank:
+            if recv_len > 0:
+                can_recv_from[u] = True
+
+    def _exchange(
+        to_send: torch.Tensor,
+    ):
+        """
+        Always exclude the self rank.
+        The result will have the shape `(world_size,) + tosend.shape`.
+        """
+        to_send = to_send.to(dist_env.comm_device)
+        recv_buffer = torch.empty(
+            (dist_env.world_size,) + to_send.shape,
+            dtype=to_send.dtype, device=dist_env.comm_device
+        )
+        p2p_ops = []
+
+        for u in range(dist_env.world_size):
+            if can_send_to[u]:
+                isend = dist_env.def_isend(to_send, u, tag=u)
+                p2p_ops.append(isend)
+
+        for u in range(dist_env.world_size):
+            if can_recv_from[u]:
+                irecv = dist_env.def_irecv(
+                    recv_buffer[u], u, tag=dist_env.rank
+                )
+                p2p_ops.append(irecv)
         
-        rmeta = tree_map(v, _get_runtime_metadata_from_value)
-        node.meta[KEY__JITENGINE_RUNTIMEMETA] = rmeta
+        for req in dist_env.batch_isend_irecv(p2p_ops):
+            req.wait()
+        return recv_buffer.cpu()
+    
+    #
+    # Exchange dtype and ndim
+    # both have relatively constant sizes
+    #
 
-        return v
+    # A big enough buffer to store the serialized dtype.
+    # buffer[0] is the length of bytes.
+    dtype_buffer = torch.zeros((1000,), dtype=torch.int64)
+    ndim = 0
 
-    def if_call_function(self, function):
+    if isinstance(input, torch.Tensor):
+
+        dtype_bytes = pickle.dumps(input.dtype)
+        assert len(dtype_bytes) < dtype_buffer.shape[0] - 1
+        dtype_buffer[0] = len(dtype_bytes)
+        dtype_buffer[1:(1 + len(dtype_bytes))] = torch.from_numpy(
+            numpy.frombuffer(dtype_bytes, dtype=numpy.uint8).copy()
+        )
+
+        ndim = input.ndim
+
+    else:
+        if not isinstance(input, _Skipped):
+            raise EasierJitException(
+                f"runtime value {input} is not expected"
+            )
+        
+        if not torch.any(can_recv_from):
+            raise EasierJitException("TODO missing info")
+
+    dtypes_buffer = _exchange(dtype_buffer)
+    ndims_buffer = _exchange(torch.tensor([ndim], dtype=torch.int64))
+
+    # nzep stands for Non-Zero ElemPart
+    nzep_dtypes = set()
+    if can_recv_from.any():
+        # split returns an empty tensor if input is empty
+        for nzep_dtype_buffer in dtypes_buffer[can_recv_from].split(1, dim=0):
+            # dtypes_buffer: (N, 1000)
+            # split: [(1,1000), (1,1000), ...]
+            nzep_dtype_buffer = nzep_dtype_buffer[0]
+            u8_len = int(nzep_dtype_buffer[0])
+            nzep_dtypes.add(pickle.loads(
+                nzep_dtype_buffer[
+                    1:(1 + u8_len)
+                ].to(torch.uint8).numpy(force=True).tobytes()
+            ))
+
+    #
+    # - Validate dtype and ndim are consistent among workers
+    #   involved in the halo_xchg;
+    # - Exchange shape, the size is depended on ndim
+    #
+    if isinstance(input, torch.Tensor):
+        # Validate dtype with others, if there are any
+        if not all(d == input.dtype for d in nzep_dtypes):
+            raise EasierJitException("TODO not same")
+        dtype = input.dtype
+
+        # Validate ndim with others, if there are any
+        if not torch.all(ndims_buffer[can_recv_from] == ndim):
+            raise EasierJitException("TODO not same")
+
+        shape_buffer = torch.tensor(input.shape, dtype=torch.int64)
+
+    else:
+        assert isinstance(input, _Skipped)
+
+        # Unique dtype
+        if len(nzep_dtypes) != 1:
+            raise EasierJitException("TODO not same")
+        dtype = nzep_dtypes.pop()
+
+        # Unique ndim
+        nzep_ndims = ndims_buffer[can_recv_from].unique()
+        if nzep_ndims.shape[0] > 1:
+            raise EasierJitException("TODO not same")
+        
+        ndim = int(nzep_ndims[0])
+        shape_buffer = torch.full((ndim,), -1, dtype=torch.int64)
+
+
+    shapes_buffer = _exchange(shape_buffer)
+    if isinstance(input, torch.Tensor):
+        # Validate shape[1:] with others, if there are any
+        if not torch.all(
+            shapes_buffer[can_recv_from][:, 1:] == shape_buffer[1:]
+        ):
+            raise EasierJitException("TODO not same")
+        subshape = tuple(input.shape[1:])
+    
+    else:
+        assert isinstance(input, _Skipped)
+
+        # Unique shape[1:]
+        nzep_subshape_buffer = \
+            shapes_buffer[can_recv_from][:, 1:].unique(dim=0)
+        if nzep_subshape_buffer.shape != (1, ndim - 1,):
+            raise EasierJitException("TODO not same")
+        subshape = tuple(nzep_subshape_buffer[0].tolist())
+
+    return subshape, dtype
+
+def allgather_meta_for_aggregator(
+    function,
+    input: Union[torch.Tensor, _Skipped]
+) -> Tuple[Tuple[int, ...], torch.dtype]:
+    dist_env = get_runtime_dist_env()
+
+    if isinstance(input, torch.Tensor):
+        arg_skipped = torch.tensor([0], device=dist_env.comm_device)
+
+    elif isinstance(input, _Skipped):
+        arg_skipped = torch.tensor([1], device=dist_env.comm_device)
+
+    else:
+        raise EasierJitException(
+            f"runtime value {input} of type {type(input)} is not expected"
+        )
+
+    # The first communication API must be the same API and involving the same
+    # set of workers.
+    arg_skipped_flags = dist_env.all_gather_into_tensor(arg_skipped)
+
+    # at least one rank has shape info
+    info_sender = (arg_skipped_flags == 0).argwhere().ravel()[0]
+
+    if info_sender == dist_env.rank:
+        [dtype, subshape] = dist_env.broadcast_object_list(
+            info_sender,
+            [input.dtype, input.shape[1:]]  # type: ignore
+        )
+    else:
+        [dtype, subshape] = dist_env.broadcast_object_list(
+            info_sender
+        )
+
+    if isinstance(input, torch.Tensor):
+        if input.shape[1:] != subshape:
+            raise EasierJitException("TODO not same")
+        if input.dtype != dtype:
+            raise EasierJitException("TODO not same")
+
+    return tuple(subshape), dtype
+
+
+class EvaluationHandlerBase:
+    """
+    A Handler can be registered into the JitEngine to serve as
+    pre/post-evaluation hooks of a single Node in the runtime.
+
+    All handlers are run in a recursion manner. The NodeEvaluationHandler
+    that really evaluates the Node (i.e. resulting in Tensor(s)) must be
+    the innermost of the recursion.
+
+    For implementers:
+
+    Any Handler if_xxx method (e.g. if_call_function) can call
+    `super().if_call_function()` to enter the recursion, like:
+    ```
+    class MyHandler(EvaluationHandlerBase):
+        def if_call_function(self, function, args, kwargs):
+            # pre hooks
+            # derived Handlers may inspect the IR Node here
+            if function in easier.aggregator:
+                # may change the args
+                args = (0,) + args[1:]
+
+            # enter the recursion
+            # the `if_call_function` method of the next Handler will be called
+            result = super().if_call_function(self, function, args, kwargs)
+            # ~~~~                                            ~~~~~~~~~~~~
+            # get the result                     when needed, transform the arg
+
+            # post hooks
+            print(result)
+
+            return result
+    ```
+
+    NOTE
+    -   self.dispatch_node() will also enter recursion.
+    -   Positional arguments can be passed in as keyword args.
+        For Selector/Reducer, we can use `normalize_selector_call_into_args`
+        etc. to _normalize_ `*args **kwargs` into all positional args.
+    """
+    def __init__(self) -> None:
+        # Let JitEngine initialize and wire up all registered Handlers.
+        self.next: Optional[EvaluationHandlerBase] = None
+        self.current_module: esr.Module
+        self.current_graph: Graph
+
+        # 
+        # Context variables, the lifetime is the scope of `Module.forward()`
+        # =================
+        #
+        # All Handlers share the same stackframe dict, which is normally
+        # created and managed by the JitEngine
+        self.stackframe: Dict[Node, RuntimeValue]
+
+        # 
+        # Context variables, the lifetime is the execution period of a Node.
+        # =================
+        self.current_node: Node
+
+    def _dispatch_next(self, args, kwargs):
+        assert self.next is not None, \
+            "The innermost Handler shouldn't call super().if_xxx method" \
+            " (normally we need to put a NodeEvaluationHandler innermost)"
+
+        result = self.next.dispatch_node(self.current_node, args, kwargs)
+
+        assert self.current_node is self.next.current_node, \
+            "Currently we don't expect Handlers rebind self.current_node"
+        # TODO if we expect recursively run Handlers rebind self.current_node
+        # we may enable:
+        # self.current_node = self.next.current_node
+
+        return result
+
+    def dispatch_node(
+        self,
+        node: Node, 
+        args: Tuple[RuntimeValue, ...],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> RuntimeValue:
+        self.current_node = node
+
+        root = self.current_module
+
+        if node.op == FX.GET_ATTR:
+            assert isinstance(node.target, str)
+            val = self.if_get_attr(node.target)
+
+        elif node.op == FX.CALL_FUNCTION:
+            assert callable(node.target)
+            val = self.if_call_function(node.target, args, kwargs)
+
+        elif node.op == FX.CALL_METHOD:
+            assert isinstance(node.target, str)
+            val = self.if_call_method(node.target, args, kwargs)
+
+        elif node.op == FX.CALL_MODULE:
+            submod_path = cast(str, node.target)
+            callee = root.get_submodule(submod_path)
+            val = self.if_call_module(callee, args, kwargs)
+        
+        elif node.op == FX.OUTPUT:
+            return None
+
+        else:
+            assert False, f"Unexpected FX Node op {node.op}"
+
+        # TODO certain Handlers like NodeEvalHandler may skip super().dispatch
+        # and immediately return _Skipped(), making the setting and the check
+        # of self.current_node not working.
+        # However NodeEvalHandler is the innermost Handler so it may be OK.
+        # But it will be better if we make such checks _pre/_post hook of
+        # dispatch_node() method itself, just like DistEnv and DataLoader.
+        assert self.current_node is node, \
+            "Currently we don't expect Handlers rebind self.current_node"
+
+        return val
+
+    def if_get_attr(self, attr_path: str) -> RuntimeValue:
+        # As a result of not passing attr_path, function, submod etc.
+        # into _dispatch_next, we make these variables auxiliary only
+        # and Handler methods cannot change them within the recursion.
+        # TODO if we want to make function/submod arg hookable, we may add
+        # an extra route to bypass dispatch_node().
+        return self._dispatch_next((), {})
+
+    def if_call_function(
+        self,
+        function: Callable,
+        args: Tuple[RuntimeValue, ...],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> RuntimeValue:
+        return self._dispatch_next(args, kwargs)
+    
+    def if_call_method(
+        self,
+        method_name: str,
+        args: Tuple[RuntimeValue, ...],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> RuntimeValue:
+        return self._dispatch_next(args, kwargs)
+    
+    def if_call_module(
+        self,
+        submod: torch.nn.Module,
+        args: Tuple[RuntimeValue, ...],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> RuntimeValue:
+        return self._dispatch_next(args, kwargs)
+
+
+class NodeEvaluationHandler(EvaluationHandlerBase):
+    """
+    The most essential Handler to evaluate each Node.
+
+    If a Node has StaticNodeMeta(Role.DISTRIBUTED, batch_size=0) it will be
+    skipped and a debug marker object _Skipped() will be put to the stackframe.
+    (But HaloExchangers are still evaluated)
+
+    Must be the innermost Handler.
+    No more dispatch_next() i.e. super().if_xxx() is called.
+    """
+    def dispatch_node(self, node: Node, args, kwargs):
+        is_halo_exchanger = \
+            node.op == FX.CALL_MODULE and isinstance(
+                self.current_module.get_submodule(cast(str, node.target)),
+                HaloExchanger
+            )
+
+        node_meta = get_static_node_metadata(node)
+        if node_meta.role == Role.DISTRIBUTED \
+        and node_meta.batch_size == 0 \
+        and (not is_halo_exchanger):
+            # Skip according to the static metadata, so the result will be
+            # consistent among sessions.
+            self.stackframe[node] = _skipped
+            return _skipped
+
+
+        # TODO detect input meta changes on the fly, especially dtype/shape[1:]
+        # incoming_runtime_meta = tree_map(
+        #     args, lambda x: _get_runtime_metadata_from_value(role, x)
+        # )
+        # if prev_runtime_meta[1:] != incoming_runtime_meta[1:]:
+        #     pass
+
+        res = super().dispatch_node(node, args, kwargs)
+
+        result_runtime_meta = tree_map(
+            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
+        )
+        self.handle_result_runtime_metadata(node, res, result_runtime_meta)
+
+        self.stackframe[node] = res
+
+        return res
+    
+    def handle_result_runtime_metadata(self, node, res, result_runtime_meta):
+        prev_runtime_meta = get_runtime_tensor_metadata(node)
+
+        # TODO if we support meta changes on the fly, we can just check
+        # if batch sizes change.
+        if prev_runtime_meta != result_runtime_meta:
+            raise EasierJitException(
+                "The properties of the result value of the operation"
+                f" {node.target} changes:"
+                f" {prev_runtime_meta} => {result_runtime_meta}"
+            )
+
+    def if_get_attr(self, attr_path: str) -> RuntimeValue:
+        submod_path, _sep, attr_name = attr_path.rpartition(".")
+        submod = self.current_module.get_submodule(submod_path)
+        obj = getattr(submod, attr_name)
+        return obj
+
+    def if_call_function(self, function, args, kwargs) -> RuntimeValue:
+        if function in _EsrMod.easier_aggregators:
+            if isinstance(args[0], _Skipped):
+                dist_env = get_runtime_dist_env()
+                result_runtime_meta = get_runtime_tensor_metadata(
+                    self.current_node
+                )
+                assert isinstance(result_runtime_meta, RuntimeTensorMeta)
+                assert result_runtime_meta.role == Role.REPLICATED
+
+                vneutral = get_aggregator_neutral_value(
+                    function, result_runtime_meta.dtype
+                )
+
+                # TODO We may consider to create the neutral value
+                # (per node, also per run if k-dim shape can change)
+                # only once.
+                # Maybe we can store such values for skipped inputs in
+                # JitEngine (also HaloExchanger.zero_length_input can be
+                # unified in this way).
+                # However given that previous Nodes are skipped, it may have
+                # saved enough time to create on the fly.
+                arg_neutral = torch.full(
+                    result_runtime_meta.shape,
+                    fill_value=vneutral,
+                    dtype=result_runtime_meta.dtype,
+                    device=dist_env.comm_device
+                )
+                args = (arg_neutral,) + args[1:]
+
+        res = function(*args, **kwargs)
+
+        if function is operator.setitem:
+            # By default operator.setitem will return None
+            # Since the args[0] may be both DISTRIBUTED and REPLICA,
+            # we'd better return the concrete value to not get mixed with None.
+            # (None is normally identified as REPLICA only)
+            return args[0]
+
+        return res
+    
+    def if_call_method(self, method_name, args, kwargs) -> RuntimeValue:
+        this, *other_args = args
+
+        if isinstance(this, torch.Tensor):
+            # TODO any cases in FX that non-tensor methods are called?
+            # maybe `a.split().index(3)` -- `tuple.index` is called?
+            raise EasierJitException(
+                "expect a method of torch.Tensor to be called"
+            )
+        
+        this_method = getattr(this, method_name)
+        # `getattr` on the instance `this` already binds the method to the obj
+        # so we don't pass `this` as an argument anymore.
+        res = this_method(*other_args, **kwargs)
+        return res
+    
+    def if_call_module(self, submod, args, kwargs) -> RuntimeValue:
+        if isinstance(submod, HaloExchanger):
+            # Inserted by EASIER, input always on args[0]
+            arg = args[0]
+            if isinstance(arg, _Skipped):
+                args = (submod.zero_length_input,) + args[1:]
+
+        res = submod(*args, **kwargs)
+        return res
+
+
+
+
+
+class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
+    def handle_result_runtime_metadata(self, node, res, result_runtime_meta):
+        set_runtime_tensor_metadata(node, result_runtime_meta)
+
+    def if_call_function(self, function, args, kwargs):
         dist_env = get_runtime_dist_env()
 
         if function in _EsrMod.easier_aggregators:
-            # The input to he aggregator may have been skipped,
-            # we need to broadcast the shape[1:] from other Node.
-            (arg, *_args), *_kwargs = self.eval_args_kwargs()
-            if isinstance(arg, torch.Tensor):
-                arg_skipped = torch.tensor([0], device=dist_env.comm_device)
+            # Set resultant runtime tensor metadata in advance.
+            # If on some ranks the input Node is skipped, NodeEvalHandler
+            # will use that resultant runtime metadata to create a neutral
+            # input.
+            subshape, dtype = allgather_meta_for_aggregator(function, args[0])
+            set_runtime_tensor_metadata(
+                self.current_node,
+                RuntimeTensorMeta(Role.REPLICATED, (1,) + subshape, dtype)
+            )
 
-            elif isinstance(arg, _Skipped):
-                arg_skipped = torch.tensor([1], device=dist_env.comm_device)
-
-            else:
-                raise EasierJitException(
-                    f"runtime value {arg} is not expected"
-                )
-
-            # TODO note the comm primitive to broadcast the shape info here
-            # it cannot be mixed with e.g. P2P because if some ranks have
-            # empty partition, they will not invoke P2P calls,
-            # and this will cause the P2P to exchange shapes and P2P to
-            # exchange halos.
-            arg_skipped_flags = dist_env.all_gather_into_tensor(arg_skipped)
-            if arg_skipped_flags.sum() > 0:
-                # at least one rank has shape info
-                info_sender = (arg_skipped_flags == 0).argwhere().ravel()[0]
-
-                if info_sender == dist_env.rank:
-                    [dtype, subshape] = dist_env.broadcast_object_list(
-                        info_sender,
-                        [arg.dtype, arg.shape[1:]]  # type: ignore
-                    )
-                else:
-                    [dtype, subshape] = dist_env.broadcast_object_list(
-                        info_sender
-                    )
-
-            if arg_skipped == 0:
-                v = super().if_call_function(function)
-            else:
-                vneutral = get_aggregator_neutral_value(function, dtype)
-
-                v = torch.full(
-                    (1,) + subshape,
-                    fill_value=vneutral,
-                    dtype=dtype,
-                    device=dist_env.comm_device
-                )
-
-            return v
-
-        return super().if_call_function(function)
+        return super().if_call_function(function, args, kwargs)
         
 
-    def if_call_module(self, submod):
+    def if_call_module(self, submod, args: tuple, kwargs: dict):
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
 
         if isinstance(submod, HaloExchanger):
-            (arg, *_args), *_kwargs = self.eval_args_kwargs()
-            if isinstance(arg, torch.Tensor):
-                arg_ndim = torch.tensor([arg.ndim], device=dist_env.comm_device)
+            subshape, dtype = exchange_meta_for_halo_exchanger(submod, args[0])
+            submod.prepare_buffers(subshape, dtype)
 
-            elif isinstance(arg, _Skipped):
-                arg_ndim = torch.tensor([0], device=dist_env.comm_device)
-
-            else:
-                raise EasierJitException(
-                    f"runtime value {arg} is not expected"
-                )
-
-            recv_ndims = [
-                torch.tensor([0], device=dist_env.comm_device)
-                for _ in range(dist_env.world_size)
-            ]
-            p2ps = []
-
-            # P2P twice:
-            # 1. which rank can send shape info i.e. its arg is not skipped;
-            #   this rank can recv from which rank;
-            # 2. send and recv on active paths in #1
-            for w in range(dist_env.rank):
-                lidx_w = submod.runtime_halos_lidxes[w]
-                if lidx_w.shape[0] > 0:
-                    isend = dist_env.def_isend(arg_ndim, w, w)
-                    p2ps.append(isend)
-
-                if submod.runtime_recv_lengths[w] > 0:
-                    irecv = dist_env.def_irecv(recv_ndims[w], w, rank)
-                    p2ps.append(irecv)
-            
-            for p2p in dist_env.batch_isend_irecv(p2ps):
-                p2p.wait()
-
-            
-
-            recv_shapes = [
-                torch
-            ]
-            p2ps = []
-            for w in range(dist_env.rank):
-                if arg_ndim > 0:
-                    isend = dist_env.def_isend(
-                        torch.tensor(
-                            list(arg.shape), device=dist_env.comm_device
-                        ), w, w
-                    )
-                    p2ps.append(isend)
-                
-                if recv_ndims[w] > 0:
-                    irecv = dist_env.de
-
-
-
-        return super().if_call_module(submod)
-
-
-class RewriteTupleGetItemHandler(EvaluationHandlerBase):
-    def eval_arg_node(self, arg: Node):
-        """
-        Ensure any resultant tensor tuples have always been unpacked first.
-
-        So we can make the assertions:
-        1.  when nested structure appear, e.g. `torch.stack([a,b,c])`,
-            we can be sure that the argument list/tuple/tree
-            (which is a list/tuple/tree of Nodes)
-            is exactly showing that structure of argument Tensors.
-
-        2.  every Node,
-            except the operator itself that is known to return a tuple,
-            exactly represents a Tensor.
-
-        We do the check when a Node is used, so that it covers the cases of
-        call_function/call_method.
-        """
-        v = super().eval_arg_node(arg)
-
-        # Use is-not-Tensor check, since the structure may be list/tuple/etc.
-        if not isinstance(v, torch.Tensor):
-            if self.current_node.op == FX.CALL_FUNCTION \
-            and self.current_node.target is tuple_getitem:
-                # We are unpacking the tuple, this is the only allowed case
-                return v
-            else:
-                raise EasierJitException("TODO unpack first!")
-
-    def if_call_function(self, function):
-        if self.current_node.op == FX.CALL_FUNCTION \
-        and self.current_node.target is operator.getitem:
-            # here we can be sure that arguments are definitely positional
-            (this_val, pos_val), _kwargs = self.eval_args_kwargs()
-            assert len(_kwargs) == 0, \
-                "Both FX tuple getitem and tensor slicing do not have kwargs"
-
-            # Use is-not-Tensor check, since it may be list/tuple/etc.
-            if not isinstance(this_val, torch.Tensor):
-                self.current_node.target = tuple_getitem
-
-        return super().if_call_function(function)
+        return super().if_call_module(submod, args, kwargs)
 
 
 
@@ -530,7 +658,6 @@ class JitEngine:
         self.run_count = 0
 
         self.first_run_handlers: List[EvaluationHandlerBase] = [
-            RewriteTupleGetItemHandler(),
             FisrtRunNodeEvaluationHandler()  # always last
         ]
         self.runtime_handlers: List[EvaluationHandlerBase] = [
@@ -566,14 +693,26 @@ class JitEngine:
 
         else:
             handlers = self.runtime_handlers
+        outermost_handler = handlers[0]
+
         
-        stackframe = {}
+        stackframe: Dict[Node, RuntimeValue] = {}
         for h in handlers:
             h.stackframe = stackframe
+
+        # TODO make eval_args_kwargs Handler recursion-style methods
+        def _eval(x):
+            # instead sf.get(x,x) we want to also check type consistency.
+            if isinstance(x, Node):
+                return stackframe[x]
+            else:
+                return x
         
-        outermost_handler = handlers[0]
         for node in list(self.graph.nodes):
-            outermost_handler.dispatch_node(node)
+            args = tuple(tree_map(v, _eval) for v in node.args)
+            kwargs = {k: tree_map(v, _eval) for k, v in node.kwargs.items()}
+
+            outermost_handler.dispatch_node(node, args, kwargs)  # type: ignore
 
         if self.run_count == 0:
             ms, gs = [self.module], [self.graph]
