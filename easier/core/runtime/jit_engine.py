@@ -215,7 +215,9 @@ def exchange_meta_for_halo_exchanger(
             )
         
         if not torch.any(can_recv_from):
-            raise EasierJitException("TODO missing info")
+            raise EasierJitException(
+                "Unexpected HaloExchanger without any input"
+            )
 
     dtypes_buffer = _exchange(dtype_buffer)
     ndims_buffer = _exchange(torch.tensor([ndim], dtype=torch.int64))
@@ -243,12 +245,18 @@ def exchange_meta_for_halo_exchanger(
     if isinstance(input, torch.Tensor):
         # Validate dtype with others, if there are any
         if not all(d == input.dtype for d in nzep_dtypes):
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "dtypes of HaloExchanger are not the same:"
+                f" {nzep_dtypes}"
+            )
         dtype = input.dtype
 
         # Validate ndim with others, if there are any
         if not torch.all(ndims_buffer[can_recv_from] == ndim):
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "ndim of HaloExchanger are not the same:"
+                f" {ndims_buffer[can_recv_from]}"
+            )
 
         shape_buffer = torch.tensor(input.shape, dtype=torch.int64)
 
@@ -257,13 +265,19 @@ def exchange_meta_for_halo_exchanger(
 
         # Unique dtype
         if len(nzep_dtypes) != 1:
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "dtypes of HaloExchanger are not the same:"
+                f" {nzep_dtypes}"
+            )
         dtype = nzep_dtypes.pop()
 
         # Unique ndim
         nzep_ndims = ndims_buffer[can_recv_from].unique()
         if nzep_ndims.shape[0] > 1:
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "ndim of HaloExchanger are not the same:"
+                f" {nzep_ndims}"
+            )
         
         ndim = int(nzep_ndims[0])
         shape_buffer = torch.full((ndim,), -1, dtype=torch.int64)
@@ -275,7 +289,10 @@ def exchange_meta_for_halo_exchanger(
         if not torch.all(
             shapes_buffer[can_recv_from][:, 1:] == shape_buffer[1:]
         ):
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "shape[1:] of HaloExchanger are not the same:"
+                f" {shapes_buffer[can_recv_from][:, 1:]}"
+            )
         subshape = tuple(input.shape[1:])
     
     else:
@@ -285,7 +302,10 @@ def exchange_meta_for_halo_exchanger(
         nzep_subshape_buffer = \
             shapes_buffer[can_recv_from][:, 1:].unique(dim=0)
         if nzep_subshape_buffer.shape != (1, ndim - 1,):
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "shape[1:] of HaloExchanger are not the same:"
+                f" {nzep_subshape_buffer}"
+            )
         subshape = tuple(nzep_subshape_buffer[0].tolist())
 
     return subshape, dtype
@@ -330,9 +350,15 @@ def allgather_meta_for_collective_input(
 
     if isinstance(input, torch.Tensor):
         if input.shape[1:] != subshape:
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "shape[1:] of collective inputs are not the same:"
+                f" {input.shape[1:]} and {subshape}"
+            )
         if input.dtype != dtype:
-            raise EasierJitException("TODO not same")
+            raise EasierJitException(
+                "dtype of collective inputs are not the same:"
+                f" {input.dtype} and {dtype}"
+            )
 
     return tuple(subshape), dtype
 

@@ -225,7 +225,11 @@ class HaloExchanger(torch.nn.Module):
                 
                 else:
                     # No local element is read, add an empty tensor.
-                    # Because the list to concat needs at least one tensor
+                    # Because the list to concat needs at least one tensor.
+                    #
+                    # This also aligns with that the HaloExchanger is always
+                    # run, even it only returns an zero-length tensor for
+                    # the following Reducers (not Selectors).
                     recv_buffers.append(self.zero_length_input)
 
         for req in dist_env.batch_isend_irecv(p2p_ops):
