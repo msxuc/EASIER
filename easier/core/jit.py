@@ -400,8 +400,8 @@ def compile(
         # modules, graphs = passes.generate_code(modules, backend, graphs)
 
     for m, g in zip(modules, graphs):
-        gm = JitEngine(m, g)
-        m.forward = gm.forward
+        jit_engine = JitEngine(m, g)
+        m.forward = jit_engine.forward
 
     esr.logger.info("EASIER just-in-time compilation has completed")
 
