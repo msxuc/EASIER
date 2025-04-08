@@ -67,12 +67,14 @@ def _get_runtime_metadata_from_value(
             f'Value {val} of type {type(val)} cannot have associated metadata'
         )
 
+
 class _Skipped:
     """
     We use a special runtime object `_skipped = _Skipped()` to represent
     values of skipped Nodes.
     """
     pass
+
 
 _skipped = _Skipped()
 
@@ -89,6 +91,7 @@ RuntimeValue: TypeAlias = Union[
     None,  # output Nodes, nested esr.Module calls
     _Skipped  # Skipped won't be nested
 ]
+
 
 def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
     if dtype.is_complex:
@@ -111,7 +114,6 @@ def get_aggregator_neutral_value(aggregator, dtype: torch.dtype):
         esr.min: vmax
     }[aggregator]
     return vneutral
-
 
 
 def exchange_meta_for_halo_exchanger(
@@ -182,11 +184,11 @@ def exchange_meta_for_halo_exchanger(
                     recv_buffer[u], u, tag=dist_env.rank
                 )
                 p2p_ops.append(irecv)
-        
+
         for req in dist_env.batch_isend_irecv(p2p_ops):
             req.wait()
         return recv_buffer.cpu()
-    
+
     #
     # Exchange dtype and ndim
     # both have relatively constant sizes
@@ -213,7 +215,7 @@ def exchange_meta_for_halo_exchanger(
             raise EasierJitException(
                 f"runtime value {input} of type {type(input)} is not expected"
             )
-        
+
         if not torch.any(can_recv_from):
             raise EasierJitException(
                 "Unexpected HaloExchanger without any input"
@@ -278,10 +280,9 @@ def exchange_meta_for_halo_exchanger(
                 "ndim of HaloExchanger are not the same:"
                 f" {nzep_ndims}"
             )
-        
+
         ndim = int(nzep_ndims[0])
         shape_buffer = torch.full((ndim,), -1, dtype=torch.int64)
-
 
     shapes_buffer = _exchange(shape_buffer)
     if isinstance(input, torch.Tensor):
@@ -294,7 +295,7 @@ def exchange_meta_for_halo_exchanger(
                 f" {shapes_buffer[can_recv_from][:, 1:]}"
             )
         subshape = tuple(input.shape[1:])
-    
+
     else:
         assert isinstance(input, _Skipped)
 
@@ -310,12 +311,13 @@ def exchange_meta_for_halo_exchanger(
 
     return subshape, dtype
 
+
 def allgather_meta_for_collective_input(
     input: Union[torch.Tensor, _Skipped]
 ) -> Tuple[Tuple[int, ...], torch.dtype]:
     """
     This will be a fully collective call, all ranks must be involved.
-    
+
     Available scenarios include EASIER aggregators and Reducers.
     """
     dist_env = get_runtime_dist_env()
@@ -332,7 +334,7 @@ def allgather_meta_for_collective_input(
         )
 
     # The first communication API must be fully collective, to avoid getting
-    # mixed with P2P etc. 
+    # mixed with P2P etc.
     arg_skipped_flags = dist_env.all_gather_into_tensor(arg_skipped)
 
     # at least one rank has shape info
@@ -403,13 +405,14 @@ class EvaluationHandlerBase:
         For Selector/Reducer, we can use `normalize_selector_call_into_args`
         etc. to _normalize_ `*args **kwargs` into all positional args.
     """
+
     def __init__(self) -> None:
         # Let JitEngine initialize and wire up all registered Handlers.
         self.next: Optional[EvaluationHandlerBase] = None
         self.current_module: esr.Module
         self.current_graph: Graph
 
-        # 
+        #
         # Context variables, the lifetime is the scope of `Module.forward()`
         # =================
         #
@@ -417,7 +420,7 @@ class EvaluationHandlerBase:
         # created and managed by the JitEngine
         self.stackframe: Dict[Node, RuntimeValue]
 
-        # 
+        #
         # Context variables, the lifetime is the execution period of a Node.
         # =================
         self.current_node: Node
@@ -439,7 +442,7 @@ class EvaluationHandlerBase:
 
     def dispatch_node(
         self,
-        node: Node, 
+        node: Node,
         args: Tuple[RuntimeValue, ...],
         kwargs: Dict[str, RuntimeValue]
     ) -> RuntimeValue:
@@ -463,7 +466,7 @@ class EvaluationHandlerBase:
             submod_path = cast(str, node.target)
             callee = root.get_submodule(submod_path)
             val = self.if_call_module(callee, args, kwargs)
-        
+
         elif node.op == FX.OUTPUT:
             return None
 
@@ -496,7 +499,7 @@ class EvaluationHandlerBase:
         kwargs: Dict[str, RuntimeValue]
     ) -> RuntimeValue:
         return self._dispatch_next(args, kwargs)
-    
+
     def if_call_method(
         self,
         method_name: str,
@@ -504,7 +507,7 @@ class EvaluationHandlerBase:
         kwargs: Dict[str, RuntimeValue]
     ) -> RuntimeValue:
         return self._dispatch_next(args, kwargs)
-    
+
     def if_call_module(
         self,
         submod: torch.nn.Module,
@@ -525,6 +528,10 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
     Must be the innermost Handler.
     No more dispatch_next() i.e. super().if_xxx() is called.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+
     def dispatch_node(self, node: Node, args, kwargs):
         if self.is_skippable(node):
             # Skip according to the static metadata, so the result will be
@@ -534,13 +541,12 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         else:
             res = super().dispatch_node(node, args, kwargs)
 
-            # TODO handle _SKipped here
             self.handle_result_runtime_metadata(node, res)
 
         self.stackframe[node] = res
 
         return res
-    
+
     def is_skippable(self, node: Node):
         is_halo_exchanger = \
             node.op == FX.CALL_MODULE and isinstance(
@@ -549,12 +555,17 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             )
 
         node_meta = get_static_node_metadata(node)
-        
+
         return node_meta.role == Role.DISTRIBUTED \
             and node_meta.batch_size == 0 \
             and (not is_halo_exchanger)
-    
+
     def handle_result_runtime_metadata(self, node, res):
+        """
+        _Skipped() is not expected here.
+
+        Compare runtime metadata but not record/update it.
+        """
         node_meta = get_static_node_metadata(node)
         prev_runtime_meta = get_runtime_tensor_metadata(node)
 
@@ -618,7 +629,7 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             return args[0]
 
         return res
-    
+
     def if_call_method(self, method_name, args, kwargs) -> RuntimeValue:
         this, *other_args = args
 
@@ -626,23 +637,37 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             # TODO any cases in FX that non-tensor methods are called?
             # maybe `a.split().index(3)` -- `tuple.index` is called?
             raise EasierJitException(
-                "expect a method of torch.Tensor to be called,"
+                "Expect a method of torch.Tensor to be called,"
                 f" but method '{method_name}' of {type(this)} is called"
             )
-        
+
         this_method = getattr(this, method_name)
         # `getattr` on the instance `this` already binds the method to the obj
         # so we don't pass `this` as an argument anymore.
         res = this_method(*other_args, **kwargs)
         return res
-    
+
     def if_call_module(self, submod, args, kwargs) -> RuntimeValue:
+        """
+        About HaloExchanger:
+        -   input may have been skipped, if this HaloExchanger is recv-only.
+
+        About Reducer:
+        -   input may have been skipped, if this local Reducer is a part of
+            a not-full Reducer
+            -   no elemparts of the local output ElemPart are reduced to.
+            -   no HaloExchanger is inserted for such cases
+
+        -   input may be the output of a HaloExchanger, and is zero-length
+            -   input is not _Skipped
+            -   local Reducer.idx is zero-length, OK for Reducer.forward()
+        """
         if isinstance(submod, HaloExchanger):
             # Inserted by EASIER, input always on args[0]
             arg = args[0]
             if isinstance(arg, _Skipped):
                 args = (submod.zero_length_input,) + args[1:]
-        
+
         if isinstance(submod, esr.Reducer):
             input, opt_out = normalize_reducer_call_into_args(*args, **kwargs)
             if isinstance(input, _Skipped):
@@ -667,15 +692,18 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                     )
 
                     return out
-            
+
             # P.S. local Reducer.idx may be zero-length, but forward() and
             # scatter_reduce_() within can handle it.
-        
+
         res = submod(*args, **kwargs)
         return res
 
 
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
+    def __init__(self) -> None:
+        super().__init__()
+
     def is_skippable(self, node: Node):
         """
         Additional to HaloExchanger, in the first run we need to exchange
@@ -687,10 +715,11 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
                 self.current_module.get_submodule(cast(str, node.target)),
                 esr.Reducer
             )
-         
+
         return (not is_reducer) and super().is_skippable(node)
 
     def handle_result_runtime_metadata(self, node, res):
+        # Record but not compare.
         node_meta = get_static_node_metadata(node)
         result_runtime_meta = tree_map(
             res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
@@ -712,13 +741,12 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             )
 
         return super().if_call_function(function, args, kwargs)
-        
 
     def if_call_module(self, submod, args: tuple, kwargs: dict):
         if isinstance(submod, HaloExchanger):
             subshape, dtype = exchange_meta_for_halo_exchanger(submod, args[0])
             submod.prepare_buffers(subshape, dtype)
-        
+
         if isinstance(submod, esr.Reducer):
             subshape, dtype = allgather_meta_for_collective_input(args[0])
             set_runtime_tensor_metadata(
@@ -729,7 +757,6 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             )
 
         return super().if_call_module(submod, args, kwargs)
-
 
 
 class JitEngine:
@@ -756,12 +783,11 @@ class JitEngine:
             prev = handlers[i]
             next = handlers[i + 1]
             prev.next = next
-        
+
         for h in handlers:
             h.current_module = self.module
             h.current_graph = self.graph
 
-    
     def forward(self):
         if self.run_count == 0:
             ms, gs = [self.module], [self.graph]
@@ -777,7 +803,6 @@ class JitEngine:
             handlers = self.runtime_handlers
         outermost_handler = handlers[0]
 
-        
         stackframe: Dict[Node, RuntimeValue] = {}
         for h in handlers:
             h.stackframe = stackframe
@@ -789,7 +814,7 @@ class JitEngine:
                 return stackframe[x]
             else:
                 return x
-        
+
         for node in list(self.graph.nodes):
             args = tuple(tree_map(v, _eval) for v in node.args)
             kwargs = {k: tree_map(v, _eval) for k, v in node.kwargs.items()}
@@ -808,4 +833,3 @@ class JitEngine:
         stackframe.clear()
 
         self.run_count += 1
-

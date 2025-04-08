@@ -19,6 +19,7 @@ from ..utils import \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode
 from tests.core.utils import multi_stage_zero_length_partition
 
+
 class Model(esr.Module):
     def __init__(self, nf, device='cpu') -> None:
         super().__init__()

@@ -144,7 +144,7 @@ class HaloExchanger(torch.nn.Module):
                 (batchsize,) + element_tensor_shape,
                 dtype=dtype, device=device
             )
-        
+
         self.zero_length_input = _get_buffer(0)
 
         if self.concat_buffer_length is None:
@@ -192,7 +192,7 @@ class HaloExchanger(torch.nn.Module):
                     isend = dist_env.def_isend(local[lidx], u, tag=u)
                     p2p_ops.append(isend)
 
-        # When Selector has no recvs, 
+        # When Selector has no recvs,
         # send halos if there are any, then,
         # don't bother writing a chunk, but directly return the input tensor.
         if self.concat_buffer is None:
@@ -222,7 +222,7 @@ class HaloExchanger(torch.nn.Module):
                         recv_buffers.append(
                             local[self.runtime_halos_lidxes[dist_env.rank]]
                         )
-                
+
                 else:
                     # No local element is read, add an empty tensor.
                     # Because the list to concat needs at least one tensor.

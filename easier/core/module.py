@@ -413,7 +413,7 @@ class Reducer(nn.Module):
             raise ValueError(
                 f"{out.shape[0]} the length of the first dimension of `out`"
                 f" and {self.n} the specified `Reducer.n` do not match")
-        
+
         idx = self.idx[
             (...,) + (None,) * (len(shape) - 1)].expand(-1, *shape[1:])
         return out.scatter_reduce_(0, idx, tensor, self.reduce,

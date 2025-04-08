@@ -310,7 +310,7 @@ def reorder_input_by_reducer(
         halo_out.shape[0] for halo_out in unordered_halo_lidxes_to_others
     ) == input_elempart_to_reorder.idx.shape[0], \
         "each input_elempart element is used once as the halo"
-    
+
     _reordered_output_gidx_on_this, reordered_input_gidx_to_this, _pos = \
         zipsort_using_order(
             order=output_elempart.idx,

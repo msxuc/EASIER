@@ -340,7 +340,7 @@ def partition_tensor_groups_with_adjmat(
     # Invoke partition
     #
 
-    # TODO tensor_group_partition didn't handle the cases well 
+    # TODO tensor_group_partition didn't handle the cases well
     # where the number of vertexes is less than the world size.
     # (although such lightweight cases do not need distribution at all)
 

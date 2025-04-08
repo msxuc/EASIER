@@ -302,6 +302,7 @@ class TestJittedUsage:
             init_type=dev_type  # type: ignore
         )
 
+
 def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     torch.manual_seed(2345)
     m = Model(3, 'cpu')
@@ -381,7 +382,8 @@ class NotFullModel(esr.Module):
     def __init__(self):
         super().__init__()
 
-        self.vertex = esr.Tensor(torch.arange(2, 20).double(), mode='partition')
+        self.vertex = esr.Tensor(torch.arange(
+            2, 20).double(), mode='partition')
         self.edge = esr.Tensor(torch.arange(2, 5).double(), mode='partition')
         self.selector = esr.Selector(torch.arange(3) // 2)
         self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)
@@ -397,6 +399,7 @@ class NotFullModel(esr.Module):
             + esr.max(self.edge) * 3.4 \
             + esr.min(self.edge) * 4.5 \
             + esr.norm(self.edge, p=2)
+
 
 def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     m = NotFullModel()
@@ -419,6 +422,7 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     torch.testing.assert_close(collected_e, orig_e)
     torch.testing.assert_close(collected_r, orig_r)
 
+
 @pytest.mark.parametrize('dev_type', [
     'cpu',
     pytest.param('cuda', marks=when_ngpus_ge_2)
@@ -435,7 +439,7 @@ class TestZeroLengthPartition:
             4 if dev_type == 'cpu' else 2,
             worker__test_zerolength_save, (dev_type,), init_type=dev_type
         )
-    
+
     def test_smoke_zerolength_notfull(self, dev_type):
         torchrun_singlenode(
             4 if dev_type == 'cpu' else 2,

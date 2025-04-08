@@ -40,6 +40,7 @@ class Role(enum.Enum):
     # (but if it's HaloExchanger, even if batch size == 0 it must be run)
     DISTRIBUTED = 1
 
+
 @dataclasses.dataclass(frozen=True, eq=True)
 class StaticNodeMeta:
     """
@@ -52,7 +53,7 @@ class StaticNodeMeta:
     the same role/batch_size info.
     """
     role: Role
-    
+
     # For Role.REPLICATED, batch_size is always 0
     batch_size: int
 
@@ -81,12 +82,14 @@ class RuntimeTensorMeta:
     shape: Tuple[int, ...]
     dtype: torch.dtype
 
+
 StructuredTensorMeta: TypeAlias = Union[
     RuntimeTensorMeta,
     Sequence['StructuredTensorMeta']
 ]
 
 _replica = StaticNodeMeta(Role.REPLICATED, 0)
+
 
 class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
     """
@@ -99,6 +102,7 @@ class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
     This class should only be used on well-validated and rewritten Graphs,
     so we don't need to validate with details again.
     """
+
     def __init__(self, modules, graphs) -> None:
         super().__init__(modules, graphs)
 
@@ -106,7 +110,7 @@ class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
         meta = super().for_each_node()
         self.current_node.meta[KEY__METADATA_STATIC] = meta
         return meta
-    
+
     def if_get_attr(
         self, submod_path: str, attr_name: str, attr_val
     ) -> StaticNodeMeta:
@@ -135,19 +139,18 @@ class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
             assert len(dist_in_metas) == 1, \
                 "EASIER aggregator input should be distributed"
             return _replica
-        
+
         assert len(dist_in_metas) <= 1
         if len(dist_in_metas) == 1:
             meta = dist_in_metas.pop()
             return meta
         else:
             return _replica
-    
-    
+
     def if_call_module(self, submod: nn.Module) -> StaticNodeMeta:
         if isinstance(submod, _EsrMod.Module):
             return _replica
-        
+
         if isinstance(submod, _EsrMod.Selector):
             return StaticNodeMeta(Role.DISTRIBUTED, submod.idx.shape[0])
 
@@ -157,14 +160,14 @@ class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
             # that the two input metas are not the same, therefore we'll have
             # `len(in_metas) == 2`
             return StaticNodeMeta(Role.DISTRIBUTED, submod.n)
-        
+
         if isinstance(submod, HaloExchanger):
             return StaticNodeMeta(
                 Role.DISTRIBUTED, submod.output_batch_size
             )
 
         assert False, 'unreachable'
-    
+
     def if_output(self) -> StaticNodeMeta:
         return _replica
 
@@ -188,6 +191,7 @@ def get_static_node_metadata(node: Node) -> StaticNodeMeta:
 
 def set_runtime_tensor_metadata(node: Node, tensor_meta: StructuredTensorMeta):
     node.meta[KEY__METADATA_RUNTIME] = tensor_meta
+
 
 def get_runtime_tensor_metadata(node: Node) -> StructuredTensorMeta:
     return node.meta[KEY__METADATA_RUNTIME]

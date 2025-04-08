@@ -83,7 +83,7 @@ def multi_stage_zero_length_partition(
             end = per_worker_len * (part + 1)
 
         return start, end
-    
+
     def _metis_wrapper_0len(*args, **kwargs) -> Tuple[int, torch.Tensor]:
         # only run on rank-0
         # before uncoarsening (and refinement)
@@ -92,7 +92,7 @@ def multi_stage_zero_length_partition(
         ncuts = ncuts + 999
         membership[membership == 0] = 1
         return ncuts, membership
-    
+
     def _kway_0len(*args, **kwargs):
         # each worker has a part of membership tensor
         # after uncoarsening (and refinement)
@@ -173,13 +173,13 @@ def multi_stage_zero_length_partition(
     with patch(
         f'{dataloader_module}.{_get_offset_exactly_nparts.__name__}',
     ) as dt_mock, \
-    patch(
+        patch(
         f'{distpart_module}.{_metis.__name__}',
     ) as metis_mock, \
-    patch(
+        patch(
         f'{tensor_partition_module}.{_kway.__name__}',
     ) as kway_mock, \
-    patch(
+        patch(
         f'{tensor_partition_module}.{_sync_elempart.__name__}',
     ) as sync_ep_mock:
         dt_mock.side_effect = _get_dt_nparts_0len
@@ -190,7 +190,7 @@ def multi_stage_zero_length_partition(
         yield
 
         dt_mock.assert_called()
-        if rank == 0:       
+        if rank == 0:
             metis_mock.assert_called_once()
         kway_mock.assert_called_once()
         sync_ep_mock.assert_called_once()
