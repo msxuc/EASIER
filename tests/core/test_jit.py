@@ -308,9 +308,9 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     [m] = esr.compile([m], backend='none')
     m()
 
-    orig_vertex = m.vertex_tensor.clone().cpu()
-    orig_edge = m.edge_tensor.clone().cpu()
-    orig_replica = m.tensor.clone().cpu()
+    orig_vertex = m.vertex_tensor.clone()
+    orig_edge = m.edge_tensor.clone()
+    orig_replica = m.tensor.clone()
 
     torch.manual_seed(2345)
     m = Model(3, 'cpu')
@@ -318,10 +318,6 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
         [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
-    
-    import easier.core.runtime.dist_env as D
-    D.start = True
-
     jitted()
 
     # Simple test that partition is really done.
@@ -332,12 +328,9 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     collected_vertex = jitted.vertex_tensor.collect()
     collected_edge = jitted.edge_tensor.collect()
     collected_replica = jitted.tensor.collect()
-    assert collected_vertex.device.type == dev_type
-    assert collected_edge.device.type == dev_type
-    assert collected_replica.device.type == dev_type
-    torch.testing.assert_close(collected_vertex.cpu(), orig_vertex)
-    torch.testing.assert_close(collected_edge.cpu(), orig_edge)
-    torch.testing.assert_close(collected_replica.cpu(), orig_replica)
+    torch.testing.assert_close(collected_vertex, orig_vertex)
+    torch.testing.assert_close(collected_edge, orig_edge)
+    torch.testing.assert_close(collected_replica, orig_replica)
 
 
 def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
