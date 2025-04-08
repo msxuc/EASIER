@@ -382,8 +382,9 @@ class NotFullModel(esr.Module):
     def __init__(self):
         super().__init__()
 
-        self.vertex = esr.Tensor(torch.arange(
-            2, 20).double(), mode='partition')
+        self.vertex = esr.Tensor(
+            torch.arange(2, 20).double(), mode='partition'
+        )
         self.edge = esr.Tensor(torch.arange(2, 5).double(), mode='partition')
         self.selector = esr.Selector(torch.arange(3) // 2)
         self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)

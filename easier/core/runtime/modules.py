@@ -142,7 +142,8 @@ class HaloExchanger(torch.nn.Module):
         def _get_buffer(batchsize: int):
             return torch.empty(
                 (batchsize,) + element_tensor_shape,
-                dtype=dtype, device=device
+                dtype=dtype,
+                device=device
             )
 
         self.zero_length_input = _get_buffer(0)

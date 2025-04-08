@@ -63,7 +63,7 @@ class StaticNodeMeta:
         elif self.role == Role.DISTRIBUTED:
             assert self.batch_size >= 0
         else:
-            assert f'bad value {self}'
+            assert False, f'bad value {self}'
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -131,7 +131,8 @@ class StaticMetadataPropagator(EasierInterpreter[StaticNodeMeta]):
         # Role, and it can store the Role e.g. using a special wrapper function
         # easier.all_reduce and the information remains in the dump.
         in_metas = set(
-            get_static_node_metadata(n) for n in self.current_node.all_input_nodes
+            get_static_node_metadata(n)
+            for n in self.current_node.all_input_nodes
         )
         dist_in_metas = in_metas - set([_replica])
 

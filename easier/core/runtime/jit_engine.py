@@ -169,7 +169,8 @@ def exchange_meta_for_halo_exchanger(
         to_send = to_send.to(dist_env.comm_device)
         recv_buffer = torch.empty(
             (dist_env.world_size,) + to_send.shape,
-            dtype=to_send.dtype, device=dist_env.comm_device
+            dtype=to_send.dtype,
+            device=dist_env.comm_device
         )
         p2p_ops = []
 

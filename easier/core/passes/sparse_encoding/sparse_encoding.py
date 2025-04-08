@@ -217,6 +217,7 @@ def reorder_output_by_selector(
     """
     For Selector, it's the output_elempart to encode sparsity into.
     """
+
     input_idx_part, output_idx_part = \
         get_selector_reducer_idx_partition_pair(selector)
     input_gidx_to_this, output_gidx_on_this = calculate_paired_in_out_idx(
