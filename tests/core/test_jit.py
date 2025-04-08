@@ -389,34 +389,41 @@ class NotFullModel(esr.Module):
         super().__init__()
 
         self.vertex = esr.Tensor(torch.arange(2, 20).double(), mode='partition')
+        self.edge = esr.Tensor(torch.arange(2, 5).double(), mode='partition')
         self.selector = esr.Selector(torch.arange(3) // 2)
         self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)
         self.replica = esr.Tensor(torch.zeros([1]).double(), mode='replicate')
 
     def forward(self):
-        self.vertex[:] += self.reducer(self.selector(self.vertex))
+        self.edge[:] += self.selector(self.vertex)
+        self.vertex[:] += self.reducer(self.edge)
 
         self.replica[:] \
-            = esr.sum(self.vertex) * 1.2 \
-            + esr.prod(self.vertex) * 2.3 \
-            + esr.max(self.vertex) * 3.4 \
-            + esr.min(self.vertex) * 4.5 \
-            + esr.norm(self.vertex, p=2)
+            = esr.sum(self.edge) * 1.2 \
+            + esr.prod(self.edge) * 2.3 \
+            + esr.max(self.edge) * 3.4 \
+            + esr.min(self.edge) * 4.5 \
+            + esr.norm(self.edge, p=2)
 
 def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     m = NotFullModel()
     [jitted] = esr.compile([m], backend='none')
     jitted()
     orig_v = jitted.vertex.clone().cpu()
+    orig_e = jitted.edge.clone().cpu()
     orig_r = jitted.replica.clone().cpu()
 
     m = NotFullModel()
     [jitted] = esr.compile([m], backend=dev_type)
     jitted()
     collected_v = jitted.vertex.collect().cpu()
+    collected_e = jitted.edge.collect().cpu()
     collected_r = jitted.replica.collect().cpu()
 
+    print(orig_v, orig_e, orig_r)
+
     torch.testing.assert_close(collected_v, orig_v)
+    torch.testing.assert_close(collected_e, orig_e)
     torch.testing.assert_close(collected_r, orig_r)
 
 @pytest.mark.parametrize('dev_type', [

@@ -290,13 +290,13 @@ def exchange_meta_for_halo_exchanger(
 
     return subshape, dtype
 
-def allgather_meta_for_aggregator(
-    function,
+def allgather_meta_for_collective_input(
     input: Union[torch.Tensor, _Skipped]
 ) -> Tuple[Tuple[int, ...], torch.dtype]:
     """
-    This will be a fully collective call, all ranks must be involved in
-    EASIER aggregators.
+    This will be a fully collective call, all ranks must be involved.
+    
+    Available scenarios include EASIER aggregators and Reducers.
     """
     dist_env = get_runtime_dist_env()
 
@@ -311,8 +311,8 @@ def allgather_meta_for_aggregator(
             f"runtime value {input} of type {type(input)} is not expected"
         )
 
-    # The first communication API must be the same API and involving the same
-    # set of workers.
+    # The first communication API must be fully collective, to avoid getting
+    # mixed with P2P etc. 
     arg_skipped_flags = dist_env.all_gather_into_tensor(arg_skipped)
 
     # at least one rank has shape info
@@ -500,16 +500,7 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
     No more dispatch_next() i.e. super().if_xxx() is called.
     """
     def dispatch_node(self, node: Node, args, kwargs):
-        is_halo_exchanger = \
-            node.op == FX.CALL_MODULE and isinstance(
-                self.current_module.get_submodule(cast(str, node.target)),
-                HaloExchanger
-            )
-
-        node_meta = get_static_node_metadata(node)
-        if node_meta.role == Role.DISTRIBUTED \
-        and node_meta.batch_size == 0 \
-        and (not is_halo_exchanger):
+        if self.is_skippable(node):
             # Skip according to the static metadata, so the result will be
             # consistent among sessions.
             res = _skipped
@@ -523,6 +514,19 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         self.stackframe[node] = res
 
         return res
+    
+    def is_skippable(self, node: Node):
+        is_halo_exchanger = \
+            node.op == FX.CALL_MODULE and isinstance(
+                self.current_module.get_submodule(cast(str, node.target)),
+                HaloExchanger
+            )
+
+        node_meta = get_static_node_metadata(node)
+        
+        return node_meta.role == Role.DISTRIBUTED \
+            and node_meta.batch_size == 0 \
+            and (not is_halo_exchanger)
     
     def handle_result_runtime_metadata(self, node, res):
         node_meta = get_static_node_metadata(node)
@@ -577,7 +581,6 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                 )
                 args = (arg_neutral,) + args[1:]
 
-        logger.info(self.current_node.format_node())
         res = function(*args, **kwargs)
 
         if function is operator.setitem:
@@ -615,46 +618,52 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                 args = (submod.zero_length_input,) + args[1:]
         
         if isinstance(submod, esr.Reducer):
-            # For not-full Reducer, on some workers, the rewritten idx may be
-            # empty, meaning all input elemparts are sent to other workers,
-            # and no output elempart are reduced into
-            # -- these cases are handled by Reducer.forward(), to return the
-            # given `out` or forward()-created zero tensors.
-            # TODO first handle the creation of out if input is SKipped
-            # TODO will the idx.shape[0] == 0 still matter?
-
             input, opt_out = normalize_reducer_call_into_args(*args, **kwargs)
             if isinstance(input, _Skipped):
+                # Pre-Reducer HaloExchanger won't be skipped;
+                # Empty input ElemPart won't have reordering Selector.
                 if opt_out is not None:
-                    return opt_out  # may be _Skipped too
+                    return opt_out
 
                 else:
                     dist_env = get_runtime_dist_env()
-
-                    out = torch.zeros(
-                        (submod.n),
-                        dtype=torch.float64,
-                        device=dist_env.comm_device
-                    )
-                    return out
-
                     result_runtime_meta = get_runtime_tensor_metadata(
                         self.current_node
                     )
                     assert isinstance(result_runtime_meta, RuntimeTensorMeta)
                     assert result_runtime_meta.role == Role.DISTRIBUTED
+
+                    # Same as Reducer.forward()
                     out = torch.zeros(
                         result_runtime_meta.shape,
                         dtype=result_runtime_meta.dtype,
                         device=dist_env.comm_device
                     )
+
                     return out
+            
+            # P.S. local Reducer.idx may be zero-length, but forward() and
+            # scatter_reduce_() within can handle it.
         
         res = submod(*args, **kwargs)
         return res
 
 
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
+    def is_skippable(self, node: Node):
+        """
+        Additional to HaloExchanger, in the first run we need to exchange
+        meta for possible skipped inputs to Reducers, so we enforce the
+        evaluation of Reducers too.
+        """
+        is_reducer = \
+            node.op == FX.CALL_MODULE and isinstance(
+                self.current_module.get_submodule(cast(str, node.target)),
+                esr.Reducer
+            )
+         
+        return (not is_reducer) and super().is_skippable(node)
+
     def handle_result_runtime_metadata(self, node, res):
         node_meta = get_static_node_metadata(node)
         result_runtime_meta = tree_map(
@@ -668,10 +677,12 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             # If on some ranks the input Node is skipped, NodeEvalHandler
             # will use that resultant runtime metadata to create a neutral
             # input.
-            subshape, dtype = allgather_meta_for_aggregator(function, args[0])
+            subshape, dtype = allgather_meta_for_collective_input(args[0])
             set_runtime_tensor_metadata(
                 self.current_node,
-                RuntimeTensorMeta(Role.REPLICATED, (1,) + subshape, dtype)
+                RuntimeTensorMeta(
+                    Role.REPLICATED, (1,) + subshape, dtype
+                )
             )
 
         return super().if_call_function(function, args, kwargs)
@@ -683,7 +694,13 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             submod.prepare_buffers(subshape, dtype)
         
         if isinstance(submod, esr.Reducer):
-            pass
+            subshape, dtype = allgather_meta_for_collective_input(args[0])
+            set_runtime_tensor_metadata(
+                self.current_node,
+                RuntimeTensorMeta(
+                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype
+                )
+            )
 
         return super().if_call_module(submod, args, kwargs)
 
