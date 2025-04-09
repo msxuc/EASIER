@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import itertools
 import operator
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast, FrozenSet
+    Type, Union, Callable, cast, FrozenSet, TYPE_CHECKING
 from typing_extensions import TypeAlias
 
 import torch
@@ -13,10 +13,8 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-from easier.core.passes.metadata_propagation.metadata import \
-    EasierTensorMeta, Role, View, ViewType, get_node_meta
-from easier.core.passes.metadata_propagation.utils import \
-    Validation as MetaV
+from easier.core.passes.metadata_propagation import \
+    StaticNodeMeta
 
 from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
@@ -24,19 +22,8 @@ import easier.core.module as esr
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, tree_map
 
-# `ViewSrc` are Nodes that:
-# - represent individual storage of the tensors.
-# - are the torch operations that allocate the memory blocks for the tensors;
-#
-# The `metadata.View.src` carries the storage identities.
-#
-# However, metadata propagation leaves the view sources to be None for the
-# `type==ALLOCATED` cases (but the source Node will be very obvious though),
-# we need to pick up the associated Nodes first.
-ViewSrc: TypeAlias = Union[
-    Node,               # non-multi-result Nodes, including get_attr
-    Tuple[Node, int],   # item of multi-result Nodes
-]
+if TYPE_CHECKING:
+    from easier.core.runtime.jit_engine import RuntimeValue
 
 KEY__DATA_DEPENDENCY_INPUTS = 'easier_dataDependency_inputs'
 KEY__DATA_DEPENDENCY_USERS = 'easier_dataDependency_users'
@@ -52,47 +39,90 @@ def get_data_dependency_users(node: Node) -> List[Node]:
     return list(node.meta.get(KEY__DATA_DEPENDENCY_USERS, []))
 
 
+def _collect_addrs(
+    runtime_vals: Union['RuntimeValue', list]
+) -> OrderedSet[int]:
+    addrs = OrderedSet()
+
+    def _insert(x):
+        if isinstance(x, torch.Tensor):
+            # ignoring strides/offsets
+            addr: int = x.storage().data_ptr()
+            addrs.add(addr)
+        
+    _ = tree_map(runtime_vals, _insert)
+    return addrs
+
+
 class DataDependencyAnalyzer(EasierInterpreter):
     """
-    Some Nodes (Node-plus-index for multi-result operators like `linalg.svd`)
-    are themselves representing, or 1:1-corresponding to,
-    the view sources (e.g. the underlying memory blocks),
-    i.e. when `get_node_meta(node).view_info.type == ViewType.ALLOCATED`.
-
     When a Node/tensor X is used as an argument to another Node/operation F,
-    we say F does a reading operation on the view source under X;
+    we say F does a reading operation on the memory under X;
     similarily, when a argument Node/tensor Y is inplace modified by F,
-    we say F does a writing operation on the view source under Y.
+    or the operation F allocates the memory of Y,
+    we say F does a writing operation on the memory under Y.
 
     Along the node list as the original EASIER program runs, at different
-    timings/Nodes, a view source may be modified (and maybe multiple times!).
+    timings/Nodes, a memory may be modified (and maybe multiple times!).
     Those modifying timings/Nodes become barriers.
-    Any operation/Node that directly reads/writes a view source, cannot be
-    reordered across any barrier formed by specifically that view source.
-    (i.e. crossing barrier of other view sources does not matter.)
+    Any operation/Node that directly reads/writes a memory, cannot be
+    reordered across any barrier formed by specifically that memory.
+    (i.e. crossing barrier of other memory does not matter.)
 
     This Analyzer will add data dependency edges between those reader/writers
     Nodes to express such barrier-like constraints.
-    """
 
-    def __init__(self, modules: Sequence[esr.Module], graphs: Sequence[Graph]):
+    We present a memory by its memory address, ignoring strides/offsets
+    introduced by the PyTorch view operations e.g. X[:, :, 2]
+    Also, the addresses are in the same memory space i.e. CPU or CUDA memory.
+    """
+    def __init__(
+        self,
+        modules: Sequence[esr.Module],
+        graphs: Sequence[Graph],
+        stackframe: Dict[Node, 'RuntimeValue']
+    ):
+        """
+        Args:
+        -   stackframe:
+                the snapshot of the stackframe from the runtime,
+                no memory space should be reused during the execution
+                (i.e. not used tensors should not be released)
+        """
+        assert len(modules) == len(graphs) == 1, \
+            "One module/graph at a time, avoid adding dep edges cross graphs"
+            # otherwise, 1) provide multiple stackframes,
+            # 2) clear add2readers/write when switching current_graph.
+
         super().__init__(modules, graphs)
+
+        self.stackframe = stackframe
+        
+        # TODO this requires, in the runtime, intermediate results are
+        # not released even if it's no longer used.
+        # Otherwise, there will be conflicts for simple `int` addresses.
+        self.addr2srcnode: Dict[int, Node] = {}
+
+        for node, val in stackframe.items():
+            for addr in _collect_addrs(val):
+                if addr not in self.addr2srcnode:
+                    self.addr2srcnode[addr] = node
+
 
         # Each writer Node refreshes the status of a view source;
         # All subsequent readers, and the next writer, have
         # data dependency on this writer.
-        self.src2writer: Dict[ViewSrc, Node] = {}
-
-        self.src2readers: Dict[ViewSrc, OrderedSet[Node]] = {}
-
+        #
+        # The source Node itself is NOT??? included.
+        #
         # When a writer Node (e.g. Reducer-with-out) is never referred
         # in dataflow, it will still be added to src2writer,
         # but may not be touched anymore, e.g. no more writers/readers torch
         # the same view source of `out=x`.
-        #
-        # TODO currently no more dep edges will come out of that writer Node.
-        # But as commented under `if_output` handlers, we may need to add
-        # dep edges from such writer Nodes to the `output` Node.
+        self.addr2writer: Dict[int, Node] = {}
+
+        self.addr2readers: Dict[int, OrderedSet[Node]] = {}
+
 
     def add_data_dependency_edge(self, src: Node, dst: Node):
         if src is dst:
@@ -106,9 +136,11 @@ class DataDependencyAnalyzer(EasierInterpreter):
 
         # Use OrderedSet to deduplicate.
         dep_inputs: OrderedSet[Node] = dst.meta.setdefault(
-            KEY__DATA_DEPENDENCY_INPUTS, OrderedSet())
+            KEY__DATA_DEPENDENCY_INPUTS, OrderedSet()
+        )
         dep_users: OrderedSet[Node] = src.meta.setdefault(
-            KEY__DATA_DEPENDENCY_USERS, OrderedSet())
+            KEY__DATA_DEPENDENCY_USERS, OrderedSet()
+        )
 
         # Since we traverse each Node in the node list once, and have avoid
         # above cases, we won't add redundant data dependency edges between
@@ -117,34 +149,32 @@ class DataDependencyAnalyzer(EasierInterpreter):
         dep_inputs.add(src)
         dep_users.add(dst)
 
-    def add_viewsrc_reader(self, view_src: ViewSrc):
+    def add_reader_dependency(self, arg_addr: int):
         """
-        Add the current node as a reader to the specified view src.
+        Add the current node as a reader to the memory at `arg_addr`.
         """
         reader = self.current_node
 
-        latest_writer = self.src2writer.get(view_src, None)
-        if latest_writer is not None:
-            self.add_data_dependency_edge(latest_writer, reader)
+        latest_writer = self.addr2writer[arg_addr]
+        self.add_data_dependency_edge(latest_writer, reader)
 
         # Other readers in the same barrier-barrier region.
         # Since the next writer will be enforced to be after these readers,
         # between these readers we do not need a order.
-        readers = self.src2readers.get(view_src, None)
-        if readers is None:
-            readers = OrderedSet()
-            self.src2readers[view_src] = readers
-
+        readers = self.addr2readers.setdefault(arg_addr, OrderedSet())
         readers.add(reader)
 
-    def add_viewsrc_writer(self, view_src: ViewSrc):
+    def add_writer_dependency(self, res_addr: int):
         """
-        Add the current node as a writer to the specified view src.
+        Add the current node as a writer to the memory at `res_addr`.
+        Including the operation that allocates the memory.
         """
         writer = self.current_node
 
-        prev_writer: Optional[Node] = self.src2writer.get(view_src, None)
-        prev_readers: Iterable[Node] = self.src2readers.get(view_src, [])
+        # If current_node is the operation that allocates, we get no prev
+        # writers.
+        prev_writer: Optional[Node] = self.addr2writer.get(res_addr, None)
+        prev_readers: Iterable[Node] = self.addr2readers.get(res_addr, [])
 
         # By concat-ing prev_write with prev_reads, we add a dedicated dep edge
         # between the two writes, even there are reads between them, e.g.
@@ -167,59 +197,33 @@ class DataDependencyAnalyzer(EasierInterpreter):
             self.add_data_dependency_edge(prev, writer)
 
         # refresh the status of the view src ("add a barrier")
-        self.src2writer[view_src] = writer
-        self.src2readers[view_src] = OrderedSet()
+        self.addr2writer[res_addr] = writer
+        self.addr2readers[res_addr] = OrderedSet()
 
-    def get_view_src(self, arg: Node) -> ViewSrc:
-        arg_meta = MetaV.assert_non_structured(arg)
-        view_info = arg_meta.view_info
+    def for_each_node(self):
+        # Some ops may take multiple input writable tensors, and the result
+        # will be a tuple of those tensors themselves.
+        #
+        # JitEngine also executes and records `operator.setitem` in this way.
+        #
+        # TODO any FX-traceable torch ops violate this convention? Or any way
+        # to detect if the violation happens?
+        #
+        res_addrs: OrderedSet[int] = _collect_addrs(
+            self.stackframe[self.current_node]
+        )
+        arg_addrs: OrderedSet[int] = _collect_addrs([
+            self.stackframe[arg_node]
+            for arg_node in self.current_node.all_input_nodes
+        ])
 
-        if view_info.src is None:
-            assert view_info.type == ViewType.ALLOCATED
-            return arg
+        for arg_addr in arg_addrs:
+            self.add_reader_dependency(arg_addr)
+        for res_addr in res_addrs:
+            self.add_writer_dependency(res_addr)
 
-        else:
-            assert view_info.src is not None
-            return view_info.src
-
-    def handle_any_writing_operation(self):
-        """
-        Handle if any writing operation into (the view src of) the argument
-        pointed by `easier_is_inplace: Optional[Node]` of node current node.
-        """
-        inplace_arg = self.current_node.meta.get('easier_is_inplace', None)
-        if inplace_arg is not None:
-            assert isinstance(inplace_arg, Node)
-
-            inplace_arg_meta = MetaV.assert_non_structured(inplace_arg)
-            inplace_arg_view_info = inplace_arg_meta.view_info
-            assert not (
-                inplace_arg_view_info.type == ViewType.ALLOCATED
-                and inplace_arg_view_info.is_multi_result_item()
-            ), \
-                "must have already been converted to a derived view by" \
-                " operator.getitem MetaRule"
-
-            arg_view_src = self.get_view_src(inplace_arg)
-
-            self.add_viewsrc_writer(arg_view_src)
-
-    def handle_reading_operation(self, arg: Node):
-        """
-        Handle one reading operation to (the view src of) some argument
-        of the current node.
-
-        NOTE being actually a syntactic structure, getting-item out of a
-        multi-result torch op must not be regarded as a reading operation here
-        and must be handled elsewhere (in `if_function_or_method`).
-        """
-        arg_view_src = self.get_view_src(arg)
-        self.add_viewsrc_reader(arg_view_src)
-
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        # FX deduplicates if two esr.Module attributes refer to the same
-        # esr.Tensor, so we can directly use the Node itself as ViewSrc.
-        self.add_viewsrc_reader(self.current_node)
+        # Handle more specific scenarios like nested esr.Module calls
+        return super().for_each_node()
 
     # TODO
     # Some functions are purely manipulating the views, e.g.
@@ -228,35 +232,13 @@ class DataDependencyAnalyzer(EasierInterpreter):
     # it's actually safe to move `a2 a3` around.
     # We might omit adding data dependency edges on them if needed.
 
-    def if_function_or_method(self, op_callable):
-        for arg in self.current_node.all_input_nodes:
-            arg_meta = get_node_meta(arg)
-            if not isinstance(arg_meta, EasierTensorMeta):
-                # Special case: getitem out of a multi-return op
-                # the multi-return op won't be referred elsewhere.
-                # However `op.getitem` also serves for tensor slicing.
-                assert op_callable is operator.getitem
-                continue
-
-            self.handle_reading_operation(arg)
-
-        # mark write after reads.
-        self.handle_any_writing_operation()
-
     def if_call_module(self, submod: nn.Module):
-
-        # Currently we inline both esr.Module and torch.Module, so nested
-        # esr.Module calls simply become a plain one-layer graph, where
-        # call_module is only about primitive Selector or Reducer.
-        # However, when we switch to NOT INLINE esr.Module, we need to:
-        # TODO propagate inside-esr.Module R/W dependency to outer esr.Modules
-        assert type(submod) in [esr.Reducer, esr.Selector]
-
-        for arg in self.current_node.all_input_nodes:
-            MetaV.assert_non_structured(arg)
-            self.handle_reading_operation(arg)
-
-        self.handle_any_writing_operation()
+        if isinstance(submod, esr.Module):
+            # A nested esr.Module call has no input/output, data dependency
+            # may occur through esr.Tensor instances the inner Module
+            # shares/writes.
+            # TODO we may identify the concrete intersection set of esr.Tensors
+            return
 
     def if_output(self):
         # TODO output is strictly a syntactic element, but since FX has
@@ -264,13 +246,17 @@ class DataDependencyAnalyzer(EasierInterpreter):
         # to all side-effectful Nodes that do not have output Node as a
         # descendent, to ensure in subsequent graph manipulation, output will
         # not be incorrectly reordered upwards and deactivate those Nodes.
-        return None
+        return
 
 
-def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):
+def analyze_data_dependency(
+    modules: List[esr.Module],
+    graphs: List[Graph],
+    stackframe: Dict[Node, 'RuntimeValue']
+):
     """
     PyTorch operations that take Nodes/tensors as inputs and return a
-    Node(itself)/tensor, are actually reading/writing the storage
+    Node(itself)/tensor, are actually reading/writing the storage/memory
     underneath those Nodes/tensors.
 
     The idea of "views" informs that different Nodes/tensors may refer to the
@@ -286,6 +272,6 @@ def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):
     dataflow edges (between node inputs/users) to ensure numerical correctness
     with tensor-writing operations like `y[:]=x` or `Reducer.forward(out=x)`.
     """
-    DataDependencyAnalyzer(modules, graphs).run()
+    DataDependencyAnalyzer(modules, graphs, stackframe).run()
 
     return modules, graphs

@@ -825,6 +825,7 @@ class JitEngine:
         if self.run_count == 0:
             ms, gs = [self.module], [self.graph]
 
+            ms, gs = passes.analyze_data_dependency(ms, gs, stackframe)
             # ms, gs = passes.fuse(ms, gs)
             # ms, gs = passes.codegen(ms, gs)
 
