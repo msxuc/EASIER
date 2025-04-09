@@ -392,7 +392,10 @@ class NotFullModel(esr.Module):
 
     def forward(self):
         self.edge[:] += self.selector(self.vertex)
+        self.edge[:] += torch.einsum('i,i->i', self.edge, self.edge)
+
         self.vertex[:] += self.reducer(self.edge)
+        self.vertex[:] += torch.einsum('i,i->i', self.vertex, self.vertex)
 
         self.replica[:] \
             = esr.sum(self.edge) * 1.2 \
@@ -416,8 +419,6 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     collected_v = jitted.vertex.collect().cpu()
     collected_e = jitted.edge.collect().cpu()
     collected_r = jitted.replica.collect().cpu()
-
-    print(orig_v, orig_e, orig_r)
 
     torch.testing.assert_close(collected_v, orig_v)
     torch.testing.assert_close(collected_e, orig_e)

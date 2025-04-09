@@ -566,6 +566,9 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         _Skipped() is not expected here.
 
         Compare runtime metadata but not record/update it.
+
+        TODO result may be None if the node is output or nested esr.Module call
+            it seems better to skip handling the value None.
         """
         node_meta = get_static_node_metadata(node)
         prev_runtime_meta = get_runtime_tensor_metadata(node)
@@ -719,12 +722,32 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
 
         return (not is_reducer) and super().is_skippable(node)
 
-    def handle_result_runtime_metadata(self, node, res):
+    def handle_result_runtime_metadata(self, node: Node, res):
         # Record but not compare.
         node_meta = get_static_node_metadata(node)
-        result_runtime_meta = tree_map(
-            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
-        )
+        batch_sizes = set()
+
+        def _get_metadata_batchsize(x):
+            meta = _get_runtime_metadata_from_value(node_meta.role, x)
+            if node_meta.role == Role.DISTRIBUTED:
+                batch_sizes.add(meta.shape[0])
+            return meta
+
+        result_runtime_meta = tree_map(res, _get_metadata_batchsize)
+
+        if node_meta.role == Role.DISTRIBUTED:
+            if len(batch_sizes) != 1:
+                raise EasierJitException(
+                    f"Unexpected distributed operation {node.target}"
+                    " returns multiple Tensors with different batch sizes"
+                    f" {batch_sizes}"
+                )
+            bs = batch_sizes.pop()
+            if bs != node_meta.batch_size:
+                raise EasierJitException(
+                    f"Runtime batch size {bs} is not expected on {node.target}"
+                )
+
         set_runtime_tensor_metadata(node, result_runtime_meta)
 
     def if_call_function(self, function, args, kwargs):
