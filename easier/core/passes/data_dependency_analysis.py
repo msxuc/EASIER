@@ -20,7 +20,7 @@ from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, tree_map
+    EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
 
 if TYPE_CHECKING:
     from easier.core.runtime.jit_engine import RuntimeValue
@@ -237,8 +237,18 @@ class DataDependencyAnalyzer(EasierInterpreter):
             # A nested esr.Module call has no input/output, data dependency
             # may occur through esr.Tensor instances the inner Module
             # shares/writes.
-            # TODO we may identify the concrete intersection set of esr.Tensors
-            return
+            # Simply set read/write dependencies on ALL esr.Tensors in module.
+            #
+            # TODO we may identify the concrete RECURSIVE intersection set
+            # of esr.Tensors
+            tensors: Dict[esr.Tensor, list] = get_easier_tensors(
+                [self.current_module]
+            )
+            param_addrs = _collect_addrs(list(tensors))
+
+            for param_addr in param_addrs:
+                self.add_reader_dependency(param_addr)
+                self.add_writer_dependency(param_addr)
 
     def if_output(self):
         # TODO output is strictly a syntactic element, but since FX has

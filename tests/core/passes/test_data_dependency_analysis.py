@@ -13,19 +13,15 @@ from torch.fx.node import Node
 from easier.core.jit import EasierTracer
 
 from easier.core.module import Selector, Reducer, Tensor
-from easier.core.passes.metadata_propagation.metadata import \
-    INT32, EasierTensorMeta, EasierTensorMeta, \
-    Role, ScalarType, ViewType, View
-from easier.core.passes.metadata_propagation.utils import \
-    Validation as V
 from easier.core.passes.tensor_grouping import \
     EasierTensorDef, EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.data_dependency_analysis import \
     get_data_dependency_inputs, get_data_dependency_users, \
     KEY__DATA_DEPENDENCY_USERS, KEY__DATA_DEPENDENCY_INPUTS
+from easier.core.runtime.jit_engine import NodeEvaluationHandler
 from easier.core import passes
 import easier as esr
-from easier.core.passes.utils import FX
+from easier.core.passes.utils import FX, tree_map
 
 
 def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):
@@ -48,9 +44,28 @@ def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):
         assert inputs_sets.get(n, set()) == set(get_data_dependency_inputs(n))
         assert users_sets.get(n, set()) == set(get_data_dependency_users(n))
 
+class _Eval(NodeEvaluationHandler):
+    def __init__(self, module, graph) -> None:
+        super().__init__()
+        self.current_module = module
+        self.current_graph = graph
+        self.stackframe = {}
 
-def _get_viewinfo(node: Node) -> View:
-    return V.assert_non_structured(node).view_info
+    def handle_result_runtime_metadata(self, node, res):
+        # Skip validation
+        pass
+
+    def forward(self):
+        def _eval(x):
+            if isinstance(x, Node):
+                return self.stackframe[x]
+            else:
+                return x
+        for node in list(self.current_graph.nodes):
+            args = tuple(tree_map(v, _eval) for v in node.args)
+            kwargs = {k: tree_map(v, _eval) for k, v in node.kwargs.items()}
+
+            self.dispatch_node(node, args, kwargs)  # type: ignore
 
 
 def test_data_dependency__none():
@@ -64,12 +79,13 @@ def test_data_dependency__none():
             b = a + 3
             c = a - b
             d = esr.sum(c)
-
+    
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
-    [jm], [graph] = passes.group_tensors([m], [graph])
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+
+    e = _Eval(m, graph)
+    e.forward()
+    [jm], [graph] = passes.analyze_data_dependency([m], [graph], e.stackframe)
 
     get_v, mul, add, sub, sum, output = graph.nodes
 
@@ -100,9 +116,10 @@ def test_data_dependency__two_path_inplace():
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
-    [jm], [graph] = passes.group_tensors([m], [graph])
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+
+    e = _Eval(m, graph)
+    e.forward()
+    [jm], [graph] = passes.analyze_data_dependency([m], [graph], e.stackframe)
 
     v22, view22, v55, r55_22_v22, a22_add, set1, \
         aview22, r55_22_a22, add_, sub_, output = graph.nodes
@@ -143,9 +160,10 @@ def test_data_dependency__undetermined():
 
     m = M()
     graph = EasierTracer().trace(m)
-    [jm], [graph] = passes.propagate_metadata([m], [graph])
-    [jm], [graph] = passes.group_tensors([m], [graph])
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+
+    e = _Eval(m, graph)
+    e.forward()
+    [jm], [graph] = passes.analyze_data_dependency([m], [graph], e.stackframe)
 
     v, a, b, c, d, e, output = graph.nodes
 
