@@ -543,6 +543,7 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             res = super().dispatch_node(node, args, kwargs)
 
             self.handle_result_runtime_metadata(node, res)
+            self.handle_result_view_info(node, res)
 
         self.stackframe[node] = res
 
@@ -582,6 +583,18 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                 f" {node.target} changes:"
                 f" {prev_runtime_meta} => {result_runtime_meta}"
             )
+
+    def handle_result_view_info(self, node, res):
+        """
+        _Skipped() is not expected here.
+
+        Allow views become non-views, this won't break the dependency analysis.
+
+        WHAT IS A VIEW VIOLATION?
+        """
+
+
+
 
     def if_get_attr(self, attr_path: str) -> RuntimeValue:
         submod_path, _sep, attr_name = attr_path.rpartition(".")
@@ -726,6 +739,9 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
         )
         set_runtime_tensor_metadata(node, result_runtime_meta)
+    
+    def handle_result_view_info(self, node, res):
+        return
 
     def if_call_function(self, function, args, kwargs):
         if function in _EsrMod.easier_aggregators:

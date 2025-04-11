@@ -2,11 +2,13 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
+import dataclasses
 import itertools
 import operator
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
     Type, Union, Callable, cast, FrozenSet, TYPE_CHECKING
 from typing_extensions import TypeAlias
+from enum import Enum, auto
 
 import torch
 import torch.overrides
@@ -37,6 +39,16 @@ def get_data_dependency_inputs(node: Node) -> List[Node]:
 def get_data_dependency_users(node: Node) -> List[Node]:
     # Return a clone to avoid manipulating the node meta dict.
     return list(node.meta.get(KEY__DATA_DEPENDENCY_USERS, []))
+
+
+# class ViewType(Enum):
+#     ALLOCATED = auto()
+#     DERIVED = auto()
+
+# @dataclasses.dataclass
+# class View:
+#     type: ViewType
+#     src: Union[]
 
 
 def _collect_addrs(
@@ -112,8 +124,7 @@ class DataDependencyAnalyzer(EasierInterpreter):
         # Each writer Node refreshes the status of a view source;
         # All subsequent readers, and the next writer, have
         # data dependency on this writer.
-        #
-        # The source Node itself is NOT??? included.
+        # Including the Node that is the operation who allocates the memory.
         #
         # When a writer Node (e.g. Reducer-with-out) is never referred
         # in dataflow, it will still be added to src2writer,
@@ -125,6 +136,10 @@ class DataDependencyAnalyzer(EasierInterpreter):
 
 
     def add_data_dependency_edge(self, src: Node, dst: Node):
+        # NOTE only existing dataflow/dependency edges are deduplicated,
+        # but if the adding edge is the composition of multiple existing edges,
+        # we don't deduplicate for such cases.
+
         if src is dst:
             # inplace ops may be both reader and writer on the same view src.
             return
@@ -133,7 +148,7 @@ class DataDependencyAnalyzer(EasierInterpreter):
             # Avoid adding a data dependency edge if a dataflow edge
             # already exists (between the two Nodes).
             return
-
+        
         # Use OrderedSet to deduplicate.
         dep_inputs: OrderedSet[Node] = dst.meta.setdefault(
             KEY__DATA_DEPENDENCY_INPUTS, OrderedSet()
@@ -166,7 +181,7 @@ class DataDependencyAnalyzer(EasierInterpreter):
 
     def add_writer_dependency(self, res_addr: int):
         """
-        Add the current node as a writer to the memory at `res_addr`.
+        Add the current node as a writer on the memory at `res_addr`.
         Including the operation that allocates the memory.
         """
         writer = self.current_node
@@ -237,26 +252,20 @@ class DataDependencyAnalyzer(EasierInterpreter):
             # A nested esr.Module call has no input/output, data dependency
             # may occur through esr.Tensor instances the inner Module
             # shares/writes.
-            # Simply set read/write dependencies on ALL esr.Tensors in module.
-            #
             # TODO we may identify the concrete RECURSIVE intersection set
-            # of esr.Tensors
+            # of esr.Tensors:
+            # intersect(tensors, union(read_write_tensors for nested_mod))
+
+            # For the sake of simplicity,
+            # add read/write dependencies on ALL esr.Tensors in current_module.
             tensors: Dict[esr.Tensor, list] = get_easier_tensors(
                 [self.current_module]
             )
             param_addrs = _collect_addrs(list(tensors))
-
             for param_addr in param_addrs:
                 self.add_reader_dependency(param_addr)
                 self.add_writer_dependency(param_addr)
 
-    def if_output(self):
-        # TODO output is strictly a syntactic element, but since FX has
-        # dedicated output Node, we may add data dependency edges from output
-        # to all side-effectful Nodes that do not have output Node as a
-        # descendent, to ensure in subsequent graph manipulation, output will
-        # not be incorrectly reordered upwards and deactivate those Nodes.
-        return
 
 
 def analyze_data_dependency(
