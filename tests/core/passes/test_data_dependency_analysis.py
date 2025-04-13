@@ -173,3 +173,10 @@ def test_data_dependency__undetermined():
     assert _get_viewinfo(c) == View(ViewType.UNDETERMINED, v)
     assert _get_viewinfo(d) == View(ViewType.ALLOCATED, None)
     assert _get_viewinfo(e) == View(ViewType.DERIVED, d)
+
+
+def test_data_dependency_alias():
+    """
+    The same Tensor instance is bound to multiple variables, R/W to all those
+    variables share the same dep path.
+    """

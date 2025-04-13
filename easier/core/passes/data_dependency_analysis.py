@@ -16,13 +16,14 @@ from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
 from easier.core.passes.metadata_propagation import \
-    StaticNodeMeta
+    Role, StaticNodeMeta, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
+    get_runtime_tensor_metadata, get_static_node_metadata
 
 from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
+    FX, EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
 
 if TYPE_CHECKING:
     from easier.core.runtime.jit_engine import RuntimeValue
@@ -41,29 +42,6 @@ def get_data_dependency_users(node: Node) -> List[Node]:
     return list(node.meta.get(KEY__DATA_DEPENDENCY_USERS, []))
 
 
-# class ViewType(Enum):
-#     ALLOCATED = auto()
-#     DERIVED = auto()
-
-# @dataclasses.dataclass
-# class View:
-#     type: ViewType
-#     src: Union[]
-
-
-def _collect_addrs(
-    runtime_vals: Union['RuntimeValue', list]
-) -> OrderedSet[int]:
-    addrs = OrderedSet()
-
-    def _insert(x):
-        if isinstance(x, torch.Tensor):
-            # ignoring strides/offsets
-            addr: int = x.storage().data_ptr()
-            addrs.add(addr)
-        
-    _ = tree_map(runtime_vals, _insert)
-    return addrs
 
 
 class DataDependencyAnalyzer(EasierInterpreter):
@@ -84,42 +62,17 @@ class DataDependencyAnalyzer(EasierInterpreter):
     This Analyzer will add data dependency edges between those reader/writers
     Nodes to express such barrier-like constraints.
 
-    We present a memory by its memory address, ignoring strides/offsets
-    introduced by the PyTorch view operations e.g. X[:, :, 2]
-    Also, the addresses are in the same memory space i.e. CPU or CUDA memory.
+    We present a memory by the tensor's ViewSrc
+    i.e. ignoring strides/offsets introduced by the PyTorch view operations
+    e.g. X[:, :, 2].
     """
-    def __init__(
-        self,
-        modules: Sequence[esr.Module],
-        graphs: Sequence[Graph],
-        stackframe: Dict[Node, 'RuntimeValue']
-    ):
-        """
-        Args:
-        -   stackframe:
-                the snapshot of the stackframe from the runtime,
-                no memory space should be reused during the execution
-                (i.e. not used tensors should not be released)
-        """
+    def __init__(self, modules: Sequence[esr.Module], graphs: Sequence[Graph]):
         assert len(modules) == len(graphs) == 1, \
             "One module/graph at a time, avoid adding dep edges cross graphs"
             # otherwise, 1) provide multiple stackframes,
             # 2) clear add2readers/write when switching current_graph.
 
         super().__init__(modules, graphs)
-
-        self.stackframe = stackframe
-        
-        # TODO this requires, in the runtime, intermediate results are
-        # not released even if it's no longer used.
-        # Otherwise, there will be conflicts for simple `int` addresses.
-        self.addr2srcnode: Dict[int, Node] = {}
-
-        for node, val in stackframe.items():
-            for addr in _collect_addrs(val):
-                if addr not in self.addr2srcnode:
-                    self.addr2srcnode[addr] = node
-
 
         # Each writer Node refreshes the status of a view source;
         # All subsequent readers, and the next writer, have
@@ -130,9 +83,9 @@ class DataDependencyAnalyzer(EasierInterpreter):
         # in dataflow, it will still be added to src2writer,
         # but may not be touched anymore, e.g. no more writers/readers torch
         # the same view source of `out=x`.
-        self.addr2writer: Dict[int, Node] = {}
+        self.src2writer: Dict[ViewSrc, Node] = {}
 
-        self.addr2readers: Dict[int, OrderedSet[Node]] = {}
+        self.src2readers: Dict[ViewSrc, OrderedSet[Node]] = {}
 
 
     def add_data_dependency_edge(self, src: Node, dst: Node):
@@ -164,32 +117,32 @@ class DataDependencyAnalyzer(EasierInterpreter):
         dep_inputs.add(src)
         dep_users.add(dst)
 
-    def add_reader_dependency(self, arg_addr: int):
+    def add_reader_dependency(self, arg_src: ViewSrc):
         """
-        Add the current node as a reader to the memory at `arg_addr`.
+        Add the current node as a reader to the memory at `arg_src`.
         """
         reader = self.current_node
 
-        latest_writer = self.addr2writer[arg_addr]
+        latest_writer = self.src2writer[arg_src]
         self.add_data_dependency_edge(latest_writer, reader)
 
         # Other readers in the same barrier-barrier region.
         # Since the next writer will be enforced to be after these readers,
         # between these readers we do not need a order.
-        readers = self.addr2readers.setdefault(arg_addr, OrderedSet())
+        readers = self.src2readers.setdefault(arg_src, OrderedSet())
         readers.add(reader)
 
-    def add_writer_dependency(self, res_addr: int):
+    def add_writer_dependency(self, res_src: ViewSrc):
         """
-        Add the current node as a writer on the memory at `res_addr`.
+        Add the current node as a writer on the memory at `res_src`.
         Including the operation that allocates the memory.
         """
         writer = self.current_node
 
         # If current_node is the operation that allocates, we get no prev
         # writers.
-        prev_writer: Optional[Node] = self.addr2writer.get(res_addr, None)
-        prev_readers: Iterable[Node] = self.addr2readers.get(res_addr, [])
+        prev_writer: Optional[Node] = self.src2writer.get(res_src, None)
+        prev_readers: Iterable[Node] = self.src2readers.get(res_src, [])
 
         # By concat-ing prev_write with prev_reads, we add a dedicated dep edge
         # between the two writes, even there are reads between them, e.g.
@@ -212,8 +165,8 @@ class DataDependencyAnalyzer(EasierInterpreter):
             self.add_data_dependency_edge(prev, writer)
 
         # refresh the status of the view src ("add a barrier")
-        self.addr2writer[res_addr] = writer
-        self.addr2readers[res_addr] = OrderedSet()
+        self.src2writer[res_src] = writer
+        self.src2readers[res_src] = OrderedSet()
 
     def for_each_node(self):
         # Some ops may take multiple input writable tensors, and the result
@@ -224,18 +177,35 @@ class DataDependencyAnalyzer(EasierInterpreter):
         # TODO any FX-traceable torch ops violate this convention? Or any way
         # to detect if the violation happens?
         #
-        res_addrs: OrderedSet[int] = _collect_addrs(
-            self.stackframe[self.current_node]
-        )
-        arg_addrs: OrderedSet[int] = _collect_addrs([
-            self.stackframe[arg_node]
-            for arg_node in self.current_node.all_input_nodes
-        ])
+        class _ViewSrcCollector:
+            def __init__(self):
+                self.view_srcs: OrderedSet[ViewSrc] = OrderedSet()
 
-        for arg_addr in arg_addrs:
-            self.add_reader_dependency(arg_addr)
-        for res_addr in res_addrs:
-            self.add_writer_dependency(res_addr)
+            def collect_view_src(self, x):
+                if isinstance(x, RuntimeTensorMeta):
+                    if x.view_src is not None:
+                        self.view_srcs.add(x.view_src)
+
+        res_srcs_coll = _ViewSrcCollector()
+        _ = tree_map(
+            get_runtime_tensor_metadata(self.current_node),
+            res_srcs_coll.collect_view_src
+        )
+
+        arg_srcs_coll = _ViewSrcCollector()
+        _ = tree_map(
+            [
+                get_runtime_tensor_metadata(arg)
+                for arg in self.current_node.all_input_nodes
+            ],
+            arg_srcs_coll.collect_view_src
+        )
+
+
+        for arg_src in arg_srcs_coll.view_srcs:
+            self.add_reader_dependency(arg_src)
+        for res_src in res_srcs_coll.view_srcs:
+            self.add_writer_dependency(res_src)
 
         # Handle more specific scenarios like nested esr.Module calls
         return super().for_each_node()
@@ -258,21 +228,27 @@ class DataDependencyAnalyzer(EasierInterpreter):
 
             # For the sake of simplicity,
             # add read/write dependencies on ALL esr.Tensors in current_module.
-            tensors: Dict[esr.Tensor, list] = get_easier_tensors(
-                [self.current_module]
-            )
-            param_addrs = _collect_addrs(list(tensors))
-            for param_addr in param_addrs:
-                self.add_reader_dependency(param_addr)
-                self.add_writer_dependency(param_addr)
+            param_srcs: OrderedSet[ViewSrc] = OrderedSet()
+
+            for n in self.current_graph.nodes:
+                if n.op == FX.GET_ATTR:
+                    node_meta = get_static_node_metadata(n)
+                    if node_meta.role == Role.DISTRIBUTED \
+                    and node_meta.batch_size == 0:
+                        continue  # skipped
+                    
+                    runtime_meta = get_runtime_tensor_metadata(n)
+                    assert isinstance(runtime_meta, RuntimeTensorMeta)
+                    assert runtime_meta.view_src is not None
+                    param_srcs.add(runtime_meta.view_src)
+
+            for param_src in param_srcs:
+                self.add_reader_dependency(param_src)
+                self.add_writer_dependency(param_src)
 
 
 
-def analyze_data_dependency(
-    modules: List[esr.Module],
-    graphs: List[Graph],
-    stackframe: Dict[Node, 'RuntimeValue']
-):
+def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):
     """
     PyTorch operations that take Nodes/tensors as inputs and return a
     Node(itself)/tensor, are actually reading/writing the storage/memory
@@ -291,6 +267,6 @@ def analyze_data_dependency(
     dataflow edges (between node inputs/users) to ensure numerical correctness
     with tensor-writing operations like `y[:]=x` or `Reducer.forward(out=x)`.
     """
-    DataDependencyAnalyzer(modules, graphs, stackframe).run()
+    DataDependencyAnalyzer(modules, graphs).run()
 
     return modules, graphs

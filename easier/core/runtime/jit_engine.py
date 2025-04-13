@@ -23,49 +23,15 @@ import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
 from easier.core.passes.metadata_propagation import \
-    StaticNodeMeta, get_static_node_metadata, Role, \
-    get_runtime_tensor_metadata, set_runtime_tensor_metadata, RuntimeTensorMeta
+    StaticNodeMeta, RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
+    get_runtime_tensor_metadata, set_runtime_tensor_metadata, \
+    get_static_node_metadata, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
-    FX, get_easier_objects, tree_map, normalize_reducer_call_into_args
+    FX, OrderedSet, tree_map, normalize_reducer_call_into_args
 from easier.core.utils import EasierJitException, logger
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 
-
-def _get_runtime_metadata_from_value(
-    node_role: Role,
-    val: Union[torch.Tensor, bool, int, float, None]
-) -> RuntimeTensorMeta:
-    if isinstance(val, torch.Tensor):
-        return RuntimeTensorMeta(node_role, tuple(val.shape), val.dtype)
-
-    if node_role == Role.DISTRIBUTED:
-        raise EasierJitException(
-            f"Unexpected distributed value {val} of type {type(val)}"
-        )
-
-    if val is None:
-        # Replica Nodes: Output, nested esr.Module calls
-        # may return None
-        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32)
-    elif isinstance(val, bool):
-        return RuntimeTensorMeta(Role.REPLICATED, (), torch.bool)
-    elif isinstance(val, int):
-        # PyTorch Python wrapper isn't aware of Python int precision,
-        # so we treat ints as current minimum int32 dtype
-        # so they are compatible with any torch tensor with int-kind dtype.
-        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32)
-    elif isinstance(val, float):
-        # Same as int32, treat Python float as current minimum float32.
-        return RuntimeTensorMeta(Role.REPLICATED, (), torch.float32)
-    else:
-        # NOTE for types that cannot explicitly appear on `Node.args`,
-        # (`torch.Tensor` is one of such types), their metadata is always
-        # propagated and carried by their corresponding `Node[op='get_attr']`.
-        # We don't expect to see them here.
-        raise EasierJitException(
-            f'Value {val} of type {type(val)} cannot have associated metadata'
-        )
 
 
 class _Skipped:
@@ -425,6 +391,12 @@ class EvaluationHandlerBase:
         # Context variables, the lifetime is the execution period of a Node.
         # =================
         self.current_node: Node
+    
+    def enter(self):
+        return
+
+    def exit(self):
+        return
 
     def _dispatch_next(self, args, kwargs):
         assert self.next is not None, \
@@ -533,6 +505,11 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
     def __init__(self) -> None:
         super().__init__()
 
+        self.addr2viewsrc: Dict[int, ViewSrc] = {}
+    
+    def enter(self):
+        self.addr2viewsrc.clear()
+
     def dispatch_node(self, node: Node, args, kwargs):
         if self.is_skippable(node):
             # Skip according to the static metadata, so the result will be
@@ -542,8 +519,8 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         else:
             res = super().dispatch_node(node, args, kwargs)
 
-            self.handle_result_runtime_metadata(node, res)
-            self.handle_result_view_info(node, res)
+            self.handle_result_runtime_metadata(res)
+            # self.handle_result_view_info(node, res)
 
         self.stackframe[node] = res
 
@@ -561,41 +538,111 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         return node_meta.role == Role.DISTRIBUTED \
             and node_meta.batch_size == 0 \
             and (not is_halo_exchanger)
+    
+    def _collect_addrs(
+        self,
+        runtime_vals: Union[RuntimeValue, list]
+    ) -> OrderedSet[int]:
+        addrs = OrderedSet()
 
-    def handle_result_runtime_metadata(self, node, res):
+        def _insert(x):
+            if isinstance(x, torch.Tensor):
+                # ignoring strides/offsets
+                addr: int = x.storage().data_ptr()
+                addrs.add(addr)
+            
+        _ = tree_map(runtime_vals, _insert)
+        return addrs
+    
+    def get_current_node_runtime_metadata(self, val) -> StructuredTensorMeta:
+        """
+        Get a probably nested RuntimeTensorMeta structure for some runtime
+        value. Such a value is normally the result of evaluating
+        `self.current_node`.
+        """
+        if isinstance(val, torch.Tensor):
+            node_meta = get_static_node_metadata(self.current_node)
+            if node_meta.role == Role.DISTRIBUTED:
+                if val.ndim == 0 or val.shape[0] != node_meta.batch_size:
+                    raise EasierJitException(
+                        f"Unexpected resultant shape={val.shape} of"
+                        f" distributed operation {self.current_node.target}"
+                    )
+
+            addr, = self._collect_addrs(val)
+            if addr in self.addr2viewsrc:
+                view_src: ViewSrc = self.addr2viewsrc[addr]
+            else:
+                view_src: ViewSrc = self.current_node
+
+            tensor_runtime_mete = RuntimeTensorMeta(
+                node_meta.role, tuple(val.shape), val.dtype, view_src=view_src
+            )
+            return tensor_runtime_mete
+
+        elif val is None:
+            # Replica Nodes: Output, nested esr.Module calls may return None
+            return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32, None)
+            
+        elif isinstance(val, (tuple, list)):
+            n_items = len(val)
+            item_metas = []
+            for i in range(n_items):
+                item = val[i]
+                item_meta = self.get_current_node_runtime_metadata(item)
+
+                # assume being only one level nested.
+                assert isinstance(item, torch.Tensor)
+                assert isinstance(item_meta, RuntimeTensorMeta)
+
+                if item_meta.view_src is self.current_node:
+                    # additionally mark it's allocated by a multi-res operation
+                    item_meta = RuntimeTensorMeta(
+                        role=item_meta.role,
+                        shape=item_meta.shape,
+                        dtype=item_meta.dtype,
+                        view_src=(self.current_node, i)
+                    )
+            
+                item_metas.append(item_meta)
+
+            item_metas = type(val)(item_metas)  # tuple or list
+            return item_metas
+        
+        else:
+            # Scalar cases may happen for `t.item()` that returns the scalar
+            # Python object for singleton tensors.
+            return get_runtime_metadata_from_scalar(val)
+
+
+    def handle_result_runtime_metadata(self, res):
         """
         _Skipped() is not expected here.
 
         Compare runtime metadata but not record/update it.
+        The metadata includess:
+        -   shape/dtype
+        -   tensor view info
 
         TODO result may be None if the node is output or nested esr.Module call
             it seems better to skip handling the value None.
         """
-        node_meta = get_static_node_metadata(node)
-        prev_runtime_meta = get_runtime_tensor_metadata(node)
+        prev_runtime_meta = get_runtime_tensor_metadata(self.current_node)
 
-        result_runtime_meta = tree_map(
-            res, lambda x: _get_runtime_metadata_from_value(node_meta.role, x)
-        )
+        result_runtime_meta = self.get_current_node_runtime_metadata(res)
 
         # TODO if we support meta changes on the fly, we can just check
         # if batch sizes change.
+        # TODO it's better to tolerate view info changes, e.g. a view Node
+        # becomes an allocator Node, as long as it does not break the dep edges
+        # of data-dep-analysis. Currently by simply equating two Metas we are
+        # enforcing that the view info must be exactly the same.
         if prev_runtime_meta != result_runtime_meta:
             raise EasierJitException(
                 "The properties of the result value of the operation"
-                f" {node.target} changes:"
+                f" {self.current_node.target} changes:"
                 f" {prev_runtime_meta} => {result_runtime_meta}"
             )
-
-    def handle_result_view_info(self, node, res):
-        """
-        _Skipped() is not expected here.
-
-        Allow views become non-views, this won't break the dependency analysis.
-
-        WHAT IS A VIEW VIOLATION?
-        """
-
 
 
 
@@ -718,9 +765,6 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
 
 
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
-    def __init__(self) -> None:
-        super().__init__()
-
     def is_skippable(self, node: Node):
         """
         Additional to HaloExchanger, in the first run we need to exchange
@@ -734,37 +778,13 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             )
 
         return (not is_reducer) and super().is_skippable(node)
-
-    def handle_result_runtime_metadata(self, node: Node, res):
-        # Record but not compare.
-        node_meta = get_static_node_metadata(node)
-        batch_sizes = set()
-
-        def _get_metadata_batchsize(x):
-            meta = _get_runtime_metadata_from_value(node_meta.role, x)
-            if node_meta.role == Role.DISTRIBUTED:
-                batch_sizes.add(meta.shape[0])
-            return meta
-
-        result_runtime_meta = tree_map(res, _get_metadata_batchsize)
-
-        if node_meta.role == Role.DISTRIBUTED:
-            if len(batch_sizes) != 1:
-                raise EasierJitException(
-                    f"Unexpected distributed operation {node.target}"
-                    " returns multiple Tensors with different batch sizes"
-                    f" {batch_sizes}"
-                )
-            bs = batch_sizes.pop()
-            if bs != node_meta.batch_size:
-                raise EasierJitException(
-                    f"Runtime batch size {bs} is not expected on {node.target}"
-                )
-
-        set_runtime_tensor_metadata(node, result_runtime_meta)
     
-    def handle_result_view_info(self, node, res):
-        return
+
+    def handle_result_runtime_metadata(self, res):
+        # Record but not compare.
+        runtime_meta = self.get_current_node_runtime_metadata(res)
+        set_runtime_tensor_metadata(self.current_node, runtime_meta)
+    
 
     def if_call_function(self, function, args, kwargs):
         if function in _EsrMod.easier_aggregators:
@@ -776,7 +796,7 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             set_runtime_tensor_metadata(
                 self.current_node,
                 RuntimeTensorMeta(
-                    Role.REPLICATED, (1,) + subshape, dtype
+                    Role.REPLICATED, (1,) + subshape, dtype, self.current_node
                 )
             )
 
@@ -789,10 +809,22 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
 
         if isinstance(submod, esr.Reducer):
             subshape, dtype = allgather_meta_for_collective_input(args[0])
+
+            input, opt_out = normalize_reducer_call_into_args(*args, **kwargs)
+            input_node, opt_out_node = normalize_reducer_call_into_args(
+                *self.current_node.args, **self.current_node.kwargs
+            )
+            view_src = self.current_node
+            if isinstance(input, _Skipped):
+                if opt_out_node is not None:
+                    view_src = get_runtime_tensor_metadata(
+                        opt_out_node  # type: ignore
+                    ).view_src  # type: ignore
+
             set_runtime_tensor_metadata(
                 self.current_node,
                 RuntimeTensorMeta(
-                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype
+                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype, view_src
                 )
             )
 
@@ -846,6 +878,7 @@ class JitEngine:
         stackframe: Dict[Node, RuntimeValue] = {}
         for h in handlers:
             h.stackframe = stackframe
+            h.enter()
 
         # TODO make eval_args_kwargs Handler recursion-style methods
         def _eval(x):
@@ -864,13 +897,15 @@ class JitEngine:
         if self.run_count == 0:
             ms, gs = [self.module], [self.graph]
 
-            ms, gs = passes.analyze_data_dependency(ms, gs, stackframe)
+            ms, gs = passes.analyze_data_dependency(ms, gs)
             # ms, gs = passes.fuse(ms, gs)
             # ms, gs = passes.codegen(ms, gs)
 
             [self.module], [self.graph] = ms, gs
             self._update_handlers(self.runtime_handlers)
 
+        for h in handlers:
+            h.exit()
         stackframe.clear()
 
         self.run_count += 1

@@ -66,6 +66,13 @@ class StaticNodeMeta:
             assert False, f'bad value {self}'
 
 
+# `ViewSrc` are Nodes allocate allocate the memory blocks for the tensors.
+ViewSrc: TypeAlias = Union[
+    Node,              # non-multi-result op, including get_attr
+    Tuple[Node, int],  # item of multi-result Nodes
+]
+
+
 @dataclasses.dataclass(frozen=True, eq=True)
 class RuntimeTensorMeta:
     """
@@ -81,6 +88,10 @@ class RuntimeTensorMeta:
     role: Role
     shape: Tuple[int, ...]
     dtype: torch.dtype
+
+    # NOTE we are treating scalars as ()-shape tensors, those scalars do not
+    # have allocators, and set `view_src = None` for them
+    view_src: Optional[ViewSrc]
 
 
 StructuredTensorMeta: TypeAlias = Union[
@@ -196,3 +207,27 @@ def set_runtime_tensor_metadata(node: Node, tensor_meta: StructuredTensorMeta):
 
 def get_runtime_tensor_metadata(node: Node) -> StructuredTensorMeta:
     return node.meta[KEY__METADATA_RUNTIME]
+
+
+def get_runtime_metadata_from_scalar(
+    val: Union[bool, int, float]
+) -> RuntimeTensorMeta:
+    if isinstance(val, bool):
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.bool, None)
+    elif isinstance(val, int):
+        # PyTorch Python wrapper isn't aware of Python int precision,
+        # so we treat ints as current minimum int32 dtype
+        # so they are compatible with any torch tensor with int-kind dtype.
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32, None)
+    elif isinstance(val, float):
+        # Same as int32, treat Python float as current minimum float32.
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.float32, None)
+    else:
+        # NOTE for types that cannot explicitly appear on `Node.args`,
+        # (`torch.Tensor` is one of such types), their metadata is always
+        # propagated and carried by their corresponding `Node[op='get_attr']`.
+        # We don't expect to see them here.
+        raise EasierJitException(
+            f'Scalar value {val} of type {type(val)}'
+            ' cannot have associated metadata'
+        )
