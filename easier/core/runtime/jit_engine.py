@@ -814,6 +814,13 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             submod.prepare_buffers(subshape, dtype)
 
         if isinstance(submod, esr.Reducer):
+            # On the first run, we don't skip any Reducer.
+            # Because 1) some Reducers have zero-length local output, but can
+            # provide input info;
+            # 2) some Reducers have their inputs skipped, but should allocate
+            # zero-ed output.
+            # Therefore we need to visit/evaluate all Reducers collectly
+            # to gather information.
             subshape, dtype = allgather_meta_for_collective_input(args[0])
 
             input_val, opt_out_val = normalize_reducer_call_into_args(
