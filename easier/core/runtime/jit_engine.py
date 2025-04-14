@@ -549,6 +549,14 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         return res
 
     def is_skippable(self, node: Node):
+        """
+        Overridable.
+        The base NodeEvaluationHandler skips only if the Node satisfies:
+        -   not a HaloExchanger
+        -   distributed and zero-length
+        The derived FisrtRunNodeEvaluationHandler adds new requirements:
+        -   not a Reducer.
+        """
         is_halo_exchanger = \
             node.op == FX.CALL_MODULE and isinstance(
                 self.current_module.get_submodule(cast(str, node.target)),
@@ -563,6 +571,8 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
 
     def handle_result_runtime_metadata(self, node, res):
         """
+        Overridable.
+
         _Skipped() is not expected here.
 
         Compare runtime metadata but not record/update it.
@@ -710,6 +720,8 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
 
     def is_skippable(self, node: Node):
         """
+        Override.
+
         Additional to HaloExchanger, in the first run we need to exchange
         meta for possible skipped inputs to Reducers, so we enforce the
         evaluation of Reducers too.
@@ -723,7 +735,11 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
         return (not is_reducer) and super().is_skippable(node)
 
     def handle_result_runtime_metadata(self, node: Node, res):
-        # Record but not compare.
+        """
+        Override.
+
+        Record runtime tensor metas but not compare.
+        """
         node_meta = get_static_node_metadata(node)
         batch_sizes = set()
 
@@ -772,6 +788,13 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             submod.prepare_buffers(subshape, dtype)
 
         if isinstance(submod, esr.Reducer):
+            # On the first run, we don't skip any Reducer.
+            # Because 1) some Reducers have zero-length local output, but can
+            # provide input info;
+            # 2) some Reducers have their inputs skipped, but should allocate
+            # zero-ed output.
+            # Therefore we need to visit/evaluate all Reducers collectly
+            # to gather information.
             subshape, dtype = allgather_meta_for_collective_input(args[0])
             set_runtime_tensor_metadata(
                 self.current_node,
@@ -819,10 +842,9 @@ class JitEngine:
             ms, gs = passes.propagate_static_node_metadata(ms, gs)
 
             [self.module], [self.graph] = ms, gs
-
             self._update_handlers(self.first_run_handlers)
-            handlers = self.first_run_handlers
 
+            handlers = self.first_run_handlers
         else:
             handlers = self.runtime_handlers
         outermost_handler = handlers[0]
@@ -857,3 +879,7 @@ class JitEngine:
         stackframe.clear()
 
         self.run_count += 1
+
+        # JitEngine.forward() serves as esr.Module.forward(), and is required
+        # to return None.
+        return None
