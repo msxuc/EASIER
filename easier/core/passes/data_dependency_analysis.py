@@ -19,6 +19,7 @@ from easier.core.passes.metadata_propagation import \
     Role, StaticNodeMeta, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
     get_runtime_tensor_metadata, get_static_node_metadata
 
+from easier.core.runtime.modules import HaloExchanger
 from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
@@ -42,9 +43,7 @@ def get_data_dependency_users(node: Node) -> List[Node]:
     return list(node.meta.get(KEY__DATA_DEPENDENCY_USERS, []))
 
 
-
-
-class DataDependencyAnalyzer(EasierInterpreter):
+class DataDependencyAnalyzer(EasierInterpreter[None]):
     """
     When a Node/tensor X is used as an argument to another Node/operation F,
     we say F does a reading operation on the memory under X;
@@ -66,11 +65,12 @@ class DataDependencyAnalyzer(EasierInterpreter):
     i.e. ignoring strides/offsets introduced by the PyTorch view operations
     e.g. X[:, :, 2].
     """
+
     def __init__(self, modules: Sequence[esr.Module], graphs: Sequence[Graph]):
         assert len(modules) == len(graphs) == 1, \
             "One module/graph at a time, avoid adding dep edges cross graphs"
-            # otherwise, 1) provide multiple stackframes,
-            # 2) clear add2readers/write when switching current_graph.
+        # otherwise, 1) provide multiple stackframes,
+        # 2) clear add2readers/write when switching current_graph.
 
         super().__init__(modules, graphs)
 
@@ -87,7 +87,6 @@ class DataDependencyAnalyzer(EasierInterpreter):
 
         self.src2readers: Dict[ViewSrc, OrderedSet[Node]] = {}
 
-
     def add_data_dependency_edge(self, src: Node, dst: Node):
         # NOTE only existing dataflow/dependency edges are deduplicated,
         # but if the adding edge is the composition of multiple existing edges,
@@ -101,7 +100,7 @@ class DataDependencyAnalyzer(EasierInterpreter):
             # Avoid adding a data dependency edge if a dataflow edge
             # already exists (between the two Nodes).
             return
-        
+
         # Use OrderedSet to deduplicate.
         dep_inputs: OrderedSet[Node] = dst.meta.setdefault(
             KEY__DATA_DEPENDENCY_INPUTS, OrderedSet()
@@ -135,7 +134,13 @@ class DataDependencyAnalyzer(EasierInterpreter):
     def add_writer_dependency(self, res_src: ViewSrc):
         """
         Add the current node as a writer on the memory at `res_src`.
-        Including the operation that allocates the memory.
+
+        Including the operations that:
+        -   allocates the memory -- this is the most common case
+        -   in-place modifies the memory, e.g. setitem, Reducer(out=)
+        -   purely creates a view, e.g. getitem, reshape
+            P.S. without being rule-based it's not that easy to tell if an op
+            is purely creating views.
         """
         writer = self.current_node
 
@@ -168,6 +173,17 @@ class DataDependencyAnalyzer(EasierInterpreter):
         self.src2writer[res_src] = writer
         self.src2readers[res_src] = OrderedSet()
 
+    def is_skipped(self, node: Node):
+        """
+        Test if the specific `node` (NOT `self.current_node`) is skipped
+        in JitEngine.
+
+        The judgement is the same as
+        jit_engine.NodeEvaluationHandler.is_skippable()
+        """
+        from easier.core.runtime.jit_engine import is_nonhalo_and_zerolength
+        return is_nonhalo_and_zerolength(self.current_module, node)
+
     def for_each_node(self):
         # Some ops may take multiple input writable tensors, and the result
         # will be a tuple of those tensors themselves.
@@ -177,6 +193,9 @@ class DataDependencyAnalyzer(EasierInterpreter):
         # TODO any FX-traceable torch ops violate this convention? Or any way
         # to detect if the violation happens?
         #
+        if self.is_skipped(self.current_node):
+            return
+
         class _ViewSrcCollector:
             def __init__(self):
                 self.view_srcs: OrderedSet[ViewSrc] = OrderedSet()
@@ -186,29 +205,31 @@ class DataDependencyAnalyzer(EasierInterpreter):
                     if x.view_src is not None:
                         self.view_srcs.add(x.view_src)
 
-        res_srcs_coll = _ViewSrcCollector()
-        _ = tree_map(
-            get_runtime_tensor_metadata(self.current_node),
-            res_srcs_coll.collect_view_src
-        )
-
         arg_srcs_coll = _ViewSrcCollector()
         _ = tree_map(
             [
                 get_runtime_tensor_metadata(arg)
                 for arg in self.current_node.all_input_nodes
+                if not self.is_skipped(arg)
             ],
             arg_srcs_coll.collect_view_src
         )
-
-
         for arg_src in arg_srcs_coll.view_srcs:
             self.add_reader_dependency(arg_src)
+
+        # Generally, purely viewing operators like getitem, reshape will
+        # return the argument memory addr, making themselves look like
+        # writers, and leading to extra writer dep barriers and handling.
+        res_srcs_coll = _ViewSrcCollector()
+        _ = tree_map(
+            get_runtime_tensor_metadata(self.current_node),
+            res_srcs_coll.collect_view_src
+        )
         for res_src in res_srcs_coll.view_srcs:
             self.add_writer_dependency(res_src)
 
         # Handle more specific scenarios like nested esr.Module calls
-        return super().for_each_node()
+        super().for_each_node()
 
     # TODO
     # Some functions are purely manipulating the views, e.g.
@@ -234,9 +255,9 @@ class DataDependencyAnalyzer(EasierInterpreter):
                 if n.op == FX.GET_ATTR:
                     node_meta = get_static_node_metadata(n)
                     if node_meta.role == Role.DISTRIBUTED \
-                    and node_meta.batch_size == 0:
+                            and node_meta.batch_size == 0:
                         continue  # skipped
-                    
+
                     runtime_meta = get_runtime_tensor_metadata(n)
                     assert isinstance(runtime_meta, RuntimeTensorMeta)
                     assert runtime_meta.view_src is not None
@@ -245,7 +266,6 @@ class DataDependencyAnalyzer(EasierInterpreter):
             for param_src in param_srcs:
                 self.add_reader_dependency(param_src)
                 self.add_writer_dependency(param_src)
-
 
 
 def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):

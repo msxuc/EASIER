@@ -33,7 +33,6 @@ from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 
 
-
 class _Skipped:
     """
     We use a special runtime object `_skipped = _Skipped()` to represent
@@ -391,7 +390,7 @@ class EvaluationHandlerBase:
         # Context variables, the lifetime is the execution period of a Node.
         # =================
         self.current_node: Node
-    
+
     def enter(self):
         return
 
@@ -490,6 +489,19 @@ class EvaluationHandlerBase:
         return self._dispatch_next(args, kwargs)
 
 
+def is_nonhalo_and_zerolength(root: esr.Module, node: Node):
+    is_halo_exchanger = \
+        node.op == FX.CALL_MODULE and isinstance(
+            root.get_submodule(cast(str, node.target)), HaloExchanger
+        )
+
+    node_meta = get_static_node_metadata(node)
+
+    return node_meta.role == Role.DISTRIBUTED \
+        and node_meta.batch_size == 0 \
+        and (not is_halo_exchanger)
+
+
 class NodeEvaluationHandler(EvaluationHandlerBase):
     """
     The most essential Handler to evaluate each Node.
@@ -506,7 +518,7 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
         super().__init__()
 
         self.addr2viewsrc: Dict[int, ViewSrc] = {}
-    
+
     def enter(self):
         self.addr2viewsrc.clear()
 
@@ -520,45 +532,30 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
             res = super().dispatch_node(node, args, kwargs)
 
             self.handle_result_runtime_metadata(res)
-            # self.handle_result_view_info(node, res)
 
         self.stackframe[node] = res
 
         return res
 
     def is_skippable(self, node: Node):
-        is_halo_exchanger = \
-            node.op == FX.CALL_MODULE and isinstance(
-                self.current_module.get_submodule(cast(str, node.target)),
-                HaloExchanger
-            )
+        """
+        Overridable.
+        The base NodeEvaluationHandler skips only if the Node satisfies:
+        -   not a HaloExchanger
+        -   distributed and zero-length
+        The derived FisrtRunNodeEvaluationHandler adds new requirements:
+        -   not a Reducer.
+        """
+        return is_nonhalo_and_zerolength(self.current_module, node)
 
-        node_meta = get_static_node_metadata(node)
-
-        return node_meta.role == Role.DISTRIBUTED \
-            and node_meta.batch_size == 0 \
-            and (not is_halo_exchanger)
-    
-    def _collect_addrs(
-        self,
-        runtime_vals: Union[RuntimeValue, list]
-    ) -> OrderedSet[int]:
-        addrs = OrderedSet()
-
-        def _insert(x):
-            if isinstance(x, torch.Tensor):
-                # ignoring strides/offsets
-                addr: int = x.storage().data_ptr()
-                addrs.add(addr)
-            
-        _ = tree_map(runtime_vals, _insert)
-        return addrs
-    
     def get_current_node_runtime_metadata(self, val) -> StructuredTensorMeta:
         """
         Get a probably nested RuntimeTensorMeta structure for some runtime
         value. Such a value is normally the result of evaluating
         `self.current_node`.
+
+        If a newly allocated tensor is visited, `self.add2viewsrc` dict will
+        be updated.
         """
         if isinstance(val, torch.Tensor):
             node_meta = get_static_node_metadata(self.current_node)
@@ -569,11 +566,14 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                         f" distributed operation {self.current_node.target}"
                     )
 
-            addr, = self._collect_addrs(val)
+            # Get the memory address of the underlying memory
+            # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
+            addr: int = val.untyped_storage().data_ptr()
             if addr in self.addr2viewsrc:
                 view_src: ViewSrc = self.addr2viewsrc[addr]
             else:
                 view_src: ViewSrc = self.current_node
+                self.addr2viewsrc[addr] = view_src
 
             tensor_runtime_mete = RuntimeTensorMeta(
                 node_meta.role, tuple(val.shape), val.dtype, view_src=view_src
@@ -582,8 +582,10 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
 
         elif val is None:
             # Replica Nodes: Output, nested esr.Module calls may return None
-            return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32, None)
-            
+            return RuntimeTensorMeta(
+                Role.REPLICATED, (), torch.int32, view_src=None
+            )
+
         elif isinstance(val, (tuple, list)):
             n_items = len(val)
             item_metas = []
@@ -603,20 +605,21 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                         dtype=item_meta.dtype,
                         view_src=(self.current_node, i)
                     )
-            
+
                 item_metas.append(item_meta)
 
             item_metas = type(val)(item_metas)  # tuple or list
             return item_metas
-        
+
         else:
             # Scalar cases may happen for `t.item()` that returns the scalar
             # Python object for singleton tensors.
             return get_runtime_metadata_from_scalar(val)
 
-
     def handle_result_runtime_metadata(self, res):
         """
+        Overridable.
+
         _Skipped() is not expected here.
 
         Compare runtime metadata but not record/update it.
@@ -643,8 +646,6 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                 f" {self.current_node.target} changes:"
                 f" {prev_runtime_meta} => {result_runtime_meta}"
             )
-
-
 
     def if_get_attr(self, attr_path: str) -> RuntimeValue:
         submod_path, _sep, attr_name = attr_path.rpartition(".")
@@ -747,6 +748,7 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
                     )
                     assert isinstance(result_runtime_meta, RuntimeTensorMeta)
                     assert result_runtime_meta.role == Role.DISTRIBUTED
+                    assert result_runtime_meta.view_src == self.current_node
 
                     # Same as Reducer.forward()
                     out = torch.zeros(
@@ -767,6 +769,8 @@ class NodeEvaluationHandler(EvaluationHandlerBase):
 class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
     def is_skippable(self, node: Node):
         """
+        Override.
+
         Additional to HaloExchanger, in the first run we need to exchange
         meta for possible skipped inputs to Reducers, so we enforce the
         evaluation of Reducers too.
@@ -778,13 +782,15 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
             )
 
         return (not is_reducer) and super().is_skippable(node)
-    
 
     def handle_result_runtime_metadata(self, res):
-        # Record but not compare.
+        """
+        Override.
+
+        Record runtime tensor metas but not compare.
+        """
         runtime_meta = self.get_current_node_runtime_metadata(res)
         set_runtime_tensor_metadata(self.current_node, runtime_meta)
-    
 
     def if_call_function(self, function, args, kwargs):
         if function in _EsrMod.easier_aggregators:
@@ -810,12 +816,14 @@ class FisrtRunNodeEvaluationHandler(NodeEvaluationHandler):
         if isinstance(submod, esr.Reducer):
             subshape, dtype = allgather_meta_for_collective_input(args[0])
 
-            input, opt_out = normalize_reducer_call_into_args(*args, **kwargs)
+            input_val, opt_out_val = normalize_reducer_call_into_args(
+                *args, **kwargs
+            )
             input_node, opt_out_node = normalize_reducer_call_into_args(
                 *self.current_node.args, **self.current_node.kwargs
             )
             view_src = self.current_node
-            if isinstance(input, _Skipped):
+            if isinstance(input_val, _Skipped):
                 if opt_out_node is not None:
                     view_src = get_runtime_tensor_metadata(
                         opt_out_node  # type: ignore
@@ -867,10 +875,9 @@ class JitEngine:
             ms, gs = passes.propagate_static_node_metadata(ms, gs)
 
             [self.module], [self.graph] = ms, gs
-
             self._update_handlers(self.first_run_handlers)
-            handlers = self.first_run_handlers
 
+            handlers = self.first_run_handlers
         else:
             handlers = self.runtime_handlers
         outermost_handler = handlers[0]
@@ -906,6 +913,10 @@ class JitEngine:
 
         for h in handlers:
             h.exit()
-        stackframe.clear()
+            del h.stackframe
 
         self.run_count += 1
+
+        # JitEngine.forward() serves as esr.Module.forward(), and is required
+        # to return None.
+        return None

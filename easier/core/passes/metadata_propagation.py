@@ -7,8 +7,8 @@ import math
 import operator
 from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
-from typing_extensions import Literal
+    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
+from typing_extensions import Literal, TypeAlias
 import more_itertools
 import os
 
