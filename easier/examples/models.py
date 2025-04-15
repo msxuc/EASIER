@@ -35,12 +35,286 @@ def _get_face_norm(p0, p1, p2):
 
     return s * (b2 - c2), -s * (b1 - c1)
 
+class PoissonMeshComponentsCollector(esr.Module):
+    def __init__(self, mesh: str, device='cpu'):
+        super().__init__()
+
+        # (nc, 3)
+        self.cells = esr.Tensor(
+            esr.hdf5(mesh, 'cells', dtype=torch.int64, device=device),
+            mode='partition'
+        )
+
+        # (nbc, 2)
+        self.bpoints = esr.Tensor(
+            esr.hdf5(mesh, 'bpoints', dtype=torch.int64, device=device),
+            mode='partition'
+        )
+
+        self.selector_src = esr.Selector(
+            esr.hdf5(mesh, 'src', dtype=torch.int64, device=device)
+        )
+        self.selector_dst = esr.Selector(
+            esr.hdf5(mesh, 'dst', dtype=torch.int64, device=device)
+        )
+
+        nc = self.cells.shape[0]
+        ne = self.selector_src.idx.shape[0]
+        nbc = self.bpoints.shape[0]
+        
+
+        #
+        # Output
+        #
+        self.src_p = torch.nn.ParameterList([
+            esr.Tensor(
+                esr.zeros([ne], dtype=torch.int64, device=device),
+                mode='partition'
+            ) for i in range(3)
+        ])
+        self.dst_p = torch.nn.ParameterList([
+            esr.Tensor(
+                esr.zeros([ne], dtype=torch.int64, device=device),
+                mode='partition'
+            ) for i in range(3)
+        ])
+
+        self.cells_p = torch.nn.ParameterList([
+            esr.Tensor(
+                esr.zeros([nc], dtype=torch.int64, device=device),
+                mode='partition'
+            ) for i in range(3)
+        ])
+        
+        self.bpoints_p = torch.nn.ParameterList([
+            esr.Tensor(
+                esr.zeros([nbc], dtype=torch.int64, device=device),
+                mode='partition'
+            ) for i in range(2)
+        ])
+
+    
+    def forward(self):
+        # (ne, 3)
+        src_p = self.selector_src(self.cells)
+        dst_p = self.selector_dst(self.cells)
+
+        for i in range(3):
+            # (ne,)
+            self.src_p[i].set_(src_p[:, i])
+            self.dst_p[i].set_(dst_p[:, i])
+
+            # (nc,)
+            self.cells_p[i].set_(self.cells[:, i])
+        
+        for i in range(2):
+            # (nbc,)
+            self.bpoints_p[i].set_(self.bpoints[:, i])
+        
+
+class PoissonInitializer(esr.Module):
+    def __init__(self, poisson: str, mesh: str, device='cpu'):
+        super().__init__()
+
+        self.cells = esr.Tensor(
+            esr.hdf5(mesh, 'cells', dtype=torch.int64, device=device),
+            mode='partition'
+        )
+        self.points = esr.Tensor(
+            esr.hdf5(mesh, 'points', dtype=torch.float64, device=device),
+            mode='partition'
+        )
+
+        # self.src = esr.hdf5(mesh, 'src', dtype=torch.int64, device=device)
+
+        nc = self.cells.shape[0]
+
+        self.reducer = esr.Reducer(
+            esr.hdf5(mesh, 'src', dtype=torch.int64, device=device),
+            # self.src,
+            nc
+        )
+
+        ne = self.reducer.idx.shape[0]
+
+        self.selector_src_p = torch.nn.ModuleList([
+            esr.Selector(
+                esr.hdf5(
+                    poisson, f'src_p{i}', dtype=torch.int64, device=device
+                ),
+            ) for i in range(3)
+        ])
+        self.selector_dst_p = torch.nn.ModuleList([
+            esr.Selector(
+                esr.hdf5(
+                    poisson, f'src_p{i}', dtype=torch.int64, device=device
+                ),
+            ) for i in range(3)
+        ])
+        self.selector_cells_p = torch.nn.ModuleList([
+            esr.Selector(
+                esr.hdf5(
+                    poisson, f'cells_p{i}', dtype=torch.int64, device=device
+                ),
+            ) for i in range(3)
+        ])
+
+
+        self.bcells = esr.hdf5(
+            mesh, 'bcells', dtype=torch.int64, device=device
+        )
+        self.bselector = esr.Selector(self.bcells)
+        self.breducer = esr.Reducer(self.bcells, nc)
+        self.bselector_p = torch.nn.ModuleList([
+            esr.Selector(
+                esr.hdf5(
+                    poisson, f'bp{i}', dtype=torch.int64, device=device
+                ),
+            ) for i in range(2)
+        ])
+
+
+        #
+        # Output
+        #
+        self.b = esr.Tensor(
+            esr.zeros([nc], dtype=torch.float64, device=device),
+            mode='partition'
+        )
+        self.Ac = esr.Tensor(
+            esr.zeros([nc], dtype=torch.float64, device=device),
+            mode='partition'
+        )
+        self.Af = esr.Tensor(
+            esr.zeros([ne], dtype=torch.float64, device=device),
+            mode='partition'
+        )
+        self.rho = esr.Tensor(
+            esr.zeros([nc], dtype=torch.float64, device=device),
+            mode='partition'
+        )
+        self.centroid = esr.Tensor(
+            esr.zeros([nc], dtype=torch.float64, device=device),
+            mode='partition'
+        )
+
+    def get_face_norm(self, p0, p1, p2):
+        a1 = p0[:, 0]
+        a2 = p0[:, 1]
+        b1 = p1[:, 0]
+        b2 = p1[:, 1]
+        c1 = p2[:, 0]
+        c2 = p2[:, 1]
+
+        s = torch.sign((b1 - c1) * (a2 - c2) - (b2 - c2) * (a1 - c1))
+
+        return s * (b2 - c2), -s * (b1 - c1)
+    
+    def forward(self):
+        src_p0 = self.selector_src_p[0](self.points)
+        src_p1 = self.selector_src_p[1](self.points)
+        src_p2 = self.selector_src_p[2](self.points)
+        
+        dst_p0 = self.selector_dst_p[0](self.points)
+        dst_p1 = self.selector_dst_p[1](self.points)
+        dst_p2 = self.selector_dst_p[2](self.points)
+
+
+        src_cent = (src_p0 + src_p1 + src_p2) / 3.
+        dst_cent = (dst_p0 + dst_p1 + dst_p2) / 3.
+
+        dist = dst_cent - src_cent
+
+        norm01_x, norm01_y = self.get_face_norm(src_p2, src_p0, src_p1)
+        norm12_x, norm12_y = self.get_face_norm(src_p0, src_p1, src_p2)
+        norm20_x, norm20_y = self.get_face_norm(src_p1, src_p2, src_p0)
+
+        norm01_x_, norm01_y_ = self.get_face_norm(dst_cent, src_p0, src_p1)
+        norm12_x_, norm12_y_ = self.get_face_norm(dst_cent, src_p1, src_p2)
+        norm20_x_, norm20_y_ = self.get_face_norm(dst_cent, src_p2, src_p0)
+
+        condition = (norm01_x * norm01_x_ + norm01_y * norm01_y_) < 0
+        norm_x = torch.where(condition, norm01_x, 0.)
+        norm_y = torch.where(condition, norm01_y, 0.)
+
+        condition = (norm12_x * norm12_x_ + norm12_y * norm12_y_) < 0
+        norm_x = torch.where(condition, norm12_x, norm_x)
+        norm_y = torch.where(condition, norm12_y, norm_y)
+
+        condition = (norm20_x * norm20_x_ + norm20_y * norm20_y_) < 0
+        norm_x = torch.where(condition, norm20_x, norm_x)
+        norm_y = torch.where(condition, norm20_y, norm_y)
+
+        dist = dist / (dist**2).sum(dim=1, keepdim=True)
+        self.Af[:] = dist[:, 0] * norm_x + dist[:, 1] * norm_y
+        self.Ac[:] = - self.reducer(self.Af)
+
+        p0 = self.selector_cells_p[0](self.points)
+        x0 = p0[:, 0]
+        y0 = p0[:, 1]
+        p1 = self.selector_cells_p[1](self.points)
+        x1 = p1[:, 0]
+        y1 = p1[:, 1]
+        p2 = self.selector_cells_p[2](self.points)
+        x2 = p2[:, 0]
+        y2 = p2[:, 1]
+
+        center = torch.tensor([[0.5, 0.5]]).double()
+        area = 0.5 * torch.abs(
+            x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1)
+        )
+
+        self.centroid[:] = (p0 + p1 + p2) / 3.
+        self.rho[:] = torch.exp(
+            -0.5 * 400 * ((self.centroid - center)**2).sum(1)
+        )
+        self.b[:] = self.rho * area
+
+        # boundary condition
+        b_p0 = points[bpoints[:, 0]]
+        b_p1 = points[bpoints[:, 1]]
+        b_cell_cent = centroid[bcells]
+        b_face_cent = (b_p0 + b_p1) / 2.
+
+        bnorm_x, bnorm_y = _get_face_norm(b_cell_cent, b_p0, b_p1)
+        bdist = b_face_cent - b_cell_cent
+        bdist = bdist / (bdist**2).sum(dim=-1, keepdim=True)
+
+        Ac.sub_(_reduce(
+            bdist[:, 0] * bnorm_x + bdist[:, 1] * bnorm_y, bcells, cells.shape[0]))
+
+
+def TODO_assemble(mesh_path: str):
+    dir, mesh_name = os.path.split(mesh_path)
+    poisson_path = os.path.join(dir, 'Poisson_' + mesh_name)
+    # if os.path.exists(path):
+    #     return path
+
+    components = PoissonMeshComponentsCollector(mesh_path)
+    [components] = esr.compile([components], 'torch')  # type: ignore
+    components: PoissonMeshComponentsCollector
+    components()
+
+    for i in range(3):
+        components.src_p[i].save(poisson_path, f'src_p{i}')
+        components.dst_p[i].save(poisson_path, f'dst_p{i}')
+        components.cells_p[i].save(poisson_path, f'cells_p{i}')
+
+    initializer = PoissonInitializer(poisson_path, mesh_path)
+    [initializer] = esr.compile([initializer], 'torch')  # type: ignore
+    initializer: PoissonInitializer
+    initializer()
+
+    initializer.Ac.save(poisson_path, 'Ac')
+    initializer.rho.save(poisson_path, 'rho')
+    initializer.centroid.save(poisson_path, 'centroid')
+
 
 def _assemble_poisson(mesh_path: str):
     path, name = os.path.split(mesh_path)
     path = os.path.join(path, 'Poisson_' + name)
-    if os.path.exists(path):
-        return path
+    # if os.path.exists(path):
+    #     return path
 
     with h5py.File(mesh_path, 'r') as mesh:
         src = torch.from_numpy(mesh['src'][...]).long()
@@ -52,6 +326,8 @@ def _assemble_poisson(mesh_path: str):
 
     src_p = cells[src]
     dst_p = cells[dst]
+    
+    # print(torch.stack([src_p, dst_p], dim=1))
 
     src_p0 = points[src_p[:, 0]]
     src_p1 = points[src_p[:, 1]]
