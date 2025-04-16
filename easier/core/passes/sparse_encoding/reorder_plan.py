@@ -354,9 +354,9 @@ def build_cascade_reorder_plan_on_rank0(graph_builder: ReorderGraphBuilder):
             reorder_graph[hintsrc][hintdst].items()
         )
         pattern = edge_data['pattern']
-        cascade_hints.append(f"{hintsrc.hint} -" + (
-            "R" if isinstance(pattern, esr.Reducer) else "S"
-        ) + f"-> {hintdst.hint}")
+        cascade_hints.append(
+            f"{hintsrc.hint} -{pattern.easier_hint_name}-> {hintdst.hint}"
+        )
     logger.debug(
         "Cascade-reordering tree:\n\t" + '\n\t'.join(cascade_hints)
     )
