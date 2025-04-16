@@ -150,6 +150,19 @@ class PoissonInitializer(esr.Module):
             ) for i in range(2)
         ])
 
+        # TODO make this a replica esr.Tensor so that we can use `Mod.to()`
+        # to move it and change dtype. Only torch parameters and buffers are
+        # affected.
+        # OTAH, `self.center = torch.tensor()` also works, but users must
+        # change it dtype specifically and manually. (EASIER will move it).
+        # Inline `centroid - torch.tensor()` works too. But no way to change
+        # dtype. During FX tracing we can only get symbolic proxy for `.dtype`,
+        # but the tensor() call requires a real dtype object.
+        self.center = esr.Tensor(
+            torch.tensor([[0.5, 0.5]], dtype=torch.double, device=device),
+            mode='replicate'
+        )
+
         #
         # Output
         #
@@ -235,14 +248,13 @@ class PoissonInitializer(esr.Module):
         x2 = p2[:, 0]
         y2 = p2[:, 1]
 
-        center = torch.tensor([[0.5, 0.5]]).double()
         area = 0.5 * torch.abs(
             x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1)
         )
 
         self.centroid[:] = (p0 + p1 + p2) / 3.
         self.rho[:] = torch.exp(
-            -0.5 * 400 * ((self.centroid - center)**2).sum(1)
+            -0.5 * 400 * ((self.centroid - self.center)**2).sum(1)
         )
         self.b[:] = self.rho * area
 
