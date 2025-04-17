@@ -143,6 +143,26 @@ class TestDataLoader:
         else:
             assert tensor.device.type == target_device_type
 
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_to(self, data_loader_ctor, dtype: torch.dtype, device_type: str):
+        dl: DataLoaderBase = data_loader_ctor(dtype, 'cpu')
+
+        if dtype.is_floating_point:
+            dl_f16 = dl.to(dtype=torch.float16)
+            assert dl is not dl_f16
+            assert dl_f16.device.type == 'cpu'
+            assert dl_f16.dtype == torch.float16
+        else:
+            dl_i8 = dl.to(dtype=torch.int8)
+            assert dl is not dl_i8
+            assert dl_i8.device.type == 'cpu'
+            assert dl_i8.dtype == torch.int8  # not changed
+
+        dl_device = dl.to(device=device_type)
+        assert dl is not dl_device
+        assert dl_device.device.type == device_type
+        assert dl_device.dtype == dtype
+
 
 def worker__test_load_full_by_rank(local_rank: int, world_size: int,
                                    dtype: torch.dtype, device_type: str):
