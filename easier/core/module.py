@@ -23,7 +23,6 @@ from torch import fx
 
 import h5py
 
-from easier.core.passes.utils import get_easier_objects
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
@@ -300,8 +299,10 @@ def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
     return synced.to(device=tensor.easier_data_loader.device)
 
 
-def _parse_to_args(
-    cls_name: Literal['Module', 'Selector', 'Reducer', 'Tensor'], args, kwargs
+def _resolve_to_args(
+    cls_name: Literal['Module', 'Selector', 'Reducer', 'Tensor'],
+    args: tuple,
+    kwargs: dict
 ) -> Tuple[Optional[torch.device], Optional[torch.dtype]]:
     """
     PyTorch nn.Module.to() or torch.Tensor.to() have multiple overloadings:
@@ -314,10 +315,9 @@ def _parse_to_args(
     TODO for the sake of simplicity, we take only one argument for now.
     To change both dtype and device, users could use a chain of calls
     `mod.to(dtype).to(device)` for now.
-
     """
     # TODO validate kwargs.values() are well typed, e.g. avoid device=int64
-    _args = set(*args, *kwargs.values())
+    _args = set(args).union(kwargs.values())
     if len(_args) != 1:
         raise NotImplementedError(
             f'Currently easier.{cls_name}.to() only supports one argument,'
@@ -537,7 +537,7 @@ class Tensor(nn.Parameter):
                 repr_str = ''
             return 'Managed partitioned easier.Tensor' + repr_str
 
-    def __setitem__(self, indices, val) -> 'Tensor':
+    def __setitem__(self, indices, val) -> Self:
         """
         This __setitem__ generally runs for setting replicated easier.Tensor
         content, outside the scope for compiled easier.Module.forward().
@@ -572,7 +572,7 @@ class Tensor(nn.Parameter):
                 " before easier.compile()"
             )
 
-        device, dtype = _parse_to_args('Tensor', args, kwargs)
+        device, dtype = _resolve_to_args('Tensor', args, kwargs)
         
         self.easier_data_loader = self.easier_data_loader.to(
             device=device, dtype=dtype
@@ -749,7 +749,7 @@ class Module(nn.Module):
                 " before easier.compile()"
             )
         
-        device, fp_dtype = _parse_to_args('Module', args, kwargs)
+        device, fp_dtype = _resolve_to_args('Module', args, kwargs)
         if fp_dtype is not None:
             if not fp_dtype.is_floating_point:
                 # TODO check dtype.is_complex
@@ -757,6 +757,9 @@ class Module(nn.Module):
                     f"easier.Module.to() does not accept the dtype {fp_dtype},"
                     " floating point dtypes are required"
                 )
+        
+        # avoid circular import
+        from easier.core.passes.utils import get_easier_objects
         
         # Keys are Modules/Selectors/Reducers/Tensors/DataLoaders,
         # remarkably:
