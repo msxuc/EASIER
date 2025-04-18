@@ -545,7 +545,12 @@ class Tensor(nn.Parameter):
                 _dist_save(self, None)  # collectively save dist tensor
 
 
-def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
+def _dist_save(
+    tensor: 'Tensor',
+    h5d: Optional[h5py.Dataset],
+    *,
+    chunk_size: Optional[int] = None
+) -> None:
     """
     Save all distributed part of an `esr.Tensor` into a HDF5 dataset.
 
@@ -559,7 +564,7 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
     assert tensor.elempart is not None
 
     dist_env = get_runtime_dist_env()
-    chunk_size = 1024 * 1024 * 128  # roughly 128M elements
+    chunk_size = chunk_size or 1024 * 1024 * 128  # roughly 128M elements
 
     orig_len = tensor.easier_data_loader.shape[0]
     sub_shape = tensor.easier_data_loader.shape[1:]
@@ -568,39 +573,27 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
     if remainder > 0:
         nchunk += 1
 
-    idx = tensor.elempart.idx  # already ordered, but discrete.
-
-    # Count how many indexes each chunk has on this rank
-    chunk_counts = torch.bincount(
-        idx // chunk_size,  # determine chunk IDs of each elempart index
-        minlength=nchunk)
-
-    # TODO to bincount all chunked slices is a simple and direct approach.
-    # An alternative approach is to `torch.searchsorted` since idx is ordered,
-    # which is binary search underneath and may be more efficient (but save()
-    # is called outside of computing workflow although)
-
-    idx_start = 0
+    idx = tensor.elempart.idx
 
     for i in range(nchunk):
-        slice_len = int(chunk_counts[i])
-        idx_end = idx_start + slice_len
+        idx_start = chunk_size * i
+        idx_end = builtins.min(orig_len, chunk_size * (i + 1))
 
-        idx_slice = idx[idx_start:idx_end].to(dist_env.comm_device)
-        data_slice = tensor[idx_start:idx_end].to(dist_env.comm_device)
+        # TODO O(orig_len * nchunk) complexity, maybe sorting elempart.idx
+        # first could make it faster.
+        idx_region = torch.logical_and(idx >= idx_start, idx < idx_end)
+        local_idx_slice = idx[idx_region].to(dist_env.comm_device) - idx_start
+        data_slice = tensor[idx_region].to(dist_env.comm_device)
 
-        idx_slices = dist_env.gather(0, idx_slice)
+        idx_slices = dist_env.gather(0, local_idx_slice)
         data_slices = dist_env.gather(0, data_slice)
-
-        idx_start = idx_end  # for next step
 
         if dist_env.rank == 0:
             assert isinstance(idx_slices, list)
             assert isinstance(data_slices, list)
             assert len(idx_slices) == len(data_slices)
 
-            chuck_size_i = builtins.min(
-                orig_len, chunk_size * (i+1)) - chunk_size * i
+            chuck_size_i = idx_end - idx_start
             assert builtins.sum(s.shape[0] for s in idx_slices) == chuck_size_i
 
             h5d_slice = torch.empty(
@@ -608,12 +601,13 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
                 dtype=tensor.dtype,
                 device=dist_env.comm_device
             )
-            for idx_slice, data_slice in zip(idx_slices, data_slices):
-                assert idx_slice.shape[0] == data_slice.shape[0]
-                h5d_slice[idx_slice] = data_slice
+            for local_idx_slice, data_slice in zip(idx_slices, data_slices):
+                assert local_idx_slice.shape[0] == data_slice.shape[0]
+                h5d_slice[local_idx_slice] = data_slice
 
             assert h5d is not None
-            h5d[(chunk_size*i):(chunk_size*i+chuck_size_i)] = h5d_slice.cpu()
+            h5d[(chunk_size * i):(chunk_size * i + chuck_size_i)] = \
+                h5d_slice.cpu()
 
 
 class Module(nn.Module):
