@@ -230,7 +230,8 @@ def worker__test_save(local_rank: int, world_size: int,
 
     torch.manual_seed(2345)
     jitted, = esr.compile(
-        [Model(3, model_dev)], backend='torch')  # type: ignore
+        [Model(3, model_dev)], backend='torch'  # type: ignore
+    )
     jitted: Model
     jitted()
 
@@ -245,9 +246,21 @@ def worker__test_save(local_rank: int, world_size: int,
     else:
         fpath = None
 
-    jitted.vertex_tensor.save(fpath, 'vertex')
-    jitted.edge_tensor.save(fpath, 'edge')
-    jitted.tensor.save(fpath, 'replica')
+    from easier.core.module import _dist_save as _orig_dist_save
+
+    def _dist_save_with_chunk_size(tensor, h5d, *, chunk_size=None):
+        # Test when chuck size is smaller than the dataset size.
+        return _orig_dist_save(tensor, h5d, chunk_size=13)
+
+    with patch(f'{_orig_dist_save.__module__}._dist_save') as mock_dist_save:
+        mock_dist_save.side_effect = _dist_save_with_chunk_size
+
+        jitted.vertex_tensor.save(fpath, 'vertex')
+        jitted.edge_tensor.save(fpath, 'edge')
+        jitted.tensor.save(fpath, 'replica')
+
+        # replica.save() does not call _dist_save()
+        assert mock_dist_save.call_count == 2
 
     if local_rank == 0:
         with h5py.File(fpath, 'r') as h5f:
