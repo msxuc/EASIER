@@ -767,12 +767,17 @@ def log_metis_input_statistics(
         return
 
     def _debug(category, ints: torch.Tensor):
-        amin, amax = torch.aminmax(ints)
-        std, mean = torch.std_mean(ints.to(torch.float32))
+        # If all vertexes are isolated, adjw is zero-length.
+        if ints.nelement() == 0:
+            amin, amax, median, std, mean = 0, 0, 0, 0, 0
+        else:
+            amin, amax = torch.aminmax(ints)
+            median = ints.median()
+            std, mean = torch.std_mean(ints.to(torch.float32))
         logger.debug(
             f"METIS input of EASIER-coarsened {category}"
             f": max={int(amax)}, min={int(amin)}"
-            f", median={int(ints.median())}"
+            f", median={int(median)}"
             f", mean={float(mean)}, std={float(std)}"
         )
 
