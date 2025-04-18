@@ -582,32 +582,31 @@ def _dist_save(
         # TODO O(orig_len * nchunk) complexity, maybe sorting elempart.idx
         # first could make it faster.
         idx_region = torch.logical_and(idx >= idx_start, idx < idx_end)
-        local_idx_slice = idx[idx_region].to(dist_env.comm_device) - idx_start
-        data_slice = tensor[idx_region].to(dist_env.comm_device)
+        chunk_idx = idx[idx_region].to(dist_env.comm_device) - idx_start
+        chunk_data = tensor[idx_region].to(dist_env.comm_device)
 
-        idx_slices = dist_env.gather(0, local_idx_slice)
-        data_slices = dist_env.gather(0, data_slice)
+        idx_chunks = dist_env.gather(0, chunk_idx)
+        data_chunks = dist_env.gather(0, chunk_data)
 
         if dist_env.rank == 0:
-            assert isinstance(idx_slices, list)
-            assert isinstance(data_slices, list)
-            assert len(idx_slices) == len(data_slices)
+            assert isinstance(idx_chunks, list)
+            assert isinstance(data_chunks, list)
+            assert len(idx_chunks) == len(data_chunks)
 
             chuck_size_i = idx_end - idx_start
-            assert builtins.sum(s.shape[0] for s in idx_slices) == chuck_size_i
+            assert builtins.sum(s.shape[0] for s in idx_chunks) == chuck_size_i
 
-            h5d_slice = torch.empty(
+            h5d_chunk = torch.empty(
                 (chuck_size_i,) + sub_shape,
                 dtype=tensor.dtype,
                 device=dist_env.comm_device
             )
-            for local_idx_slice, data_slice in zip(idx_slices, data_slices):
-                assert local_idx_slice.shape[0] == data_slice.shape[0]
-                h5d_slice[local_idx_slice] = data_slice
+            for chunk_idx, chunk_data in zip(idx_chunks, data_chunks):
+                assert chunk_idx.shape[0] == chunk_data.shape[0]
+                h5d_chunk[chunk_idx] = chunk_data
 
             assert h5d is not None
-            h5d[(chunk_size * i):(chunk_size * i + chuck_size_i)] = \
-                h5d_slice.cpu()
+            h5d[idx_start:idx_end] = h5d_chunk.cpu()
 
 
 class Module(nn.Module):
