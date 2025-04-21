@@ -1,10 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import os
+import tempfile
 from typing import Union
+import h5py
 import pytest
 import torch
 import easier
+from easier.core.utils import get_random_str
+from tests.utils import when_ngpus_ge_2
 
 
 def fully_load_data(t: easier.Tensor):
@@ -134,18 +139,30 @@ class TestJitNoneBackendUsage:
         assert m.r.device == cuda0
         assert m.reducer.idx.device == cuda0
 
-    def test_collect(self):
+    @pytest.mark.usefixtures('dummy_dist_env')
+    @pytest.mark.parametrize('dev_type', [
+        'cpu',
+        pytest.param('cuda', marks=when_ngpus_ge_2)
+    ])
+    def test_collect_save(self, dev_type: str):
         n = 3
+        dev = torch.device(dev_type)
 
         class M(easier.Module):
             def __init__(self) -> None:
                 super().__init__()
                 self.v = easier.Tensor(
-                    torch.rand(3, 3, dtype=torch.float64), mode='partition')
+                    torch.rand(3, 3, dtype=torch.float64, device=dev),
+                    mode='partition'
+                )
                 self.e = easier.Tensor(
-                    torch.rand(4, 3, dtype=torch.float64), mode='partition')
+                    torch.rand(4, 3, dtype=torch.float64, device=dev),
+                    mode='partition'
+                )
                 self.r = easier.Tensor(
-                    torch.rand(9, 3, dtype=torch.float64), mode='replicate')
+                    torch.rand(9, 3, dtype=torch.float64, device=dev),
+                    mode='replicate'
+                )
 
         m = M()
         [m] = easier.compile([m], backend='none')
@@ -153,3 +170,16 @@ class TestJitNoneBackendUsage:
         assert torch.equal(m.v.collect(), m.v)
         assert torch.equal(m.e.collect(), m.e)
         assert torch.equal(m.r.collect(), m.r)
+
+        fn = get_random_str() + ".hdf5"
+        dir = os.path.join(tempfile.gettempdir(), "easier", "tests")
+        fpath = os.path.join(dir, fn)
+
+        m.v.save(fpath, 'v')
+        m.e.save(fpath, 'e')
+        m.r.save(fpath, 'r')
+
+        with h5py.File(fpath, 'r') as h5f:
+            torch.testing.assert_close(torch.from_numpy(h5f['v'][:]), m.v.cpu())
+            torch.testing.assert_close(torch.from_numpy(h5f['e'][:]), m.e.cpu())
+            torch.testing.assert_close(torch.from_numpy(h5f['r'][:]), m.r.cpu())
