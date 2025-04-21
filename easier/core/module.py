@@ -23,7 +23,8 @@ from torch import fx
 
 import h5py
 
-from easier.core.runtime.dist_env import get_runtime_dist_env
+from easier.core.runtime.dist_env import \
+    get_runtime_dist_env, get_default_dist_env
 from easier.core.runtime.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
     FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
@@ -518,8 +519,9 @@ class Tensor(nn.Parameter):
         if not self.easier_data_ready:
             raise RuntimeError("Tensor data is not ready, run compile() first")
 
-        dist_env = get_runtime_dist_env()
-        if dist_env.rank == 0:
+        # with 'none' backend we don't have runtime_dist_env configured.
+        rank = get_default_dist_env().rank
+        if rank == 0:
 
             h5_file_path = os.path.expanduser(h5_file_path)
 
@@ -538,7 +540,7 @@ class Tensor(nn.Parameter):
                 if self.elempart is not None:
                     _dist_save(self, h5d)  # collectively save dist tensor
                 else:
-                    h5d[...] = self.data.cpu()  # replica
+                    h5d[...] = self.data.cpu()  # replica or 'none' backend
 
         else:
             if self.elempart is not None:
