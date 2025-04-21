@@ -78,6 +78,7 @@ class TestReducer:
 
         assert torch.equal(res0, res1)
 
+
 @pytest.mark.usefixtures('dummy_dist_env')
 @pytest.mark.parametrize('device_type', [
     'cpu',
@@ -103,9 +104,9 @@ def test_to(device_type: str):
             self.reducer = easier.Reducer(torch.arange(2), 22)
 
             self.opt_inner = opt_inner
-        
+
     notcasted = M(None)
-    
+
     inner = M(None)
     outer = M(inner)
 

@@ -336,7 +336,6 @@ def _resolve_to_args(
         )
 
 
-
 IdxStatus: TypeAlias = Literal['placeholder', 'partially_loaded', 'rewritten']
 
 
@@ -463,7 +462,7 @@ class Reducer(nn.Module):
             (...,) + (None,) * (len(shape) - 1)].expand(-1, *shape[1:])
         return out.scatter_reduce_(0, idx, tensor, self.reduce,
                                    include_self=False)
-                                
+
     def to(self, device: Union[str, torch.device]) -> Self:
         # easier.Module/Selector/Reducer cannot take int dtype.
         # While Selector (essentially doing a[b]) can have int32/int16
@@ -478,7 +477,6 @@ class Reducer(nn.Module):
         self.easier_data_loader = self.easier_data_loader.to(device=device)
         self.idx = self.easier_data_loader.get_placeholder()
         return self
-
 
 
 class Tensor(nn.Parameter):
@@ -573,13 +571,12 @@ class Tensor(nn.Parameter):
             )
 
         device, dtype = _resolve_to_args('Tensor', args, kwargs)
-        
+
         self.easier_data_loader = self.easier_data_loader.to(
             device=device, dtype=dtype
         )
         self.data = self.easier_data_loader.get_placeholder()
         return self
-
 
     def collect(self) -> torch.Tensor:
         if not self.easier_data_ready:
@@ -748,7 +745,7 @@ class Module(nn.Module):
                 "The properties of easier.Module can only be modified"
                 " before easier.compile()"
             )
-        
+
         device, fp_dtype = _resolve_to_args('Module', args, kwargs)
         if fp_dtype is not None:
             if not fp_dtype.is_floating_point:
@@ -757,10 +754,10 @@ class Module(nn.Module):
                     f"easier.Module.to() does not accept the dtype {fp_dtype},"
                     " floating point dtypes are required"
                 )
-        
+
         # avoid circular import
         from easier.core.passes.utils import get_easier_objects
-        
+
         # Keys are Modules/Selectors/Reducers/Tensors/DataLoaders,
         # remarkably:
         # - for Modules, including self, do nothing;
@@ -782,7 +779,6 @@ class Module(nn.Module):
                         obj.to(fp_dtype)
 
         return self
-
 
 
 def _allreduce(op, tensor: torch.Tensor, *args, **kwargs):
