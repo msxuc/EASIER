@@ -1,7 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+<<<<<<< HEAD
 from dataclasses import dataclass
+=======
+>>>>>>> zerolength
 import dataclasses
 import itertools
 import operator
@@ -15,9 +18,15 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
+<<<<<<< HEAD
 from easier.core.passes.metadata_propagation import \
     Role, StaticNodeMeta, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
     get_runtime_tensor_metadata, get_static_node_metadata
+=======
+from easier.core.runtime.metadata import \
+    Role, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
+    get_node_meta
+>>>>>>> zerolength
 
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.utils import logger, EasierJitException
@@ -26,8 +35,11 @@ import easier.core.module as esr
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
 
+<<<<<<< HEAD
 if TYPE_CHECKING:
     from easier.core.runtime.jit_engine import RuntimeValue
+=======
+>>>>>>> zerolength
 
 KEY__DATA_DEPENDENCY_INPUTS = 'easier_dataDependency_inputs'
 KEY__DATA_DEPENDENCY_USERS = 'easier_dataDependency_users'
@@ -174,15 +186,10 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
         self.src2readers[res_src] = OrderedSet()
 
     def is_skipped(self, node: Node):
-        """
-        Test if the specific `node` (NOT `self.current_node`) is skipped
-        in JitEngine.
-
-        The judgement is the same as
-        jit_engine.NodeEvaluationHandler.is_skippable()
-        """
-        from easier.core.runtime.jit_engine import is_nonhalo_and_zerolength
-        return is_nonhalo_and_zerolength(self.current_module, node)
+        meta = get_node_meta(node)
+        if isinstance(meta, RuntimeTensorMeta):
+            return meta.role == Role.DISTRIBUTED and meta.shape[0] == 0
+        return False
 
     def for_each_node(self):
         # Some ops may take multiple input writable tensors, and the result
@@ -208,7 +215,7 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
         arg_srcs_coll = _ViewSrcCollector()
         _ = tree_map(
             [
-                get_runtime_tensor_metadata(arg)
+                get_node_meta(arg)
                 for arg in self.current_node.all_input_nodes
                 if not self.is_skipped(arg)
             ],
@@ -222,7 +229,7 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
         # writers, and leading to extra writer dep barriers and handling.
         res_srcs_coll = _ViewSrcCollector()
         _ = tree_map(
-            get_runtime_tensor_metadata(self.current_node),
+            get_node_meta(self.current_node),
             res_srcs_coll.collect_view_src
         )
         for res_src in res_srcs_coll.view_srcs:
@@ -253,6 +260,7 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
 
             for n in self.current_graph.nodes:
                 if n.op == FX.GET_ATTR:
+<<<<<<< HEAD
                     node_meta = get_static_node_metadata(n)
                     if node_meta.role == Role.DISTRIBUTED \
                             and node_meta.batch_size == 0:
@@ -263,6 +271,19 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
                     assert runtime_meta.view_src is not None
                     param_srcs.add(runtime_meta.view_src)
 
+=======
+                    meta = get_node_meta(n)
+                    assert isinstance(meta, RuntimeTensorMeta)
+
+                    if meta.role == Role.DISTRIBUTED and meta.shape[0] == 0:
+                        # Even it's get_attr of an esr.Tensor, if it's skipped
+                        # the Node has no view info.
+                        continue
+
+                    assert meta.view_src is not None
+                    param_srcs.add(meta.view_src)
+
+>>>>>>> zerolength
             for param_src in param_srcs:
                 self.add_reader_dependency(param_src)
                 self.add_writer_dependency(param_src)

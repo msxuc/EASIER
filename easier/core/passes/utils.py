@@ -525,6 +525,29 @@ class FX:
     OUTPUT = "output"
 
 
+def get_attr_value(root: esr.Module, node: Node) -> torch.Tensor:
+    assert node.op == FX.GET_ATTR
+    path = cast(str, node.target)
+    submod_path, _sep, attr_name = path.rpartition(".")
+    submod = root.get_submodule(submod_path)
+    obj = getattr(submod, attr_name)
+
+    if not isinstance(obj, torch.Tensor):
+        raise EasierJitException(
+            "Currently we can only reference"
+            " torch.Tensor and subtypes"
+        )
+
+    return obj
+
+
+def get_called_module(root: esr.Module, node: Node) -> torch.nn.Module:
+    assert node.op == FX.CALL_MODULE
+    submod_path = cast(str, node.target)
+    submod = root.get_submodule(submod_path)
+    return submod
+
+
 def _fx_normalization_arg_type_infer(arg) -> type:
     if isinstance(arg, Node):
         # For the category of FX-normalizable ops, FX doesn't allow a Node

@@ -177,6 +177,7 @@ def worker__test_collect(local_rank: int, world_size: int,
     m, = esr.compile(
         [Model(3, model_dev)], backend='none')
     m()
+    m()
 
     orig_vertex = m.vertex_tensor.clone().cpu()
     orig_edge = m.edge_tensor.clone().cpu()
@@ -186,6 +187,7 @@ def worker__test_collect(local_rank: int, world_size: int,
     jitted, = esr.compile(
         [Model(3, model_dev)], backend=jit_backend)  # type: ignore
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
@@ -223,6 +225,7 @@ def worker__test_save(local_rank: int, world_size: int,
     torch.manual_seed(2345)
     m, = esr.compile([Model(3, model_dev)], backend='none')
     m()
+    m()
 
     orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
     orig_edge = m.edge_tensor.data.to(device='cpu', copy=True)
@@ -233,6 +236,7 @@ def worker__test_save(local_rank: int, world_size: int,
         [Model(3, model_dev)], backend='torch'  # type: ignore
     )
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
@@ -321,6 +325,7 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     m = Model(3, 'cpu')
     [m] = esr.compile([m], backend='none')
     m()
+    m()
 
     orig_vertex = m.vertex_tensor.clone()
     orig_edge = m.edge_tensor.clone()
@@ -332,6 +337,7 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
         [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
@@ -351,6 +357,7 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
     torch.manual_seed(2345)
     m, = esr.compile([Model(3, 'cpu')], backend='none')
     m()
+    m()
 
     orig_vertex = m.vertex_tensor.data.to(device='cpu', copy=True)
     orig_edge = m.edge_tensor.data.to(device='cpu', copy=True)
@@ -362,6 +369,7 @@ def worker__test_zerolength_save(local_rank: int, world_size: int, dev_type):
     with multi_stage_zero_length_partition((m.vertex_tensor, m.edge_tensor)):
         [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted: Model
+    jitted()
     jitted()
 
     # Simple test that partition is really done.
@@ -422,12 +430,14 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     m = NotFullModel()
     [jitted] = esr.compile([m], backend='none')
     jitted()
+    jitted()
     orig_v = jitted.vertex.clone().cpu()
     orig_e = jitted.edge.clone().cpu()
     orig_r = jitted.replica.clone().cpu()
 
     m = NotFullModel()
     [jitted] = esr.compile([m], backend=dev_type)
+    jitted()
     jitted()
     collected_v = jitted.vertex.collect().cpu()
     collected_e = jitted.edge.collect().cpu()

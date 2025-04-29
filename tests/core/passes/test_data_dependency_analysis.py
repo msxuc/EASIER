@@ -16,10 +16,10 @@ from easier.core.module import Selector, Reducer, Tensor
 from easier.core.passes.data_dependency_analysis import \
     get_data_dependency_inputs, get_data_dependency_users, \
     KEY__DATA_DEPENDENCY_USERS, KEY__DATA_DEPENDENCY_INPUTS
-from easier.core.passes.metadata_propagation import \
-    ViewSrc, get_runtime_tensor_metadata
-from easier.core.runtime.jit_engine import \
-    FisrtRunNodeEvaluationHandler, JitEngine
+from easier.core.runtime.metadata import \
+    ViewSrc, get_node_meta, RuntimeTensorMeta
+from easier.core.runtime.jit_engine.jit_engine import \
+    JitEngine
 from easier.core import passes
 import easier as esr
 from easier.core.passes.utils import FX, tree_map
@@ -47,7 +47,9 @@ def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):
 
 
 def _get_viewsrc(node: Node) -> Union[None, ViewSrc]:
-    return get_runtime_tensor_metadata(node).view_src  # type: ignore
+    meta = get_node_meta(node)
+    assert isinstance(meta, RuntimeTensorMeta)
+    return meta.view_src
 
 
 @pytest.mark.usefixtures('dummy_dist_env')

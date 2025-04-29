@@ -250,7 +250,7 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             replica_allreduce_kwargs = node.kwargs.copy()
         else:
             # param `tensor` is a keyword arg
-            replica_allreduce_args = node.args
+            replica_allreduce_args = node.args  # should be ()
             replica_allreduce_kwargs = node.kwargs.copy()
             replica_allreduce_kwargs.pop('tensor')
 
