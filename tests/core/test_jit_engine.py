@@ -9,29 +9,49 @@ import torch
 from torch.fx.graph import Graph
 from torch.fx.node import Node
 
-from easier.core.jit import EasierTracer
+from easier.core.jit import EasierTracer, _fully_load_data_backend_none
 
 from easier.core.module import Selector, Reducer, Tensor
-from easier.core.passes.metadata_propagation import \
-    Role, StaticNodeMeta, get_static_node_metadata
+from easier.core.runtime.jit_engine.jit_engine import JitEngine
+from easier.core.runtime.metadata import \
+    Role, get_node_meta, collect_meta, RuntimeTensorMeta
 from easier.core.passes.utils import \
     FX
 from easier.core import passes
 import easier as esr
 
 
-def _assert_distributed(node: Node, batch_size: int):
-    meta = get_static_node_metadata(node)
+def _assert_distributed(node: Node, batch_size: int, subshape=None):
+    meta = get_node_meta(node)
+    assert isinstance(meta, RuntimeTensorMeta)
     assert meta.role == Role.DISTRIBUTED
-    assert meta.batch_size == batch_size
+    assert meta.shape[0] == batch_size
+
+    if subshape is not None:
+        assert meta.shape[1:] == tuple(subshape)
+
+    return meta
 
 
-def _assert_replica(node: Node):
-    meta = get_static_node_metadata(node)
+def _assert_replica(node: Node, shape=None):
+    meta = get_node_meta(node)
+    assert isinstance(meta, RuntimeTensorMeta)
     assert meta.role == Role.REPLICATED
 
+    if shape is not None:
+        assert meta.shape == tuple(shape)
 
+    return meta
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
 class TestMetadataPropagation:
+    """
+    Cases that TensorMeta.view_src being static and fixed are tested in
+    passes/test_data_dependency_analysis.py
+
+    TODO in the future we may allow metadata change between runs.
+    """
 
     def test_easier_primitives(self):
         class M(esr.Module):
@@ -47,13 +67,16 @@ class TestMetadataPropagation:
 
         m = M()
         graph = EasierTracer().trace(m)
-        [m], [graph] = passes.propagate_static_node_metadata([m], [graph])
+
+        _fully_load_data_backend_none([m], 'cpu')
+        engine = JitEngine(m, graph)
+        engine.forward()
 
         getattr_v, call_s, call_r, output = graph.nodes
 
-        _assert_distributed(getattr_v, 11)
-        _assert_distributed(call_s, 4)
-        _assert_distributed(call_r, 22)
+        _assert_distributed(getattr_v, 11, [3])
+        _assert_distributed(call_s, 4, [3])
+        _assert_distributed(call_r, 22, [3])
         _assert_replica(output)
 
     def test_getsetitem(self):
@@ -71,7 +94,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v, t, ..., out
             return list(graph.nodes)[2:-1]
 
@@ -91,7 +118,7 @@ class TestMetadataPropagation:
             t2 = t + 2  # out-of-index, but ok for metadata
             v[:, None, 0:2, ..., None, t2]
         calct2, slice4, = _case(_case4)
-        _assert_replica(calct2)
+        _assert_replica(calct2, [5, 6, 7])
         _assert_distributed(slice4, 11)
 
         def _case5(v, t):
@@ -116,7 +143,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v1, v2, ..., out
             return list(graph.nodes)[2:-1]
 
@@ -140,13 +171,17 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v, ..., out
             return list(graph.nodes)[1:-1]
 
         sum_full, sum_0rank = _case(lambda x: esr.sum(x).sum())
-        _assert_replica(sum_full)
-        _assert_replica(sum_0rank)
+        _assert_replica(sum_full, [1, 2, 3, 4])
+        _assert_replica(sum_0rank, [])
 
     def test_overloads(self):
         def _case(fv=lambda x: x, ft=lambda x: x) -> List[Node]:
@@ -167,7 +202,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v, t, ..., out
             return list(graph.nodes)[2:-1]
 
@@ -211,7 +250,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v1, v2, ..., out
             return list(graph.nodes)[:-1]
 
@@ -245,7 +288,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v1, v2, t1, t2, ..., out
             return list(graph.nodes)[4:-1]
 
@@ -276,7 +323,11 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
-            passes.propagate_static_node_metadata([m], [graph])
+
+            _fully_load_data_backend_none([m], 'cpu')
+            engine = JitEngine(m, graph)
+            engine.forward()
+
             # nodes: v1, v2, t1, t2, ..., out
             return list(graph.nodes)[4:-1]
 

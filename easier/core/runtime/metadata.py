@@ -1,0 +1,117 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+import dataclasses
+import enum
+from typing import \
+    Callable, List, Optional, Sequence, Tuple, TypeVar, Union, cast
+from typing_extensions import Literal, TypeAlias
+import more_itertools
+
+import torch
+from torch.fx.node import Node
+
+from easier.core.passes.utils import \
+    FX, get_easier_objects, EasierInterpreter, tree_map
+from easier.core.utils import EasierJitException, logger
+
+
+KEY__METADATA_RUNTIME = 'easier_metadata_runtimeTensorMeta'
+
+
+class Role(enum.Enum):
+    # Does not have batch dim
+    REPLICATED = 0
+
+    # Has batch dim, if batch size == 0 the Node is not runnable
+    # (but if it's HaloExchanger, even if batch size == 0 it must be run)
+    DISTRIBUTED = 1
+
+
+# `ViewSrc` are Nodes allocate allocate the memory blocks for the tensors.
+ViewSrc: TypeAlias = Union[
+    Node,              # non-multi-result op, including get_attr
+    Tuple[Node, int],  # item of multi-result Nodes
+]
+
+
+@dataclasses.dataclass(frozen=True, eq=True)
+class RuntimeTensorMeta:
+    """
+    Runtime metadata is associated with a Tensor instance.
+
+    In contrast to StaticNodeMeta, at runtime we may encounter with cases
+    that a single PyTorch operator returns a tuple/list of Tensors
+    (e.g. `maxval, maxpos = torch.max(dim=1)`).
+
+    Therefore we need to be aware of the potential nested structure of
+    runtime metadata.
+    """
+    role: Role
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+    # NOTE we are treating scalars as ()-shape tensors, those scalars do not
+    # have allocators, and set `view_src = None` for them
+    view_src: Optional[ViewSrc]
+
+
+StructuredTensorMeta: TypeAlias = Union[
+    RuntimeTensorMeta,
+    Sequence['StructuredTensorMeta']
+]
+
+
+_T = TypeVar('_T')
+_TSentinel = TypeVar('_TSentinel')
+
+
+def collect_meta(
+    meta: StructuredTensorMeta,
+    f: Callable[[RuntimeTensorMeta], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None
+) -> List[_T]:
+    ys = []
+
+    def _collect(x):
+        if isinstance(x, RuntimeTensorMeta):
+            y = f(x)
+            if y is not sentinel:
+                ys.append(y)
+
+    _ = tree_map(meta, _collect)
+
+    return ys
+
+
+def set_node_meta(node: Node, tensor_meta: StructuredTensorMeta):
+    node.meta[KEY__METADATA_RUNTIME] = tensor_meta
+
+
+def get_node_meta(node: Node) -> StructuredTensorMeta:
+    return node.meta[KEY__METADATA_RUNTIME]
+
+
+def get_runtime_metadata_from_scalar(
+    val: Union[bool, int, float]
+) -> RuntimeTensorMeta:
+    if isinstance(val, bool):
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.bool, None)
+    elif isinstance(val, int):
+        # PyTorch Python wrapper isn't aware of Python int precision,
+        # so we treat ints as current minimum int32 dtype
+        # so they are compatible with any torch tensor with int-kind dtype.
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.int32, None)
+    elif isinstance(val, float):
+        # Same as int32, treat Python float as current minimum float32.
+        return RuntimeTensorMeta(Role.REPLICATED, (), torch.float32, None)
+    else:
+        # NOTE for types that cannot explicitly appear on `Node.args`,
+        # (`torch.Tensor` is one of such types), their metadata is always
+        # propagated and carried by their corresponding `Node[op='get_attr']`.
+        # We don't expect to see them here.
+        raise EasierJitException(
+            f'Scalar value {val} of type {type(val)}'
+            ' cannot have associated metadata'
+        )
