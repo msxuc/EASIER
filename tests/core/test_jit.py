@@ -391,19 +391,23 @@ class NotFullModel(esr.Module):
         super().__init__()
 
         self.vertex = esr.Tensor(
-            torch.arange(2, 20).double(), mode='partition'
+            torch.arange(2, 38).reshape(-1, 2).double(), mode='partition'
         )
-        self.edge = esr.Tensor(torch.arange(2, 5).double(), mode='partition')
+        self.edge = esr.Tensor(
+            torch.arange(2, 8).reshape(-1, 2).double(), mode='partition'
+        )
         self.selector = esr.Selector(torch.arange(3) // 2)
         self.reducer = esr.Reducer(torch.ones(3, dtype=torch.int64), n=18)
-        self.replica = esr.Tensor(torch.zeros([1]).double(), mode='replicate')
+        self.replica = esr.Tensor(
+            torch.zeros([1, 2]).double(), mode='replicate'
+        )
 
     def forward(self):
         self.edge[:] += self.selector(self.vertex)
-        self.edge[:] += torch.einsum('i,i->i', self.edge, self.edge)
+        self.edge[:] += torch.einsum('ij,ij->ij', self.edge, self.edge)
 
         self.vertex[:] += self.reducer(self.edge)
-        self.vertex[:] += torch.einsum('i,i->i', self.vertex, self.vertex)
+        self.vertex[:] += torch.einsum('ij,ij->ij', self.vertex, self.vertex)
 
         self.replica[:] \
             = esr.sum(self.edge) * 1.2 \
