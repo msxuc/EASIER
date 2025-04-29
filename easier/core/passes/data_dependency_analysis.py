@@ -1,10 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-<<<<<<< HEAD
-from dataclasses import dataclass
-=======
->>>>>>> zerolength
 import dataclasses
 import itertools
 import operator
@@ -18,15 +14,9 @@ import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
-<<<<<<< HEAD
-from easier.core.passes.metadata_propagation import \
-    Role, StaticNodeMeta, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
-    get_runtime_tensor_metadata, get_static_node_metadata
-=======
 from easier.core.runtime.metadata import \
     Role, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
     get_node_meta
->>>>>>> zerolength
 
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.utils import logger, EasierJitException
@@ -35,11 +25,6 @@ import easier.core.module as esr
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
 
-<<<<<<< HEAD
-if TYPE_CHECKING:
-    from easier.core.runtime.jit_engine import RuntimeValue
-=======
->>>>>>> zerolength
 
 KEY__DATA_DEPENDENCY_INPUTS = 'easier_dataDependency_inputs'
 KEY__DATA_DEPENDENCY_USERS = 'easier_dataDependency_users'
@@ -260,18 +245,6 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
 
             for n in self.current_graph.nodes:
                 if n.op == FX.GET_ATTR:
-<<<<<<< HEAD
-                    node_meta = get_static_node_metadata(n)
-                    if node_meta.role == Role.DISTRIBUTED \
-                            and node_meta.batch_size == 0:
-                        continue  # skipped
-
-                    runtime_meta = get_runtime_tensor_metadata(n)
-                    assert isinstance(runtime_meta, RuntimeTensorMeta)
-                    assert runtime_meta.view_src is not None
-                    param_srcs.add(runtime_meta.view_src)
-
-=======
                     meta = get_node_meta(n)
                     assert isinstance(meta, RuntimeTensorMeta)
 
@@ -283,7 +256,6 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
                     assert meta.view_src is not None
                     param_srcs.add(meta.view_src)
 
->>>>>>> zerolength
             for param_src in param_srcs:
                 self.add_reader_dependency(param_src)
                 self.add_writer_dependency(param_src)
