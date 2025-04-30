@@ -276,8 +276,8 @@ class PoissonInitializer(esr.Module):
 def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
     components = PoissonMeshComponentsCollector(mesh, device)
     [components] = esr.compile(
-        [components], 'torch', partition_mode='evenly'  # type: ignore
-    )
+        [components], 'none'
+    )  # type: ignore
     components: PoissonMeshComponentsCollector
     components()
 
@@ -290,8 +290,8 @@ def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
 
     initializer = PoissonInitializer(poisson, mesh, device)
     [initializer] = esr.compile(
-        [initializer], 'torch', partition_mode='evenly'  # type: ignore
-    )
+        [initializer], 'none'
+    )  # type: ignore
     initializer: PoissonInitializer
     initializer()
 
@@ -310,27 +310,20 @@ class Poisson(esr.Module):
     def __init__(self, mesh_size=100, device='cpu', x=None) -> None:
         super().__init__()
 
+        mesh: str
         if torch.distributed.get_rank() == 0:
             mesh = get_triangular_mesh(mesh_size)
-            dir, mesh_name = os.path.split(mesh)
-
-            poisson = os.path.join(dir, 'Poisson_' + mesh_name)
-            hdf5_exists = os.path.exists(poisson)
-
-            torch.distributed.broadcast_object_list(
-                [mesh, poisson, hdf5_exists], 0
-            )
+            torch.distributed.broadcast_object_list([mesh], 0)
         else:
-            recv_objs = [None, None, None]
+            recv_objs = [None]
             torch.distributed.broadcast_object_list(recv_objs, 0)
-            mesh, poisson, hdf5_exists = recv_objs  # type: ignore
+            [mesh] = recv_objs  # type: ignore
 
-        mesh: str
-        poisson: str
-        hdf5_exists: bool
-
-        if not hdf5_exists:
-            _assemble_poisson(mesh, poisson, device=device)
+        data_dir = os.path.expanduser('~/.easier')
+        os.makedirs(data_dir, exist_ok=True)
+        poisson = os.path.join(data_dir, f'Poisson_{mesh_size}.hdf5')
+        if not os.path.exists(poisson):
+            _assemble_poisson(mesh, poisson, device)
 
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
         self.src = esr.hdf5(mesh, 'src', dtype=torch.long, device=device)

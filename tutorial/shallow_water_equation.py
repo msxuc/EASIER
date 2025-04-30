@@ -92,30 +92,98 @@ class ShallowWaterMeshComponentsCollector(esr.Module):
 
 
 class ShallowWaterInitializer(esr.Module):
-    def __init__(self, poisson: str, mesh: str, device='cpu'):
+    def __init__(self, shallow_water: str, mesh: str, device='cpu'):
         super().__init__()
+
+        self.points = esr.Tensor(
+            esr.hdf5(mesh, 'points', dtype=torch.double, device=device),
+            mode='partition'
+        )
+
+        cells = esr.hdf5(mesh, 'cells', dtype=torch.long, device=device)
+        nc = cells.shape[0]
 
         self.selector_src_p = torch.nn.ModuleList([
             esr.Selector(
                 esr.hdf5(
-                    poisson, f'src_p{i}', dtype=torch.long, device=device
+                    shallow_water, f'src_p{i}', dtype=torch.long, device=device
                 ),
             ) for i in range(3)
         ])
         self.selector_dst_p = torch.nn.ModuleList([
             esr.Selector(
                 esr.hdf5(
-                    poisson, f'dst_p{i}', dtype=torch.long, device=device
+                    shallow_water, f'dst_p{i}', dtype=torch.long, device=device
                 ),
             ) for i in range(3)
         ])
         self.selector_cells_p = torch.nn.ModuleList([
             esr.Selector(
                 esr.hdf5(
-                    poisson, f'cells_p{i}', dtype=torch.long, device=device
+                    shallow_water, f'cells_p{i}', dtype=torch.long, device=device
                 ),
             ) for i in range(3)
         ])
+
+        ne: int = self.selector_src_p[0].idx.shape[0]  # type: ignore
+
+        # bcells: boundary cell indices, with shape `(nbc,)`,
+        #   `nbc` means number of boundary cell
+        bcells = esr.hdf5(
+            mesh, 'bcells', dtype=torch.long, device=device
+        )
+        nbc = bcells.shape[0]
+
+        self.bselector = esr.Selector(bcells)
+        self.selector_bp = torch.nn.ModuleList([
+            esr.Selector(
+                # bp{i}: boundary points indices in each boundary cell,
+                #   with shape `(nbc,)`, `nbc` means number of boundary cell
+                esr.hdf5(
+                    shallow_water, f'bp{i}', dtype=torch.long, device=device
+                )
+            ) for i in range(2)
+        ])
+
+        #
+        # Output
+        #
+        self.x = esr.Tensor(
+            esr.zeros([nc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.y = esr.Tensor(
+            esr.zeros([nc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.area = esr.Tensor(
+            esr.zeros([nc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.sx = esr.Tensor(
+            esr.zeros([ne], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.sy = esr.Tensor(
+            esr.zeros([ne], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.bsx = esr.Tensor(
+            esr.zeros([nbc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.bsy = esr.Tensor(
+            esr.zeros([nbc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.h = esr.Tensor(
+            esr.zeros([nc], dtype=torch.double, device=device),
+            mode='partition'
+        )
+        self.alpha = esr.Tensor(
+            esr.zeros([ne], dtype=torch.double, device=device),
+            mode='partition'
+        )
 
     def get_alpha(self, sc, dc, p0, p1):
         x1 = sc[:, 0]
@@ -213,175 +281,81 @@ class ShallowWaterInitializer(esr.Module):
         # boundary condition
         b_p0 = self.selector_bp[0](self.points)
         b_p1 = self.selector_bp[1](self.points)
-        b_cell_cent = self.bselector(self.centroid)
+        b_cell_cent = self.bselector(centroid)
 
         bnorm_x, bnorm_y = self.get_face_norm(b_cell_cent, b_p0, b_p1)
         self.bsx[:] = -bnorm_x
         self.bsy[:] = -bnorm_y
 
-class ShallowWaterAssembler:
-    def __init__(self, mesh_path: str):
-        path, name = os.path.split(mesh_path)
-        path = os.path.join(path, 'SW_' + name)
+def _assemble_shallow_water(mesh: str, shallow_water: str, device='cpu'):
+    """
+    TODO this function, as a whole, should be called collectively,
+    as SWMeshCollector/Initializer are collective,
+    because they involves esr.hdf5 calls that depended on
+    collective esr.init and torchrun env.
+    
+    But other steps must be rank-0:
+    -   `compile([mod], 'none')` and `mod()`
+        mainly to save computation, however not strictly required
 
-        self.path = path
+    -   mod.x.save()
+        ~~strictly on rank-0, otherwise data is bad-written~~
+        TODO won't be bad written, as without elempart, save() only writes
+        on rank-0?
+    """
+    components = ShallowWaterMeshComponentsCollector(mesh, device)
+    [components] = esr.compile(
+        [components], 'none'
+    )  # type: ignore
+    components: ShallowWaterMeshComponentsCollector
+    components()
 
-        with h5py.File(mesh_path, 'r') as mesh:
-            self.src = torch.from_numpy(mesh['src'][...]).long()
-            self.dst = torch.from_numpy(mesh['dst'][...]).long()
-            self.cells = torch.from_numpy(mesh['cells'][...]).long()
-            self.points = torch.from_numpy(mesh['points'][...]).double()
-            self.bcells = torch.from_numpy(mesh['bcells'][...]).long()
-            self.bpoints = torch.from_numpy(mesh['bpoints'][...]).long()
+    for i in range(3):
+        components.src_p[i].save(shallow_water, f'src_p{i}')
+        components.dst_p[i].save(shallow_water, f'dst_p{i}')
+        components.cells_p[i].save(shallow_water, f'cells_p{i}')
+    for i in range(2):
+        components.bp[i].save(shallow_water, f'bp{i}')
 
-        nc = self.cells.shape[0]
-        ne = self.src.shape[0]
-        nbc = self.bcells.shape[0]
+    initializer = ShallowWaterInitializer(shallow_water, mesh, device)
+    [initializer] = esr.compile(
+        [initializer], 'none'
+    )  # type: ignore
+    initializer: ShallowWaterInitializer
+    initializer()
 
-        self.x = torch.zeros(nc).double()
-        self.y = torch.zeros(nc).double()
-        self.area = torch.zeros(nc).double()
-        self.sx = torch.zeros(ne).double()
-        self.sy = torch.zeros(ne).double()
-        self.bsx = torch.zeros(nbc).double()
-        self.bsy = torch.zeros(nbc).double()
-        self.h = torch.zeros(nc).double()
-        self.alpha = torch.zeros(ne).double()
+    initializer.x.save(shallow_water, 'x')
+    initializer.y.save(shallow_water, 'y')
+    initializer.area.save(shallow_water, 'area')
+    initializer.sx.save(shallow_water, 'sx')
+    initializer.sy.save(shallow_water, 'sy')
+    initializer.bsx.save(shallow_water, 'bsx')
+    initializer.bsy.save(shallow_water, 'bsy')
+    initializer.h.save(shallow_water, 'h')
+    initializer.alpha.save(shallow_water, 'alpha')
 
-    def assemble(self):
-        if os.path.exists(self.path):
-            return self.path
-
-        points = self.points
-        src_p = self.cells[self.src]
-        dst_p = self.cells[self.dst]
-
-        cell_points = self.points[self.cells, :2]
-
-        src_p0 = points[src_p[:, 0]]
-        src_p1 = points[src_p[:, 1]]
-        src_p2 = points[src_p[:, 2]]
-
-        dst_p0 = points[dst_p[:, 0]]
-        dst_p1 = points[dst_p[:, 1]]
-        dst_p2 = points[dst_p[:, 2]]
-
-        dst_cent = (dst_p0 + dst_p1 + dst_p2) / 3.
-        src_cent = (src_p0 + src_p1 + src_p2) / 3.
-
-        norm01_x, norm01_y = self.get_face_norm(src_p2, src_p0, src_p1)
-        norm12_x, norm12_y = self.get_face_norm(src_p0, src_p1, src_p2)
-        norm20_x, norm20_y = self.get_face_norm(src_p1, src_p2, src_p0)
-
-        norm01_x_, norm01_y_ = self.get_face_norm(dst_cent, src_p0, src_p1)
-        norm12_x_, norm12_y_ = self.get_face_norm(dst_cent, src_p1, src_p2)
-        norm20_x_, norm20_y_ = self.get_face_norm(dst_cent, src_p2, src_p0)
-
-        condition = (norm01_x * norm01_x_ + norm01_y * norm01_y_) < 0
-        self.sx[:] = torch.where(condition, norm01_x, 0.)
-        self.sy[:] = torch.where(condition, norm01_y, 0.)
-        alpha = self.get_alpha(src_cent, dst_cent, src_p0, src_p1)
-        self.alpha[:] = torch.where(condition, alpha, 0.)
-
-        condition = (norm12_x * norm12_x_ + norm12_y * norm12_y_) < 0
-        self.sx[:] = torch.where(condition, norm12_x, self.sx)
-        self.sy[:] = torch.where(condition, norm12_y, self.sy)
-        alpha = self.get_alpha(src_cent, dst_cent, src_p1, src_p2)
-        self.alpha[:] = torch.where(condition, alpha, self.alpha)
-
-        condition = (norm20_x * norm20_x_ + norm20_y * norm20_y_) < 0
-        self.sx[:] = torch.where(condition, norm20_x, self.sx)
-        self.sy[:] = torch.where(condition, norm20_y, self.sy)
-        alpha = self.get_alpha(src_cent, dst_cent, src_p2, src_p0)
-        self.alpha[:] = torch.where(condition, alpha, self.alpha)
-
-        x0 = cell_points[:, 0, 0]
-        y0 = cell_points[:, 0, 1]
-        x1 = cell_points[:, 1, 0]
-        y1 = cell_points[:, 1, 1]
-        x2 = cell_points[:, 2, 0]
-        y2 = cell_points[:, 2, 1]
-
-        self.area[:] = 0.5 * torch.abs(
-            x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1))
-        centroid = cell_points.sum(dim=1) / 3.
-        self.x[:] = centroid[:, 0]
-        self.y[:] = centroid[:, 1]
-
-        self.h[:] = 1 + 0.1 * torch.exp(
-            -100 * ((self.x - 0.0)**2 + (self.y - 0.0)**2)
-        )
-
-        # boundary condition
-        b_p0 = points[self.bpoints[:, 0]]
-        b_p1 = points[self.bpoints[:, 1]]
-        b_cell_cent = centroid[self.bcells]
-
-        bnorm_x, bnorm_y = self.get_face_norm(b_cell_cent, b_p0, b_p1)
-        self.bsx[:] = -bnorm_x
-        self.bsy[:] = -bnorm_y
-
-        with h5py.File(self.path, 'w') as h5f:
-            h5f.create_dataset('x', data=self.x)
-            h5f.create_dataset('y', data=self.y)
-            h5f.create_dataset('area', data=self.area)
-            h5f.create_dataset('sx', data=self.sx)
-            h5f.create_dataset('sy', data=self.sy)
-            h5f.create_dataset('bsx', data=self.bsx)
-            h5f.create_dataset('bsy', data=self.bsy)
-            h5f.create_dataset('h', data=self.h)
-            h5f.create_dataset('alpha', data=self.alpha)
-
-        return self.path
-
-    def get_alpha(self, sc, dc, p0, p1):
-        x1 = sc[:, 0]
-        y1 = sc[:, 1]
-        x2 = dc[:, 0]
-        y2 = dc[:, 1]
-        x3 = p0[:, 0]
-        y3 = p0[:, 1]
-        x4 = p1[:, 0]
-        y4 = p1[:, 1]
-
-        y21 = y2 - y1
-        y43 = y4 - y3
-        y31 = y3 - y1
-        x31 = x3 - x1
-        x21 = x2 - x1
-        x43 = x4 - x3
-
-        return (x31 * y43 - y31 * x43) / (x21 * y43 - y21 * x43)
-
-    def get_face_norm(self, p0, p1, p2):
-        a1 = p0[:, 0]
-        a2 = p0[:, 1]
-        b1 = p1[:, 0]
-        b2 = p1[:, 1]
-        c1 = p2[:, 0]
-        c2 = p2[:, 1]
-
-        s = torch.sign((b1 - c1) * (a2 - c2) - (b2 - c2) * (a1 - c1))
-
-        return s * (b2 - c2), -s * (b1 - c1)
+    return shallow_water
 
 
 class ShallowWaterEquation(esr.Module):
     def __init__(self, mesh_size: int = 100, dt=0.005, device='cpu') -> None:
         super().__init__()
 
+        mesh_path: str
         if torch.distributed.get_rank() == 0:
             mesh_path = get_triangular_mesh(mesh_size)
-            assembler = ShallowWaterAssembler(mesh_path)
-            sw_path = assembler.assemble()
-            assembler = None
-            torch.distributed.broadcast_object_list([mesh_path, sw_path], 0)
+            torch.distributed.broadcast_object_list([mesh_path], 0)
         else:
-            recv_objs = [None, None]
+            recv_objs = [None]
             torch.distributed.broadcast_object_list(recv_objs, 0)
-            mesh_path, sw_path = recv_objs
-        mesh_path: str
-        sw_path: str
+            [mesh_path] = recv_objs  # type: ignore
+
+        data_dir = os.path.expanduser('~/.easier')
+        os.makedirs(data_dir, exist_ok=True)
+        sw_path = os.path.join(data_dir, f'SW_{mesh_size}.hdf5')
+        if not os.path.exists(sw_path):
+            _assemble_shallow_water(mesh_path, sw_path, device)
+
 
         self.dt = dt
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
@@ -500,35 +474,6 @@ class ShallowWaterEquation(esr.Module):
         self.vh[:] += self.dt / 6 * (
             delta_vh1 + delta_vh2 + delta_vh3 + delta_vh4)
 
-def _assemble_shallow_water(mesh: str, shallow_water: str, device='cpu'):
-    components = ShallowWaterMeshComponentsCollector(mesh, device)
-    [components] = esr.compile(
-        [components], 'torch', partition_mode='evenly'  # type: ignore
-    )
-    components: ShallowWaterMeshComponentsCollector
-    components()
-
-    for i in range(3):
-        components.src_p[i].save(shallow_water, f'src_p{i}')
-        components.dst_p[i].save(shallow_water, f'dst_p{i}')
-        components.cells_p[i].save(shallow_water, f'cells_p{i}')
-    for i in range(2):
-        components.bp[i].save(shallow_water, f'bp{i}')
-
-    initializer = ShallowWaterInitializer(shallow_water, mesh, device)
-    [initializer] = esr.compile(
-        [initializer], 'torch', partition_mode='evenly'  # type: ignore
-    )
-    initializer: ShallowWaterInitializer
-    initializer()
-
-    initializer.b.save(shallow_water, 'b')
-    initializer.Ac.save(shallow_water, 'Ac')
-    initializer.Af.save(shallow_water, 'Af')
-    initializer.rho.save(shallow_water, 'rho')
-    initializer.centroid.save(shallow_water, 'centroid')
-
-    return shallow_water
 
 if __name__ == "__main__":
     """
@@ -554,12 +499,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     esr.init(args.comm_backend)
-
-    if args.init_only:
-        
-    data_dir = os.path.expanduser('~/.easier')
-    os.makedirs(data_dir, exist_ok=True)
-    path = os.path.join(data_dir, f'triangular_{mesh_size}.hdf5')
 
     eqn = ShallowWaterEquation(args.scale, args.dt, args.device)
     [eqn] = esr.compile([eqn], args.backend)
