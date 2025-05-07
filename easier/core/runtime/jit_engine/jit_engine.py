@@ -89,10 +89,10 @@ def get_value_runtime_metadata(
             view_src: ViewSrc = node
             addr2viewsrc[addr] = view_src
 
-        tensor_runtime_mete = RuntimeTensorMeta(
+        tensor_runtime_meta = RuntimeTensorMeta(
             role, tuple(val.shape), val.dtype, view_src=view_src
         )
-        return tensor_runtime_mete
+        return tensor_runtime_meta
 
     elif val is None:
         # TODO assert _rec_depth == 0  # possible?
