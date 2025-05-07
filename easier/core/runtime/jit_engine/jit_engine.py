@@ -40,6 +40,20 @@ from easier.core.runtime.jit_engine.values import \
     get_aggregator_neutral_value
 
 
+replica_none_meta = RuntimeTensorMeta(
+    Role.REPLICATED, (), torch.int32, view_src=None
+)
+
+jit_skipped_meta = RuntimeTensorMeta(
+    # It's a convention that Role.DIST and shape=(0,) are used for
+    # skipped Nodes/values,
+    # no matter what shape[1:] will be in the runtime.
+    #
+    # The '0' here should be interpreted as the batch size.
+    Role.DISTRIBUTED, (0,), torch.int32, view_src=None
+)
+
+
 def get_value_runtime_metadata(
     addr2viewsrc: Dict[int, Node], node: Node, role: Role, val,
     *,
@@ -75,30 +89,21 @@ def get_value_runtime_metadata(
             view_src: ViewSrc = node
             addr2viewsrc[addr] = view_src
 
-        tensor_runtime_mete = RuntimeTensorMeta(
+        tensor_runtime_meta = RuntimeTensorMeta(
             role, tuple(val.shape), val.dtype, view_src=view_src
         )
-        return tensor_runtime_mete
+        return tensor_runtime_meta
 
     elif val is None:
         # TODO assert _rec_depth == 0  # possible?
 
         # nested esr.Module calls may return None
-        return RuntimeTensorMeta(
-            Role.REPLICATED, (), torch.int32, view_src=None
-        )
+        return replica_none_meta
 
     elif val is jit_skipped:
         assert _rec_depth == 0, "jit_skipped is always not nested"
 
-        return RuntimeTensorMeta(
-            # It's a convention that Role.DIST and shape=(0,) are used for
-            # skipped Nodes/values,
-            # no matter what shape[1:] will be in the runtime.
-            #
-            # The '0' here should be interpreted as the batch size.
-            Role.DISTRIBUTED, (0,), torch.int32, view_src=None
-        )
+        return jit_skipped_meta
 
     elif isinstance(val, (tuple, list)):
         n_items = len(val)
@@ -445,6 +450,18 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
                     f" but {self.expected_role_size[1]} is expected"
                 )
 
+        from easier.core.runtime.metadata import KEY__METADATA_RUNTIME
+        if KEY__METADATA_RUNTIME in self.current_node.meta:
+            exist_meta = get_node_meta(self.current_node)
+            if exist_meta != runtime_meta:
+                assert False, \
+                    "if another specified Handler has set runtime meta" \
+                    f" for Node:\n    {self.current_node.format_node()}" \
+                    "\nit should be consistent with the general MetaProp," \
+                    " but get:\n" \
+                    f"    {exist_meta}\n" \
+                    f"==> {runtime_meta}"
+
         set_node_meta(self.current_node, runtime_meta)
         return res
 
@@ -472,6 +489,34 @@ class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
             )
 
         return PreprocessDecision.CONTINUE
+
+    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+        """
+        Like PyTorch, esr.sum on int32/etc. will result in int64/etc. to
+        avoid overflow, unless dtype is explicitly specified
+        (TODO aggregators do not support specifying dtype)
+
+        So we need to adjust TensorMeta.dtype to be the real value.
+        """
+        if self.current_node.target in _EsrMod.easier_aggregators:
+            assert isinstance(res, torch.Tensor)
+            res_dtype = res.dtype
+
+            preprocess_meta = get_node_meta(self.current_node)
+            assert isinstance(preprocess_meta, RuntimeTensorMeta)
+            assert preprocess_meta.shape == tuple(res.shape)
+
+            set_node_meta(
+                self.current_node,
+                RuntimeTensorMeta(
+                    Role.REPLICATED,
+                    preprocess_meta.shape,
+                    res_dtype,  # may differ from preprocess_meta.dtype
+                    self.current_node
+                )
+            )
+
+        return res
 
 
 class FirstRunHaloExchangerMetadataPropagation(NodeHandlerBase):
@@ -513,25 +558,13 @@ class FirstRunReducerMetadataPropagation(NodeHandlerBase):
 
             subshape, dtype = allgather_meta_for_collective_input(args[0])
 
-            input_val, opt_out_val = normalize_reducer_call_into_args(
-                *args, **kwargs
-            )
             input_node, opt_out_node = normalize_reducer_call_into_args(
                 *self.current_node.args, **self.current_node.kwargs
             )
 
             view_src = self.current_node
-            if isinstance(input_val, JitSkipped):
-                if opt_out_node is not None:
-                    view_src = \
-                        get_node_meta(opt_out_node).view_src  # type: ignore
-
-            set_node_meta(
-                self.current_node,
-                RuntimeTensorMeta(
-                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype, view_src
-                )
-            )
+            if opt_out_node is not None:
+                view_src = get_node_meta(opt_out_node).view_src  # type: ignore
 
             if submod.n == 0:
                 # In the first run, to allgather Reducer info we need to
@@ -539,12 +572,36 @@ class FirstRunReducerMetadataPropagation(NodeHandlerBase):
                 # However, just like FirstRunMetaProp decides skip or not,
                 # if this local Reducer is a no-op,
                 # after meta prop, we should skip eval.
+                set_node_meta(self.current_node, jit_skipped_meta)
+
                 return PreprocessDecision.SKIP_EVAL
+
+            else:
+                reducer_out_meta = RuntimeTensorMeta(
+                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype, view_src
+                )
+                set_node_meta(self.current_node, reducer_out_meta)
 
         return PreprocessDecision.CONTINUE
 
 
 class AggregatorNeutralInputPreparation(NodeHandlerBase):
+    """
+    Aggregator Nodes are where distributed tensors convert into replicated
+    tensors (before allgather_into_tensor calls).
+    If the distributed input is jit_skipped, we prepare a neutral tensor
+    to be the input.
+
+    Remarks:
+    Instead of directly allocate the neutral tensor to be the result
+    like not-full local Reducer,
+    Because PyTorch has the style of converting int32 to int64
+    to avoid overflow, unless dtype is explicitly specified.
+    So, we allocate the input and run the aggregator to get the real result
+    dtype, and in the first run we all set the real result dtype in
+    FirstRunAggregatorMetaProp.postprocess().
+    """
+
     def preprocess_call_function(
         self,
         function,
