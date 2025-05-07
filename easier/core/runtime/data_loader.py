@@ -210,13 +210,18 @@ class DataLoaderBase:
 
     def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
         """
-        Fully load the dataset, typically for compile backend=='none' case.
-
-        Can be called even without dist env set up -- but if not called on
-        rank-0, the result may be corrupted.
+        Collectively and fully load the dataset on all ranks,
+        typically for compile backend=='none' case.
 
         Args:
         - device: the device to load data to. (self.device will not be used.)
+
+            NOTE
+            Unlike other load methods where data is always loaded to
+            CPU for JIT-internal use, after full load the data is expected
+            to be ready on user-specified device, immediately.
+            So instead of going via CPU, fully_load() accepts the argument
+            for the fianl device.
 
         Returns:
         - torch.Tensor: the full tensor, on the specified device.
@@ -656,13 +661,19 @@ class H5DataLoader(DataLoaderBase):
 
     def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
         """
-        Called by backend=='none' case, EASIER does not initialize DistEnv.
-        EASIER requires there is only one process.
-        # dist_env = get_runtime_dist_env()
+        Called by backend=='none' case, only default_dist_env is available.
         """
-        with self._dataset_as_dtype() as d:
-            t = torch.from_numpy(d[...]).to(device)
-            return t
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+
+        if rank == 0:
+            with self._dataset_as_dtype() as d:
+                t = torch.from_numpy(d[...]).to(dist_env.comm_device)
+                dist_env.broadcast(0, t)
+        else:
+            t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+
+        return t.to(device)
 
     def __repr__(self) -> str:
         return ''.join([

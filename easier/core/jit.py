@@ -26,7 +26,8 @@ from easier.core.passes.utils import \
     get_easier_objects
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
-    set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type
+    set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type, \
+    get_default_dist_env
 from easier.core.runtime.jit_engine import \
     JitEngine
 
@@ -209,8 +210,8 @@ def _fully_load_data_backend_none(
     On the other hand, processes that are not rank-0 will be corrupted.
     Users shouldn't have distributed environment for backend=='none' case.
     """
-
-    device = torch.device(type=device_type, index=0)
+    default_dist_env = get_default_dist_env()
+    device = torch.device(type=device_type, index=default_dist_env.local_rank)
 
     for obj, names in get_easier_objects(top_modules).items():
 

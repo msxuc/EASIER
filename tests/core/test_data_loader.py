@@ -15,7 +15,7 @@ from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 
-from ..utils import torchrun_singlenode, get_random_str
+from ..utils import torchrun_singlenode, get_random_str, have_cuda
 
 
 def get_in_memory_tensor_loader(
@@ -81,7 +81,24 @@ def worker__test_load_by_index(local_rank: int, world_size: int,
     assert torch.equal(v[idx], tensor)
 
 
-have_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def worker__test_fully_load(
+    local_rank: int, world_size: int,
+    data_loader_ctor, dtype: torch.dtype,
+    device_type: str, final_device_type: str
+):
+    dl: DataLoaderBase = data_loader_ctor(dtype, device_type)
+    assert dl.dtype == dtype
+    assert dl.device.type == device_type
+    assert dl.shape == (17,)
+
+    v = torch.arange(17) * 3 + 1
+    v = v.to(final_device_type)
+
+    tensor = dl.fully_load(final_device_type)
+    assert tensor.dtype == dtype
+    assert tensor.device.type == final_device_type
+
+    assert torch.equal(v, tensor)
 
 
 @pytest.mark.parametrize('data_loader_ctor',
@@ -126,24 +143,16 @@ class TestDataLoader:
         torchrun_singlenode(2, worker__test_load_by_index,
                             (data_loader_ctor, dtype, device_type))
 
-    @pytest.mark.usefixtures('dummy_dist_env')
-    @pytest.mark.parametrize('target_device_type', [
+    @pytest.mark.parametrize('final_device_type', [
         'cpu',
         pytest.param('cuda', marks=have_cuda)
     ])
     def test_fully_load(self, data_loader_ctor, dtype: torch.dtype,
-                        device_type: str, target_device_type: str):
-        dl: DataLoaderBase = data_loader_ctor(dtype, device_type)
-        assert dl.dtype == dtype
-        assert dl.device.type == device_type
-        assert dl.shape == (17,)
-
-        tensor = dl.fully_load(target_device_type)
-        assert tensor.dtype == dtype
-        if target_device_type is None:
-            assert tensor.device.type == device_type
-        else:
-            assert tensor.device.type == target_device_type
+                        device_type: str, final_device_type: str):
+        torchrun_singlenode(
+            2, worker__test_fully_load,
+            (data_loader_ctor, dtype, device_type, final_device_type)
+        )
 
 
 def worker__test_load_full_by_rank(local_rank: int, world_size: int,
