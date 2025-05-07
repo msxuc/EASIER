@@ -69,14 +69,16 @@ def worker__test_load_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx, chunk_size=3)
+    v = torch.arange(17) * 3 + 1
+
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
 
-    assert torch.equal(torch.arange(5, dtype=dtype) *
-                       6 + 1 + local_rank * 3, tensor)
+    assert torch.equal(v[idx], tensor)
 
 
 have_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -172,13 +174,14 @@ def worker__test_load_full_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17, 2)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx)
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
 
-    assert torch.equal(torch.full([5, 2], 42, dtype=dtype), tensor)
+    assert torch.equal(torch.full([20, 2], 42, dtype=dtype), tensor)
 
 
 @pytest.mark.parametrize('dtype',
@@ -246,8 +249,9 @@ def worker__test_load_arange_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx)
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
