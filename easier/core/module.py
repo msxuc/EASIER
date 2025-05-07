@@ -686,24 +686,24 @@ def norm(tensor: torch.Tensor, p: Union[int, str] = 2) -> torch.Tensor:
 
 def max(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Equivalent to `torch.max(tensor, dim=0, keepdim=True)`.
+    Equivalent to `torch.amax(tensor, dim=0, keepdim=True)`.
 
     Args:
     -   tensor:
         At JIT-time, must be a distributed tensor.
     """
-    return _allreduce(torch.max, tensor)
+    return _allreduce(torch.amax, tensor)
 
 
 def min(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Equivalent to `torch.min(tensor, dim=0, keepdim=True)`.
+    Equivalent to `torch.amin(tensor, dim=0, keepdim=True)`.
 
     Args:
     -   tensor:
         At JIT-time, must be a distributed tensor.
     """
-    return _allreduce(torch.min, tensor)
+    return _allreduce(torch.amin, tensor)
 
 
 easier_aggregators = (sum, prod, norm, max, min)

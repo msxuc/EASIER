@@ -158,7 +158,9 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         else:
             return None
 
-    def if_function_or_method(self, op_callable) -> Optional[EasierTensorDef]:
+    def if_function_or_method(
+        self, function_or_method_name
+    ) -> Optional[EasierTensorDef]:
         input_defs = [
             self.node2def[arg] for arg in self.current_node.all_input_nodes
         ]
@@ -167,10 +169,11 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         # is distributed. Otherwise it's None, meaning inputs are replica.
         rep_input_def = self.set_equivalent(input_defs)
 
-        if op_callable in esr.easier_aggregators:
+        if function_or_method_name in esr.easier_aggregators:
             if rep_input_def is None:
                 raise EasierJitException(
-                    f"{op_callable} cannot be called on replicated tensors"
+                    f"{function_or_method_name} cannot be called"
+                    " on replicated tensors"
                 )
             # esr.sum etc. results are always replica, no TensorDef.
             return None
@@ -302,7 +305,7 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
         if not hasattr(p, 'easier_tensor_group'):
 
             logger.warning(
-                "Distributed easierr.Tensor "
+                "Distributed easier.Tensor "
                 f"{p.easier_hint_name} is never used in easier.Module"
             )
             tensor_group = EasierTensorGroup(
