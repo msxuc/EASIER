@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from typing import Union
 from unittest.mock import patch
 import torch
 from torch.fx.graph_module import GraphModule
@@ -22,9 +23,9 @@ from tests.core.utils import multi_stage_zero_length_partition
 
 
 class Model(esr.Module):
-    def __init__(self, nf, device='cpu') -> None:
+    def __init__(self, nf, device: Union[str, torch.device]='cpu') -> None:
         super().__init__()
-        eqn = Poisson(100, device)
+        eqn = Poisson(100, device)  # type: ignore
         nv = self.nv = eqn.x.shape[0]
         ne = self.ne = eqn.src.shape[0]
 
@@ -319,12 +320,28 @@ def worker__test_none_collect(local_rank: int, world_size: int, dev_type: str):
     model_dev = torch.device(dev_type)
 
     torch.manual_seed(2345)
-    jitted, = esr.compile(
-        [Model(3, model_dev)], backend='none'  # type: ignore
-    )
-    jitted: Model
-    jitted()
-    jitted()
+    m = Model(3, model_dev)
+
+    from h5py import File as _orig_h5py_File
+    _orig_m_forward = m.forward
+
+    with patch(f'h5py.File') as mock_h5py_File, \
+        patch.object(m, 'forward') as mock_m_forward:
+
+        mock_h5py_File.side_effect = _orig_h5py_File
+        mock_m_forward.side_effect = _orig_m_forward
+
+        [jitted] = esr.compile([m], backend='none')  # type: ignore
+        jitted: Model
+        jitted()
+        jitted()
+    
+    if local_rank == 0:
+        assert mock_h5py_File.call_count > 0
+        assert mock_m_forward.call_count == 2
+    else:
+        assert mock_h5py_File.call_count == 0
+        assert mock_m_forward.call_count == 0
 
     # backend='none' also moves data to proper devices
     def _assert_jit_device(tensor: torch.Tensor):
@@ -357,12 +374,28 @@ def worker__test_none_save(local_rank: int, world_size: int, dev_type: str):
     model_dev = torch.device(dev_type)
 
     torch.manual_seed(2345)
-    jitted, = esr.compile(
-        [Model(3, model_dev)], backend='none'  # type: ignore
-    )
-    jitted: Model
-    jitted()
-    jitted()
+    m = Model(3, model_dev)
+
+    from h5py import File as _orig_h5py_File
+    _orig_m_forward = m.forward
+
+    with patch(f'h5py.File') as mock_h5py_File, \
+        patch.object(m, 'forward') as mock_m_forward:
+
+        mock_h5py_File.side_effect = _orig_h5py_File
+        mock_m_forward.side_effect = _orig_m_forward
+
+        [jitted] = esr.compile([m], backend='none')  # type: ignore
+        jitted: Model
+        jitted()
+        jitted()
+    
+    if local_rank == 0:
+        assert mock_h5py_File.call_count > 0
+        assert mock_m_forward.call_count == 2
+    else:
+        assert mock_h5py_File.call_count == 0
+        assert mock_m_forward.call_count == 0
 
     collected_vertex = jitted.vertex_tensor.collect().cpu()
     collected_edge = jitted.edge_tensor.collect().cpu()

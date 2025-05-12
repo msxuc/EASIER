@@ -208,7 +208,9 @@ class DataLoaderBase:
         assert res.device.type == 'cpu'
         return res
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
         """
         Collectively and fully load the dataset on all ranks,
         typically for compile backend=='none' case.
@@ -222,6 +224,14 @@ class DataLoaderBase:
             to be ready on user-specified device, immediately.
             So instead of going via CPU, fully_load() accepts the argument
             for the fianl device.
+        
+        - replicated: if True, load the same, full data to all ranks,
+            otherwise only load to rank-0, other ranks will have the
+            placeholder tensor and should not do calculation with it.
+
+            NOTE
+            With placeholder tensors, other ranks can still get proper
+            shapes/dtypes.
 
         Returns:
         - torch.Tensor: the full tensor, on the specified device.
@@ -345,8 +355,16 @@ class InMemoryTensorLoader(DataLoaderBase):
     ) -> torch.Tensor:
         return self.tensor[index]
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
-        return self.tensor.to(device, copy=True)
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return self.tensor.to(device, copy=True)
+        else:
+            return self.get_placeholder()
+
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(tensor={self.tensor})'
@@ -659,19 +677,29 @@ class H5DataLoader(DataLoaderBase):
         else:
             return _run(None)
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
         """
         Called by backend=='none' case, only default_dist_env is available.
         """
         dist_env = get_default_dist_env()
         rank = dist_env.rank
 
-        if rank == 0:
-            with self._dataset_as_dtype() as d:
-                t = torch.from_numpy(d[...]).to(dist_env.comm_device)
-                dist_env.broadcast(0, t)
+        if replicated:
+            if rank == 0:
+                with self._dataset_as_dtype() as d:
+                    t = torch.from_numpy(d[...]).to(dist_env.comm_device)
+                    dist_env.broadcast(0, t)
+            else:
+                t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            
         else:
-            t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            if rank == 0:
+                with self._dataset_as_dtype() as d:
+                    t = torch.from_numpy(d[...])
+            else:
+                t = self.get_placeholder()
 
         return t.to(device)
 
@@ -745,9 +773,16 @@ class FulledTensorLoader(DataLoaderBase):
                                 **kwargs) -> torch.Tensor:
         return self._full(index.shape[0], 'cpu')
 
-    def fully_load(self, device: Union[torch.device, str]
-                   ) -> torch.Tensor:
-        return self._full(None, device)
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return self._full(None, device)
+        else:
+            return self.get_placeholder()
+
 
     def __repr__(self) -> str:
         return ''.join([
@@ -836,12 +871,19 @@ class ArangeTensorLoader(DataLoaderBase):
                                 **kwargs) -> torch.Tensor:
         return (index * self._step + self._start).to(dtype=self.dtype)
 
-    def fully_load(self, device: Union[torch.device, str]
-                   ) -> torch.Tensor:
-        return torch.arange(
-            self._start, self._end, self._step,
-            dtype=self.dtype, device=device
-        )
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return torch.arange(
+                self._start, self._end, self._step,
+                dtype=self.dtype, device=device
+            )
+        else:
+            return self.get_placeholder()
+
 
     def __repr__(self) -> str:
         return ''.join([

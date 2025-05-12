@@ -450,7 +450,15 @@ class Tensor(nn.Parameter):
 
         self.easier_data_loader: DataLoaderBase
 
-        self.easier_data_ready: bool = False
+        # The value for this field is collectively same:
+        # - False: esr.compile() not run for any modules containing this tensor
+        # - True: data loaded and non-empty on all ranks, including:
+        #    -- dist tensors in backend='torch/cpu/cuda',
+        #       and these are cases where `elempart != None`
+        #    -- replicated tensors in all backends.
+        # - rank0_only: generally, dist tensors in backend='none' have this,
+        #       meaning that all data is on rank-0, other ranks have empty.
+        self.easier_data_ready: Literal[False, True, 'rank0_only'] = False
 
         # TODO names like `is_partition` are potentially conflict to pytorch,
         # will `easier_is_partition` with namespace be better?
@@ -465,7 +473,8 @@ class Tensor(nn.Parameter):
         # (no matter if they are referenced by `get_attr` Nodes),
         self.easier_tensor_group: 'EasierTensorGroup'
 
-        # Only tensors that are distributed and used has this field set.
+        # Only tensors that are distributed and in `torch` etc. backends
+        # have this field set.
         self.elempart: 'Optional[ElemPart]' = None
 
     def __repr__(self) -> str:
@@ -507,13 +516,30 @@ class Tensor(nn.Parameter):
             " consider defining a new easier.Tensor instance.")
 
     def collect(self) -> torch.Tensor:
+        """
+        `easier.Tensor.collect()` collectively returns the full tensor
+        on all ranks.
+
+        The resultant torch.Tensor will be on the device originally specified
+        by the user program before entering `easier.compile()`.
+        """
         if not self.easier_data_ready:
             raise RuntimeError("Tensor data is not ready, run compile() first")
 
-        if self.elempart is not None:
-            return _dist_collect(self)
+        elif self.easier_data_ready == 'rank0_only':
+            dist_env = get_default_dist_env()
+            if dist_env.rank == 0:
+                t = dist_env.broadcast(0, self.data.to(dist_env.comm_device))
+            else:
+                t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            return t.to(self.easier_data_loader.device, copy=True)
+
         else:
-            return self.data.to(self.easier_data_loader.device, copy=True)
+            assert self.easier_data_ready == True
+            if self.elempart is not None:
+                return _dist_collect(self)
+            else:
+                return self.data.to(self.easier_data_loader.device, copy=True)
 
     def save(self, h5_file_path, h5_dataset_path, **h5_file_kwargs) -> None:
         if not self.easier_data_ready:

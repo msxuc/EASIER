@@ -24,9 +24,10 @@ from easier.core import passes
 from easier.core import module as _EsrMod
 from easier.core.passes.utils import \
     FX, OrderedSet, tree_map, normalize_reducer_call_into_args, \
-    get_called_module, get_attr_value
+    get_called_module, get_attr_value, get_easier_tensors
 from easier.core.utils import EasierJitException, logger
-from easier.core.runtime.dist_env import get_runtime_dist_env
+from easier.core.runtime.dist_env import \
+    get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
@@ -852,4 +853,43 @@ class JitEngine:
 
         # JitEngine.forward() serves as esr.Module.forward(), and is required
         # to return None.
+        return None
+
+
+class BackendNoneEngine:
+    """
+    When esr.compile(backend='none') is specified, in a multi-process config,
+    we only load distributed tensors (full data) on rank-0, and
+    we only run `forward()` on rank-0.
+
+    Additionally, we broadcast all replicated tensors after `forward()`,
+    because the EASIER programming model allows users to do e.g.
+    `for i in range(): mod.replica.set_(i)` outside the JIT scope.
+    """
+    def __init__(self, module: esr.Module) -> None:
+        self.module = module
+
+        # After creating BackendNoneEngine `self`,
+        # `module.forward` will be bound to `self.forward`.
+        self.orig_forward = module.forward
+    
+    def forward(self):
+        # With backend='none' we don't have runtime dist env set.
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+
+        if rank == 0:
+            self.orig_forward()
+        
+        # In a collectively same order:
+        tensors = get_easier_tensors([self.module])
+        for t in tensors:
+            if t.is_replica:
+                if rank == 0:
+                    dist_env.broadcast(0, t.data.to(dist_env.comm_device))
+                else:
+                    data = dist_env.broadcast(0, shape=t.shape, dtype=t.dtype)
+                    t[:] = data
+
+        # esr.Module.forward() is required to return None.
         return None

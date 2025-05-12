@@ -29,7 +29,7 @@ from easier.core.runtime.dist_env import \
     set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type, \
     get_default_dist_env
 from easier.core.runtime.jit_engine import \
-    JitEngine
+    JitEngine, BackendNoneEngine
 
 
 class EasierProxy(Proxy):
@@ -204,11 +204,12 @@ def _fully_load_data_backend_none(
 ):
     """
     Fully load index and data onto the specified device.
-    For backend=='none' only, and data loader `fully_load` method does not
-    require the dist env to be set up.
 
-    On the other hand, processes that are not rank-0 will be corrupted.
-    Users shouldn't have distributed environment for backend=='none' case.
+    For backend=='none' in a multi-process config:
+    -   idx and distributed data are fully and only loaded to rank-0;
+    -   forward() calculation is only run on rank-0;
+    -   replicated data are i) loaded, ii) broadcasted after forward()
+        to all ranks.
     """
     default_dist_env = get_default_dist_env()
     device = torch.device(type=device_type, index=default_dist_env.local_rank)
@@ -224,10 +225,17 @@ def _fully_load_data_backend_none(
         if isinstance(obj, esr.Module):
             obj.easier_jit_backend = 'none'
 
+            engine = BackendNoneEngine(obj)
+            obj.forward = engine.forward
+
         if isinstance(obj, esr.Tensor):
             if not obj.easier_data_ready:
-                obj.data = obj.easier_data_loader.fully_load(device)
-                obj.easier_data_ready = True
+                is_replica = obj.is_replica
+
+                obj.data = obj.easier_data_loader.fully_load(
+                    device, replicated=is_replica
+                )
+                obj.easier_data_ready = is_replica or 'rank0_only'
 
 
 def init(
