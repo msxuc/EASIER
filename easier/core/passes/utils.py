@@ -497,7 +497,9 @@ def get_easier_objects(
 
         # attr path is like 'A.selector' or 'update_x.3.V'
         for path, obj in itertools.chain(
-            topmod.named_modules(),
+            # Exclude topmod and avoid naming it under itself again,
+            # other we'll get an empty path and a bad alias like 'A.(:A)'
+            topmod.named_modules(memo=set([topmod])),
             topmod.named_parameters(),
         ):
             if isinstance(obj, EasierObj.__args__):

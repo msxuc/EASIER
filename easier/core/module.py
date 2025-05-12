@@ -3,7 +3,7 @@
 
 from typing import \
     Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, cast, \
-    overload, TYPE_CHECKING
+    overload, TYPE_CHECKING, Self
 import torch.types
 from typing_extensions import TypeAlias
 import os
@@ -300,6 +300,43 @@ def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
     return synced.to(device=tensor.easier_data_loader.device)
 
 
+def _resolve_to_args(
+    cls_name: Literal['Module', 'Selector', 'Reducer', 'Tensor'],
+    args: tuple,
+    kwargs: dict
+) -> Tuple[Optional[torch.device], Optional[torch.dtype]]:
+    """
+    PyTorch nn.Module.to() or torch.Tensor.to() have multiple overloadings:
+    - to(device)
+    - to(dtype)
+    - to(device, dtype)
+    These overloadings are differentiated by parameter types rather than
+    the number of parameters.
+
+    TODO for the sake of simplicity, we take only one argument for now.
+    To change both dtype and device, users could use a chain of calls
+    `mod.to(dtype).to(device)` for now.
+    """
+    # TODO validate kwargs.values() are well typed, e.g. avoid device=int64
+    _args = set(args).union(kwargs.values())
+    if len(_args) != 1:
+        raise NotImplementedError(
+            f'Currently easier.{cls_name}.to() only supports one argument,'
+            ' consider using method chaining `.to(dtype).to(device)`'
+        )
+    arg, = _args
+
+    if isinstance(arg, torch.dtype):
+        return None, arg
+    elif isinstance(arg, (str, torch.device)):
+        return torch.device(arg), None
+    else:
+        raise TypeError(
+            f"easier.{cls_name}.to() does not accept the argument"
+            f" of type {type(arg)}"
+        )
+
+
 IdxStatus: TypeAlias = Literal['placeholder', 'partially_loaded', 'rewritten']
 
 
@@ -337,10 +374,17 @@ class Selector(nn.Module):
         # thrown and reported by the tensor indexing operation.
         return tensor[self.idx]
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Selector does not support .to() method,"
-            " consider defining a new easier.Selector instance.")
+    def to(self, device: Union[str, torch.device]) -> Self:
+        # easier.Module/Selector/Reducer cannot take int dtype.
+        if self.easier_index_status != 'placeholder':
+            raise RuntimeError(
+                "The properties of easier.Selector can only be modified"
+                " before easier.compile()"
+            )
+
+        self.easier_data_loader = self.easier_data_loader.to(device=device)
+        self.idx = self.easier_data_loader.get_placeholder()
+        return self
 
 
 ReduceOp: TypeAlias = Literal['sum', 'prod', 'mean', 'amax', 'amin']
@@ -420,10 +464,20 @@ class Reducer(nn.Module):
         return out.scatter_reduce_(0, idx, tensor, self.reduce,
                                    include_self=False)
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Reducer does not support .to() method,"
-            " consider defining a new easier.Reducer instance.")
+    def to(self, device: Union[str, torch.device]) -> Self:
+        # easier.Module/Selector/Reducer cannot take int dtype.
+        # While Selector (essentially doing a[b]) can have int32/int16
+        # as idx dtype, Reducer (torch.scatter_reduce_) can only take int64,
+        # otherwise 'torch' JIT backend won't work.
+        if self.easier_index_status != 'placeholder':
+            raise RuntimeError(
+                "The properties of easier.Reducer can only be modified"
+                " before easier.compile()"
+            )
+
+        self.easier_data_loader = self.easier_data_loader.to(device=device)
+        self.idx = self.easier_data_loader.get_placeholder()
+        return self
 
 
 class Tensor(nn.Parameter):
@@ -491,7 +545,7 @@ class Tensor(nn.Parameter):
                 repr_str = ''
             return 'Managed partitioned easier.Tensor' + repr_str
 
-    def __setitem__(self, indices, val) -> 'Tensor':
+    def __setitem__(self, indices, val) -> Self:
         """
         This __setitem__ generally runs for setting replicated easier.Tensor
         content, outside the scope for compiled easier.Module.forward().
@@ -501,19 +555,38 @@ class Tensor(nn.Parameter):
         self.data.__setitem__(indices, val)
         return self
 
-    def to(self, *args, **kwargs):
-        """
-        `torch.Tensor.to()` returns self if the specified dtype/device is
-        compatible with the old properties.
-        Following this style implies that any in-place modification might be
-        unconsciously reflected through on both `easier.Tensor` references.
+    @overload
+    def to(self, dtype: torch.dtype) -> Self: ...
+    @overload
+    def to(self, device: Union[str, torch.device]) -> Self: ...
+    # TODO support this overload like torch.nn.Module.to()
+    # @overload
+    # def to(self, device: Union[str, torch.device], dtype: torch.dtype): ...
 
-        EASIER users might consider defining a new `easier.Tensor` instance
-        with proper dtype settings.
+    def to(self, *args, **kwargs) -> Self:
         """
-        raise TypeError(
-            "easier.Tensor does not support .to() method,"
-            " consider defining a new easier.Tensor instance.")
+        Before easier.compile(), users can call easier.Tensor.to() to modify:
+        -   the target dtype,
+        -   the target device.
+
+        And unlike torch.Tensor.to(), easier.Tensor.to() always return the
+        easier.Tensor instance itself
+        (since before easier.compile(), an easier.Tensor is only a descriptor
+        of the distributed data).
+        """
+        if self.easier_data_ready != False:
+            raise RuntimeError(
+                "The properties of easier.Tensor can only be modified"
+                " before easier.compile()"
+            )
+
+        device, dtype = _resolve_to_args('Tensor', args, kwargs)
+
+        self.easier_data_loader = self.easier_data_loader.to(
+            device=device, dtype=dtype
+        )
+        self.data = self.easier_data_loader.get_placeholder()
+        return self
 
     def collect(self) -> torch.Tensor:
         """
@@ -662,10 +735,71 @@ class Module(nn.Module):
     def forward(self):
         pass
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Module does not support .to() method,"
-            " consider defining a new easier.Module instance.")
+    @overload
+    def to(self, dtype: torch.dtype) -> Self: ...
+    @overload
+    def to(self, device: Union[str, torch.device]) -> Self: ...
+    # TODO support this overload like torch.nn.Module.to()
+    # @overload
+    # def to(self, device: Union[str, torch.device], dtype: torch.dtype): ...
+
+    def to(self, *args, **kwargs) -> Self:
+        """
+        Before easier.compile(), users can call easier.Module.to() to modify:
+        -   The target dtype of all nested easier.Tensors.
+
+            The input dtype must be floating points, and
+            the casting only take effect on easier.Tensors that are defined to
+            be floating points.
+
+        -   The target device of all nested
+            easier.Modules/Selectors/Reducers/Tensors.
+
+        easier.Module/Selector/Reducer/Tensor.to() will be called on those
+        nested objects.
+        Particularly for easier.Tensors, .to() calls won't clone the
+        easier.Tensors but merely modify their properties.
+        This is unlike torch.Tensor.to().
+        """
+        if self.easier_jit_backend is not None:
+            raise RuntimeError(
+                "The properties of easier.Module can only be modified"
+                " before easier.compile()"
+            )
+
+        device, fp_dtype = _resolve_to_args('Module', args, kwargs)
+        if fp_dtype is not None:
+            if not fp_dtype.is_floating_point:
+                # TODO check dtype.is_complex
+                raise ValueError(
+                    f"easier.Module.to() does not accept the dtype {fp_dtype},"
+                    " floating point dtypes are required"
+                )
+
+        # avoid circular import
+        from easier.core.passes.utils import get_easier_objects
+
+        # Keys are Modules/Selectors/Reducers/Tensors/DataLoaders,
+        # remarkably:
+        # - for Modules, including self, do nothing;
+        # - Selectors/Reducers that not involved in forward();
+        # - many S/R/Ts may share a DataLoader instance at the beginning,
+        #   after .to() each of them will have an individual DataLoader,
+        #   this is OK as DataLoaders are purely descriptive and lightweight.
+        objs: dict = get_easier_objects([self])
+        for obj in objs:
+            if isinstance(obj, (Selector, Reducer)):
+                if device is not None:
+                    obj.to(device)
+
+            if isinstance(obj, Tensor):
+                if device is not None:
+                    obj.to(device)
+                if fp_dtype is not None:
+                    if obj.easier_data_loader.dtype.is_floating_point:
+                        obj.to(fp_dtype)
+
+        return self
 
 
 def _allreduce(op, tensor: torch.Tensor, *args, **kwargs):

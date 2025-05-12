@@ -6,6 +6,7 @@ import os
 from typing import Iterator, Optional, Tuple, TypeAlias, Union, cast
 import h5py
 import functools
+import copy
 
 import numpy as np
 import torch
@@ -130,15 +131,21 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    # TODO now we accept keyword parameters only, we may make it do
-    # overloading resolution like Selector(idx=)
     def to(
         self,
         *,
         dtype: Optional[torch.dtype] = None,
         device: Optional[Union[torch.device, str]] = None
     ) -> 'DataLoaderBase':
-        raise NotImplementedError()
+        """
+        Return a cloned DataLoader with the specified properties changed.
+        """
+        clone = copy.deepcopy(self)
+        if dtype is not None:
+            clone.dtype = dtype
+        if device is not None:
+            clone.device = torch.device(device)
+        return clone
 
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:

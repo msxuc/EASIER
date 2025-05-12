@@ -9,7 +9,7 @@ import pytest
 import torch
 import easier
 from easier.core.utils import get_random_str
-from tests.utils import when_ngpus_ge_2, torchrun_singlenode
+from tests.utils import when_ngpus_ge_2, torchrun_singlenode, have_cuda
 
 
 def fully_load_data(t: easier.Tensor):
@@ -85,6 +85,60 @@ class TestReducer:
 
         assert torch.equal(res0, res1)
 
+@pytest.mark.usefixtures('dummy_dist_env')
+@pytest.mark.parametrize('device_type', [
+    'cpu',
+    # no device IDs, all workers use cuda:0.
+    pytest.param('cuda', marks=have_cuda)
+])
+def test_to(device_type: str):
+    class M(easier.Module):
+        def __init__(self, opt_inner: Union[None, easier.Module]) -> None:
+            super().__init__()
+            self.fv = easier.Tensor(
+                torch.rand(3, 3, dtype=torch.float64), mode='partition'
+            )
+            self.iv = easier.Tensor(
+                torch.arange(11, dtype=torch.int32), mode='partition'
+            )
+
+            self.replica = easier.Tensor(
+                torch.rand(3, 3, dtype=torch.float64), mode='replicate'
+            )
+            self.constant = torch.rand(3, 3, dtype=torch.float64)
+
+            self.reducer = easier.Reducer(torch.arange(2), 22)
+
+            self.opt_inner = opt_inner
+
+    notcasted = M(None)
+
+    inner = M(None)
+    outer = M(inner)
+
+    outer.to(torch.float16).to(device_type)
+
+    def _assert(m: M):
+        assert m.fv.dtype == torch.float16
+        assert m.fv.device.type == device_type
+        assert m.iv.dtype == torch.int32
+        assert m.iv.device.type == device_type
+
+        assert m.replica.dtype == torch.float16
+        assert m.replica.device.type == device_type
+
+        # Can be used, but not affected at all.
+        assert m.constant.dtype == torch.float64
+        assert m.constant.device.type == 'cpu'
+
+        assert m.reducer.idx.dtype == torch.int64
+        assert m.reducer.idx.device.type == device_type
+
+    _assert(outer)
+    _assert(inner)
+
+    assert notcasted.fv.dtype == torch.float64
+    assert notcasted.iv.dtype == torch.int32
 
 def worker__test_collect_save(local_rank: int, world_size: int, dev_type: str):
     n = 3
@@ -127,7 +181,7 @@ def worker__test_collect_save(local_rank: int, world_size: int, dev_type: str):
         torch.testing.assert_close(torch.from_numpy(h5f['r'][:]), m.r.cpu())
 
 
-class TestJitNoneBackendUsage:
+class TestOutOfJitUsage:
 
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_init__dtype(self):
