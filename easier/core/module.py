@@ -3,9 +3,8 @@
 
 from typing import \
     Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, cast, \
-    overload, TYPE_CHECKING, Self
-import torch.types
-from typing_extensions import TypeAlias
+    overload, TYPE_CHECKING
+from typing_extensions import TypeAlias, Self
 import os
 import dataclasses
 
