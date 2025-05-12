@@ -375,7 +375,7 @@ class Selector(nn.Module):
         return tensor[self.idx]
 
     def to(self, device: Union[str, torch.device]) -> Self:
-        # easier.Module/Selector/Reducer cannot take int dtype.
+        # easier.Module/Selector/Reducer cannot take dtype. See Reducer.to()
         if self.easier_index_status != 'placeholder':
             raise RuntimeError(
                 "The properties of easier.Selector can only be modified"
@@ -469,6 +469,7 @@ class Reducer(nn.Module):
         # While Selector (essentially doing a[b]) can have int32/int16
         # as idx dtype, Reducer (torch.scatter_reduce_) can only take int64,
         # otherwise 'torch' JIT backend won't work.
+        # TODO we'd better either enforce int64 in ctors or do cast accordingly
         if self.easier_index_status != 'placeholder':
             raise RuntimeError(
                 "The properties of easier.Reducer can only be modified"
@@ -781,11 +782,12 @@ class Module(nn.Module):
 
         # Keys are Modules/Selectors/Reducers/Tensors/DataLoaders,
         # remarkably:
-        # - for Modules, including self, do nothing;
+        # - attribute DataLoaders of Modules are casted and setattr().
         # - Selectors/Reducers that not involved in forward();
         # - many S/R/Ts may share a DataLoader instance at the beginning,
         #   after .to() each of them will have an individual DataLoader,
-        #   this is OK as DataLoaders are purely descriptive and lightweight.
+        #   this is OK as DataLoaders are purely descriptive and lightweight,
+        #   and won't affect the collective behavior of DataLoaders.
         objs: dict = get_easier_objects([self])
         for obj in objs:
             if isinstance(obj, (Selector, Reducer)):
@@ -793,11 +795,33 @@ class Module(nn.Module):
                     obj.to(device)
 
             if isinstance(obj, Tensor):
+                # TODO always `obj.to()` twice as Tensor.to() does not have
+                # good overloading resolution.
                 if device is not None:
                     obj.to(device)
                 if fp_dtype is not None:
                     if obj.easier_data_loader.dtype.is_floating_point:
                         obj.to(fp_dtype)
+            
+            if isinstance(obj, Module):
+                # Including self Module.
+                #
+                # Including DataLoaders that are purely bound on Modules
+                # but never used by S/R/T (and those DTs won't be covered by
+                # get_easier_objects), those DTs are casted only for
+                # easier usage for users, since users somehow stored the DTs.
+                #
+                # TODO we do not examine DTs in user-defined collections
+                # like `self.dts = (dt1, dt2)`, this behavior seems the same as
+                # users should use register_buffer() or ParameterList in torch.
+                for dt_name, dt in list(obj.__dict__.items()):
+                    if isinstance(dt, DataLoaderBase):
+                        if dt.dtype.is_floating_point:
+                            dt_fp_dtype = fp_dtype
+                        else:
+                            dt_fp_dtype = None
+                        dt = dt.to(dtype=dt_fp_dtype, device=device)
+                        setattr(obj, dt_name, dt)
 
         return self
 

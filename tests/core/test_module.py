@@ -109,6 +109,9 @@ def test_to(device_type: str):
 
             self.reducer = easier.Reducer(torch.arange(2), 22)
 
+            self.idt = easier.arange(13, dtype=torch.int64)
+            self.fdt = easier.arange(13, dtype=torch.float32)
+
             self.opt_inner = opt_inner
 
     notcasted = M(None)
@@ -133,6 +136,12 @@ def test_to(device_type: str):
 
         assert m.reducer.idx.dtype == torch.int64
         assert m.reducer.idx.device.type == device_type
+
+        assert m.idt.dtype == torch.int64
+        assert m.idt.device.type == device_type  # int DT device is covered
+
+        assert m.fdt.dtype == torch.float16
+        assert m.fdt.device.type == device_type
 
     _assert(outer)
     _assert(inner)
