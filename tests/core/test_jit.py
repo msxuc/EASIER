@@ -599,16 +599,17 @@ class NotFullModel(esr.Module):
 
 def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     m = NotFullModel()
-    [jitted] = esr.compile([m], backend='none')
+    [jitted] = esr.compile([m], backend='none')  # type: ignore
+    jitted: NotFullModel
     jitted()
     jitted()
     
     from easier.core.runtime.dist_env import get_default_dist_env
     def_dist_env = get_default_dist_env()
     if def_dist_env.rank == 0:
-        orig_vertex = jitted.vertex_tensor.clone().cpu()
-        orig_edge = jitted.edge_tensor.clone().cpu()
-        orig_replica = jitted.tensor.clone().cpu()
+        orig_vertex = jitted.vertex.clone().cpu()
+        orig_edge = jitted.edge.clone().cpu()
+        orig_replica = jitted.replica.clone().cpu()
         def_dist_env.broadcast_object_list(
             0, [orig_vertex, orig_edge, orig_replica]
         )
@@ -617,7 +618,7 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
             def_dist_env.broadcast_object_list(0)
 
     m = NotFullModel()
-    [jitted] = esr.compile([m], backend=dev_type)
+    [jitted] = esr.compile([m], backend=dev_type)  # type: ignore
     jitted()
     jitted()
     collected_v = jitted.vertex.collect().cpu()
