@@ -94,10 +94,17 @@ def worker__test_fully_load(
     v = torch.arange(17) * 3 + 1
     v = v.to(final_device_type)
 
-    tensor = dl.fully_load(final_device_type)
+    tensor = dl.fully_load(final_device_type, replicated=False)
     assert tensor.dtype == dtype
     assert tensor.device.type == final_device_type
+    if local_rank == 0:
+        assert torch.equal(v, tensor)
+    else:
+        assert not torch.equal(v, tensor)
 
+    tensor = dl.fully_load(final_device_type, replicated=True)
+    assert tensor.dtype == dtype
+    assert tensor.device.type == final_device_type
     assert torch.equal(v, tensor)
 
 

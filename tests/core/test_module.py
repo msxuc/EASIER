@@ -25,18 +25,21 @@ def fully_load_idx(m: Union[easier.Selector, easier.Reducer]):
     m.easier_index_status = 'rewritten'
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 class TestSelector:
     idx = torch.randint(0, 10, (20,))
-    selector = easier.Selector(idx)
-    fully_load_idx(selector)
 
     def test_selector(self):
+        selector = easier.Selector(self.idx)
+        fully_load_idx(selector)
+
         t = torch.randn((10, 1, 2))
-        edge = self.selector(t)
+        edge = selector(t)
 
         assert torch.equal(edge, t[self.idx])
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 class TestReducer:
     n = 3
     idx = torch.tensor([1, 1, 2, 2, 2], dtype=torch.int64)
@@ -125,6 +128,8 @@ def worker__test_collect_save(local_rank: int, world_size: int, dev_type: str):
 
 
 class TestJitNoneBackendUsage:
+
+    @pytest.mark.usefixtures('dummy_dist_env')
     def test_init__dtype(self):
         n = 3
 
@@ -149,6 +154,7 @@ class TestJitNoneBackendUsage:
 
         assert m.reducer.idx.dtype == torch.int64
 
+    @pytest.mark.usefixtures('dummy_dist_env')
     @pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA unavailable")
     def test_init__device(self):

@@ -180,9 +180,18 @@ def worker__test_collect(local_rank: int, world_size: int,
     m()
     m()
 
-    orig_vertex = m.vertex_tensor.clone().cpu()
-    orig_edge = m.edge_tensor.clone().cpu()
-    orig_replica = m.tensor.clone().cpu()
+    from easier.core.runtime.dist_env import get_default_dist_env
+    def_dist_env = get_default_dist_env()
+    if def_dist_env.rank == 0:
+        orig_vertex = m.vertex_tensor.clone().cpu()
+        orig_edge = m.edge_tensor.clone().cpu()
+        orig_replica = m.tensor.clone().cpu()
+        def_dist_env.broadcast_object_list(
+            0, [orig_vertex, orig_edge, orig_replica]
+        )
+    else:
+        [orig_vertex, orig_edge, orig_replica] = \
+            def_dist_env.broadcast_object_list(0)
 
     torch.manual_seed(2345)
     jitted, = esr.compile(
@@ -476,9 +485,18 @@ def worker__test_zerolength_collect(local_rank: int, world_size: int, dev_type):
     m()
     m()
 
-    orig_vertex = m.vertex_tensor.clone()
-    orig_edge = m.edge_tensor.clone()
-    orig_replica = m.tensor.clone()
+    from easier.core.runtime.dist_env import get_default_dist_env
+    def_dist_env = get_default_dist_env()
+    if def_dist_env.rank == 0:
+        orig_vertex = m.vertex_tensor.clone().cpu()
+        orig_edge = m.edge_tensor.clone().cpu()
+        orig_replica = m.tensor.clone().cpu()
+        def_dist_env.broadcast_object_list(
+            0, [orig_vertex, orig_edge, orig_replica]
+        )
+    else:
+        [orig_vertex, orig_edge, orig_replica] = \
+            def_dist_env.broadcast_object_list(0)
 
     torch.manual_seed(2345)
     m = Model(3, 'cpu')
@@ -584,9 +602,19 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     [jitted] = esr.compile([m], backend='none')
     jitted()
     jitted()
-    orig_v = jitted.vertex.clone().cpu()
-    orig_e = jitted.edge.clone().cpu()
-    orig_r = jitted.replica.clone().cpu()
+    
+    from easier.core.runtime.dist_env import get_default_dist_env
+    def_dist_env = get_default_dist_env()
+    if def_dist_env.rank == 0:
+        orig_vertex = jitted.vertex_tensor.clone().cpu()
+        orig_edge = jitted.edge_tensor.clone().cpu()
+        orig_replica = jitted.tensor.clone().cpu()
+        def_dist_env.broadcast_object_list(
+            0, [orig_vertex, orig_edge, orig_replica]
+        )
+    else:
+        [orig_vertex, orig_edge, orig_replica] = \
+            def_dist_env.broadcast_object_list(0)
 
     m = NotFullModel()
     [jitted] = esr.compile([m], backend=dev_type)
@@ -596,9 +624,9 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     collected_e = jitted.edge.collect().cpu()
     collected_r = jitted.replica.collect().cpu()
 
-    torch.testing.assert_close(collected_v, orig_v)
-    torch.testing.assert_close(collected_e, orig_e)
-    torch.testing.assert_close(collected_r, orig_r)
+    torch.testing.assert_close(collected_v, orig_vertex)
+    torch.testing.assert_close(collected_e, orig_edge)
+    torch.testing.assert_close(collected_r, orig_replica)
 
 
 @pytest.mark.parametrize('dev_type', [
