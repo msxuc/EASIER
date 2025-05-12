@@ -245,7 +245,7 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    def get_placeholder(self) -> torch.Tensor:
+    def get_placeholder(self, device=None) -> torch.Tensor:
         """
         Allocate a new placeholder torch.Tensor of the same dtype/shape/device
         but generally consuming no memory to be compatible with cases where
@@ -259,14 +259,20 @@ class DataLoaderBase:
             especially for the metadata pass.
         2.  fulfil `esr.Tensor.__new__(cls, data)` where the underlying data
             tensor should be set.
+        3.  when backend=='none', distributed data is only loaded on rank-0,
+            create placeholders on other ranks to ease retrival shape/dtype
+            especially to create receiving buffers in communication.
         """
+        if device is None:
+            device = self.device
+
         # torch.Tensor.expand can expand shape-(1,) to e.g. shape-(0,0,0),
         # but not to ndim=0 shape ().
         if len(self.shape) == 0:
-            ph = torch.zeros((), dtype=self.dtype, device=self.device)
+            ph = torch.zeros((), dtype=self.dtype, device=device)
         else:
             ph = torch.zeros(
-                (1,), dtype=self.dtype, device=self.device
+                (1,), dtype=self.dtype, device=device
             ).expand(self.shape)  # can even expand to (0,0,0)
 
         setattr(ph, ATTRIBUTE_PLACEHOLDER, True)
@@ -370,7 +376,7 @@ class InMemoryTensorLoader(DataLoaderBase):
         if replicated or rank == 0:
             return self.tensor.to(device, copy=True)
         else:
-            return self.get_placeholder()
+            return self.get_placeholder(device)
 
 
     def __repr__(self) -> str:
@@ -706,7 +712,7 @@ class H5DataLoader(DataLoaderBase):
                 with self._dataset_as_dtype() as d:
                     t = torch.from_numpy(d[...])
             else:
-                t = self.get_placeholder()
+                t = self.get_placeholder(device)
 
         return t.to(device)
 
@@ -788,7 +794,7 @@ class FulledTensorLoader(DataLoaderBase):
         if replicated or rank == 0:
             return self._full(None, device)
         else:
-            return self.get_placeholder()
+            return self.get_placeholder(device)
 
 
     def __repr__(self) -> str:
@@ -889,7 +895,7 @@ class ArangeTensorLoader(DataLoaderBase):
                 dtype=self.dtype, device=device
             )
         else:
-            return self.get_placeholder()
+            return self.get_placeholder(device)
 
 
     def __repr__(self) -> str:

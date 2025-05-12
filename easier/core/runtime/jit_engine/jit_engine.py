@@ -866,8 +866,13 @@ class BackendNoneEngine:
     because the EASIER programming model allows users to do e.g.
     `for i in range(): mod.replica.set_(i)` outside the JIT scope.
     """
-    def __init__(self, module: esr.Module) -> None:
+    def __init__(self, module: esr.Module, device: torch.device) -> None:
         self.module = module
+
+        # The device for replicas, always with proper device type and ID
+        # like 'cuda:3', which may be slightly different than the
+        # `get_default_dist_env().comm_device`.
+        self.device = device
 
         # After creating BackendNoneEngine `self`,
         # `module.forward` will be bound to `self.forward`.
@@ -889,7 +894,7 @@ class BackendNoneEngine:
                     dist_env.broadcast(0, t.data.to(dist_env.comm_device))
                 else:
                     data = dist_env.broadcast(0, shape=t.shape, dtype=t.dtype)
-                    t[:] = data
+                    t[:] = data.to(self.device)
 
         # esr.Module.forward() is required to return None.
         return None

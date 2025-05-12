@@ -105,7 +105,7 @@ def test_to(device_type: str):
             self.replica = easier.Tensor(
                 torch.rand(3, 3, dtype=torch.float64), mode='replicate'
             )
-            self.constant = torch.rand(3, 3, dtype=torch.float64)
+            self._constant = torch.rand(3, 3, dtype=torch.float64)
 
             self.reducer = easier.Reducer(torch.arange(2), 22)
 
@@ -130,9 +130,12 @@ def test_to(device_type: str):
         assert m.replica.dtype == torch.float16
         assert m.replica.device.type == device_type
 
-        # Can be used, but not affected at all.
-        assert m.constant.dtype == torch.float64
-        assert m.constant.device.type == 'cpu'
+        # Users are not supposed to use plain constant tensors, but use
+        # replicated esr.Tensors instead.
+        # FX tracing may cause plain constants to appear,
+        # but not affected by .to(), dist_pass will move it.
+        assert m._constant.dtype == torch.float64
+        assert m._constant.device.type == 'cpu'
 
         assert m.reducer.idx.dtype == torch.int64
         assert m.reducer.idx.device.type == device_type

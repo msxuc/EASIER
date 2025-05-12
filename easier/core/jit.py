@@ -212,6 +212,12 @@ def _fully_load_data_backend_none(
         to all ranks.
     """
     default_dist_env = get_default_dist_env()
+
+    # Even for backend=='none' we still move data among all devices,
+    # however, since distributed data are on rank-0, only replicated tensors
+    # are moved, but this achieve the consistency with other backends,
+    # such that replicated tensors are on individual devices
+    # and readable/writeable.
     device = torch.device(type=device_type, index=default_dist_env.local_rank)
 
     for obj, names in get_easier_objects(top_modules).items():
@@ -225,7 +231,7 @@ def _fully_load_data_backend_none(
         if isinstance(obj, esr.Module):
             obj.easier_jit_backend = 'none'
 
-            engine = BackendNoneEngine(obj)
+            engine = BackendNoneEngine(obj, device)
             obj.forward = engine.forward
 
         if isinstance(obj, esr.Tensor):
