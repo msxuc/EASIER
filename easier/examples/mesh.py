@@ -6,7 +6,6 @@ import os
 import h5py
 import torch
 
-import easier as esr
 import easier.cpp_extension as ext
 
 
@@ -36,61 +35,3 @@ def get_triangular_mesh(mesh_size=100) -> str:
         h5f.create_dataset('bpoints', data=bpoints)
 
     return path
-
-
-class TriangularMeshGenerator(esr.Module):
-    def __init__(self, mesh_size: int, device='cpu'):
-        super().__init__()
-        n = mesh_size
-        self.mesh_size = n
-        self.delta = 1. / mesh_size
-        self.nv = n * n * 4
-        self.ne = n * n * 12 - n * 4;
-        self.np = (n + 1) * (n + 1) + n * n
-
-        self.src = esr.Tensor(
-            esr.zeros([self.ne], dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.dst = esr.Tensor(
-            esr.zeros([self.ne], dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.cells = esr.Tensor(
-            esr.zeros([self.nv, 3], dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.points = esr.Tensor(
-            esr.zeros([self.np, 2], dtype=torch.float64, device=device),
-            mode='partition'
-        )
-        self.bcells = esr.Tensor(
-            esr.zeros([n * 4], dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.bpoints = esr.Tensor(
-            esr.zeros([n * 4 * 2], dtype=torch.int64, device=device),
-            mode='partition'
-        )
-
-        # Auxiliary data to explicitly provide the IDs of cells/edges/points.
-        # We can use such IDs as "thread IDs".
-        self.cell_ids = esr.Tensor(
-            esr.arange(self.ne, dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.edge_ids = esr.Tensor(
-            esr.arange(self.nv, dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.point_ids = esr.Tensor(
-            esr.arange(self.np, dtype=torch.int64, device=device),
-            mode='partition'
-        )
-        self.bcell_ids = esr.Tensor(
-            esr.arange(n * 4, dtype=torch.int64, device=device),
-            mode='partition'
-        )
-    
-    def forward(self):
-        1

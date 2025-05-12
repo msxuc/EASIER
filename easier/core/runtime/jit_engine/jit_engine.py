@@ -866,6 +866,7 @@ class BackendNoneEngine:
     because the EASIER programming model allows users to do e.g.
     `for i in range(): mod.replica.set_(i)` outside the JIT scope.
     """
+
     def __init__(self, module: esr.Module, device: torch.device) -> None:
         self.module = module
 
@@ -877,7 +878,7 @@ class BackendNoneEngine:
         # After creating BackendNoneEngine `self`,
         # `module.forward` will be bound to `self.forward`.
         self.orig_forward = module.forward
-    
+
     def forward(self):
         # With backend='none' we don't have runtime dist env set.
         dist_env = get_default_dist_env()
@@ -885,7 +886,7 @@ class BackendNoneEngine:
 
         if rank == 0:
             self.orig_forward()
-        
+
         # In a collectively same order:
         tensors = get_easier_tensors([self.module])
         for t in tensors:
@@ -894,7 +895,7 @@ class BackendNoneEngine:
                     dist_env.broadcast(0, t.data.to(dist_env.comm_device))
                 else:
                     data = dist_env.broadcast(0, shape=t.shape, dtype=t.dtype)
-                    t[:] = data.to(self.device)
+                    t[...] = data.to(self.device)
 
         # esr.Module.forward() is required to return None.
         return None

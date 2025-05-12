@@ -20,11 +20,9 @@ fig = plot.figure()
 ax = fig.add_subplot(projection='3d')
 writer = anime.PillowWriter(fps=5)
 
-zmin, zmax = 0.97, 1.03
-
+z_range = 0.1
 
 with writer.saving(fig, args.filename, dpi=72):
-    # for i in tqdm(range(100)):
     for i in tqdm(range(100)):
         data = np.load(f"{args.data_dir}/data{i:03d}.npz")
         x, y, z = (data['x'], data['y'], data['z'])
@@ -32,10 +30,9 @@ with writer.saving(fig, args.filename, dpi=72):
         ax.azim = 45
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-        ax.set_zlim(zmin, zmax + 0.1)
+        ax.set_zlim(1 - z_range, 1 + z_range)
 
-        norm = colors.TwoSlopeNorm(vcenter=zmin, vmin=0, vmax=zmax)
-
+        norm = colors.Normalize(vmin=1 - z_range, vmax=1 + z_range)
         ax.scatter(x, y, z, c=z, cmap=cm.Blues, norm=norm)
 
         writer.grab_frame()

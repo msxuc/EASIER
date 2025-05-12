@@ -231,7 +231,7 @@ class DataLoaderBase:
             to be ready on user-specified device, immediately.
             So instead of going via CPU, fully_load() accepts the argument
             for the fianl device.
-        
+
         - replicated: if True, load the same, full data to all ranks,
             otherwise only load to rank-0, other ranks will have the
             placeholder tensor and should not do calculation with it.
@@ -377,7 +377,6 @@ class InMemoryTensorLoader(DataLoaderBase):
             return self.tensor.to(device, copy=True)
         else:
             return self.get_placeholder(device)
-
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(tensor={self.tensor})'
@@ -706,7 +705,7 @@ class H5DataLoader(DataLoaderBase):
                     dist_env.broadcast(0, t)
             else:
                 t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
-            
+
         else:
             if rank == 0:
                 with self._dataset_as_dtype() as d:
@@ -795,7 +794,6 @@ class FulledTensorLoader(DataLoaderBase):
             return self._full(None, device)
         else:
             return self.get_placeholder(device)
-
 
     def __repr__(self) -> str:
         return ''.join([
@@ -896,7 +894,6 @@ class ArangeTensorLoader(DataLoaderBase):
             )
         else:
             return self.get_placeholder(device)
-
 
     def __repr__(self) -> str:
         return ''.join([

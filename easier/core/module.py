@@ -801,7 +801,7 @@ class Module(nn.Module):
                 if fp_dtype is not None:
                     if obj.easier_data_loader.dtype.is_floating_point:
                         obj.to(fp_dtype)
-            
+
             if isinstance(obj, Module):
                 # Including self Module.
                 #

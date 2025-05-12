@@ -85,6 +85,7 @@ class TestReducer:
 
         assert torch.equal(res0, res1)
 
+
 @pytest.mark.usefixtures('dummy_dist_env')
 @pytest.mark.parametrize('device_type', [
     'cpu',
@@ -151,6 +152,7 @@ def test_to(device_type: str):
 
     assert notcasted.fv.dtype == torch.float64
     assert notcasted.iv.dtype == torch.int32
+
 
 def worker__test_collect_save(local_rank: int, world_size: int, dev_type: str):
     n = 3

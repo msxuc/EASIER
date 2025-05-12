@@ -91,25 +91,29 @@ def worker__test_fully_load(
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    v = torch.arange(17) * 3 + 1
-    v = v.to(final_device_type)
+    final_device = torch.device(final_device_type, local_rank)
 
-    if final_device_type == 'cuda':
-        final_device = torch.device('cuda', local_rank)
-    else:
-        final_device = torch.device(final_device_type)
+    v = torch.arange(17) * 3 + 1
+    v = v.to(final_device)
 
     tensor = dl.fully_load(final_device, replicated=False)
     assert tensor.dtype == dtype
-    assert tensor.device.type == final_device
+    if final_device_type == 'cpu':
+        assert tensor.device.type == 'cpu'
+    else:
+        assert tensor.device == final_device
+
     if local_rank == 0:
         assert torch.equal(v, tensor)
     else:
         assert not torch.equal(v, tensor)
 
-    tensor = dl.fully_load(final_device_type, replicated=True)
+    tensor = dl.fully_load(final_device, replicated=True)
     assert tensor.dtype == dtype
-    assert tensor.device.type == final_device
+    if final_device_type == 'cpu':
+        assert tensor.device.type == 'cpu'
+    else:
+        assert tensor.device == final_device
     assert torch.equal(v, tensor)
 
 

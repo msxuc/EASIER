@@ -19,46 +19,41 @@ class PoissonMeshComponentsCollector(esr.Module):
 
         # (nc, 3)
         self.cells = esr.Tensor(
-            esr.hdf5(mesh, 'cells', dtype=torch.long, device=device),
-            mode='partition'
+            esr.hdf5(mesh, 'cells', dtype=torch.long), mode='partition'
         )
 
         # (nbc, 2)
         self.bpoints = esr.Tensor(
-            esr.hdf5(mesh, 'bpoints', dtype=torch.long, device=device),
-            mode='partition'
+            esr.hdf5(mesh, 'bpoints', dtype=torch.long), mode='partition'
         )
 
         self.selector_src = esr.Selector(
-            esr.hdf5(mesh, 'src', dtype=torch.long, device=device)
+            esr.hdf5(mesh, 'src', dtype=torch.long)
         )
         self.selector_dst = esr.Selector(
-            esr.hdf5(mesh, 'dst', dtype=torch.long, device=device)
+            esr.hdf5(mesh, 'dst', dtype=torch.long)
         )
 
         nc = self.cells.shape[0]
         ne = self.selector_src.idx.shape[0]
         nbc = self.bpoints.shape[0]
-        
+
         #
         # Output
         #
         self.src_p = torch.nn.ParameterList([
             esr.Tensor(
-                esr.zeros([ne], dtype=torch.long, device=device),
-                mode='partition'
+                esr.zeros([ne], dtype=torch.long), mode='partition'
             ) for i in range(3)
         ])
         self.dst_p = torch.nn.ParameterList([
             esr.Tensor(
-                esr.zeros([ne], dtype=torch.long, device=device),
-                mode='partition'
+                esr.zeros([ne], dtype=torch.long), mode='partition'
             ) for i in range(3)
         ])
         self.cells_p = torch.nn.ParameterList([
             esr.Tensor(
-                esr.zeros([nc], dtype=torch.long, device=device),
-                mode='partition'
+                esr.zeros([nc], dtype=torch.long), mode='partition'
             ) for i in range(3)
         ])
 
@@ -66,12 +61,10 @@ class PoissonMeshComponentsCollector(esr.Module):
         #   with shape `(nbc,)`, `nbc` means number of boundary cell
         self.bp = torch.nn.ParameterList([
             esr.Tensor(
-                esr.zeros([nbc], dtype=torch.long, device=device),
-                mode='partition'
+                esr.zeros([nbc], dtype=torch.long), mode='partition'
             ) for i in range(2)
         ])
 
-    
     def forward(self):
         # (ne, 3)
         src_p = self.selector_src(self.cells)
@@ -84,59 +77,46 @@ class PoissonMeshComponentsCollector(esr.Module):
 
             # (nc,)
             self.cells_p[i].set_(self.cells[:, i])
-        
+
         for i in range(2):
             # (nbc,)
             self.bp[i].set_(self.bpoints[:, i])
-        
+
 
 class PoissonInitializer(esr.Module):
     def __init__(self, poisson: str, mesh: str, device='cpu'):
         super().__init__()
 
-        cells = esr.hdf5(mesh, 'cells', dtype=torch.long, device=device)
+        cells = esr.hdf5(mesh, 'cells', dtype=torch.long)
         nc = cells.shape[0]
 
         self.points = esr.Tensor(
-            esr.hdf5(mesh, 'points', dtype=torch.double, device=device),
-            mode='partition'
+            esr.hdf5(mesh, 'points', dtype=torch.double), mode='partition'
         )
 
-        self.reducer = esr.Reducer(
-            esr.hdf5(mesh, 'src', dtype=torch.long, device=device),
-            nc
-        )
+        self.reducer = esr.Reducer(esr.hdf5(mesh, 'src', dtype=torch.long), nc)
 
         ne = self.reducer.idx.shape[0]
 
         self.selector_src_p = torch.nn.ModuleList([
             esr.Selector(
-                esr.hdf5(
-                    poisson, f'src_p{i}', dtype=torch.long, device=device
-                ),
+                esr.hdf5(poisson, f'src_p{i}', dtype=torch.long),
             ) for i in range(3)
         ])
         self.selector_dst_p = torch.nn.ModuleList([
             esr.Selector(
-                esr.hdf5(
-                    poisson, f'dst_p{i}', dtype=torch.long, device=device
-                ),
+                esr.hdf5(poisson, f'dst_p{i}', dtype=torch.long),
             ) for i in range(3)
         ])
         self.selector_cells_p = torch.nn.ModuleList([
             esr.Selector(
-                esr.hdf5(
-                    poisson, f'cells_p{i}', dtype=torch.long, device=device
-                ),
+                esr.hdf5(poisson, f'cells_p{i}', dtype=torch.long),
             ) for i in range(3)
         ])
 
-
         # bcells: boundary cell indices, with shape `(nbc,)`,
         #   `nbc` means number of boundary cell
-        bcells = esr.hdf5(
-            mesh, 'bcells', dtype=torch.long, device=device
-        )
+        bcells = esr.hdf5(mesh, 'bcells', dtype=torch.long)
         self.bselector = esr.Selector(bcells)
         self.breducer = esr.Reducer(bcells, nc)
 
@@ -144,9 +124,7 @@ class PoissonInitializer(esr.Module):
             esr.Selector(
                 # bp{i}: boundary points indices in each boundary cell,
                 #   with shape `(nbc,)`, `nbc` means number of boundary cell
-                esr.hdf5(
-                    poisson, f'bp{i}', dtype=torch.long, device=device
-                )
+                esr.hdf5(poisson, f'bp{i}', dtype=torch.long)
             ) for i in range(2)
         ])
 
@@ -159,32 +137,26 @@ class PoissonInitializer(esr.Module):
         # dtype. During FX tracing we can only get symbolic proxy for `.dtype`,
         # but the tensor() call requires a real dtype object.
         self.center = esr.Tensor(
-            torch.tensor([[0.5, 0.5]], dtype=torch.double, device=device),
-            mode='replicate'
+            torch.tensor([[0.5, 0.5]], dtype=torch.double), mode='replicate'
         )
 
         #
         # Output
         #
         self.b = esr.Tensor(
-            esr.zeros([nc], dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros([nc], dtype=torch.double), mode='partition'
         )
         self.Ac = esr.Tensor(
-            esr.zeros([nc], dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros([nc], dtype=torch.double), mode='partition'
         )
         self.Af = esr.Tensor(
-            esr.zeros([ne], dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros([ne], dtype=torch.double), mode='partition'
         )
         self.rho = esr.Tensor(
-            esr.zeros([nc], dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros([nc], dtype=torch.double), mode='partition'
         )
         self.centroid = esr.Tensor(
-            esr.zeros([nc, 2], dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros([nc, 2], dtype=torch.double), mode='partition'
         )
 
     def get_face_norm(self, p0, p1, p2):
@@ -198,16 +170,15 @@ class PoissonInitializer(esr.Module):
         s = torch.sign((b1 - c1) * (a2 - c2) - (b2 - c2) * (a1 - c1))
 
         return s * (b2 - c2), -s * (b1 - c1)
-    
+
     def forward(self):
         src_p0 = self.selector_src_p[0](self.points)
         src_p1 = self.selector_src_p[1](self.points)
         src_p2 = self.selector_src_p[2](self.points)
-        
+
         dst_p0 = self.selector_dst_p[0](self.points)
         dst_p1 = self.selector_dst_p[1](self.points)
         dst_p2 = self.selector_dst_p[2](self.points)
-
 
         src_cent = (src_p0 + src_p1 + src_p2) / 3.
         dst_cent = (dst_p0 + dst_p1 + dst_p2) / 3.
@@ -274,7 +245,9 @@ class PoissonInitializer(esr.Module):
 
 
 def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
-    components = PoissonMeshComponentsCollector(mesh, device)
+    components = PoissonMeshComponentsCollector(mesh)
+    components.to(device)
+
     [components] = esr.compile(
         [components], 'none'
     )  # type: ignore
@@ -288,7 +261,9 @@ def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
     for i in range(2):
         components.bp[i].save(poisson, f'bp{i}')
 
-    initializer = PoissonInitializer(poisson, mesh, device)
+    initializer = PoissonInitializer(poisson, mesh)
+    initializer.to(device)
+
     [initializer] = esr.compile(
         [initializer], 'none'
     )  # type: ignore
@@ -304,63 +279,66 @@ def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
     return poisson
 
 
-
-
 class Poisson(esr.Module):
     def __init__(self, mesh_size=100, device='cpu', x=None) -> None:
         super().__init__()
 
         mesh: str
+        poisson: str
+        poisson_exists: bool
         if torch.distributed.get_rank() == 0:
             mesh = get_triangular_mesh(mesh_size)
-            torch.distributed.broadcast_object_list([mesh], 0)
-        else:
-            recv_objs = [None]
-            torch.distributed.broadcast_object_list(recv_objs, 0)
-            [mesh] = recv_objs  # type: ignore
 
-        data_dir = os.path.expanduser('~/.easier')
-        os.makedirs(data_dir, exist_ok=True)
-        poisson = os.path.join(data_dir, f'Poisson_{mesh_size}.hdf5')
-        if not os.path.exists(poisson):
+            data_dir = os.path.expanduser('~/.easier')
+            os.makedirs(data_dir, exist_ok=True)
+            poisson = os.path.join(data_dir, f'Poisson_{mesh_size}.hdf5')
+            poisson_exists = os.path.exists(poisson)
+
+            torch.distributed.broadcast_object_list(
+                [mesh, poisson, poisson_exists], 0
+            )
+        else:
+            recv_objs = [None, None, None]
+            torch.distributed.broadcast_object_list(recv_objs, 0)
+            [mesh, poisson, poisson_exists] = recv_objs  # type: ignore
+
+        if not poisson_exists:
             _assemble_poisson(mesh, poisson, device)
 
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
-        self.src = esr.hdf5(mesh, 'src', dtype=torch.long, device=device)
+        self.src = esr.hdf5(mesh, 'src', dtype=torch.long)
         # dst (torch.LongTensor): dst cell indices, with shape `(ne,)`
-        self.dst = esr.hdf5(mesh, 'dst', dtype=torch.long, device=device)
+        self.dst = esr.hdf5(mesh, 'dst', dtype=torch.long)
 
-        cells = esr.hdf5(mesh, 'cells', dtype=torch.long, device=device)
+        cells = esr.hdf5(mesh, 'cells', dtype=torch.long)
         self.nc = cells.shape[0]
 
         self.reducer = esr.Reducer(self.src, self.nc)
         self.selector = esr.Selector(self.dst)
 
         self.x = esr.Tensor(
-            esr.zeros((self.nc,), dtype=torch.double, device=device),
-            mode='partition'
+            esr.zeros((self.nc,), dtype=torch.double), mode='partition'
         ) if x is None else x
         # b: (nc,)
         self.b = esr.Tensor(
-            esr.hdf5(poisson, 'b', dtype=torch.double, device=device),
-            mode='partition')
+            esr.hdf5(poisson, 'b', dtype=torch.double), mode='partition')
         # Ac: (nc,)
         self.Ac = esr.Tensor(
-            esr.hdf5(poisson, 'Ac', dtype=torch.double, device=device),
-            mode='partition')
+            esr.hdf5(poisson, 'Ac', dtype=torch.double), mode='partition')
         # Af: (src.shape[0],)
         self.Af = esr.Tensor(
-            esr.hdf5(poisson, 'Af', dtype=torch.double, device=device),
-            mode='partition')
+            esr.hdf5(poisson, 'Af', dtype=torch.double), mode='partition'
+        )
         self.A = Linsys(self.Ac, self.Af, self.selector, self.reducer)
 
         self.rho = esr.Tensor(
-            esr.hdf5(poisson, 'rho', dtype=torch.double, device=device),
-            mode='partition')
+            esr.hdf5(poisson, 'rho', dtype=torch.double), mode='partition')
         # centroid: (nc, 2)
         self.centroid = esr.Tensor(
-            esr.hdf5(poisson, 'centroid', dtype=torch.double, device=device),
-            mode='partition')
+            esr.hdf5(poisson, 'centroid', dtype=torch.double), mode='partition'
+        )
+
+        self.to(device)
 
 
 class Poisson1D(esr.Module):

@@ -38,7 +38,7 @@ class ShallowWaterMeshComponentsCollector(esr.Module):
         nc = self.cells.shape[0]
         ne = self.selector_src.idx.shape[0]
         nbc = self.bpoints.shape[0]
-        
+
         #
         # Output
         #
@@ -66,7 +66,6 @@ class ShallowWaterMeshComponentsCollector(esr.Module):
             ) for i in range(2)
         ])
 
-    
     def forward(self):
         # (ne, 3)
         src_p = self.selector_src(self.cells)
@@ -79,7 +78,7 @@ class ShallowWaterMeshComponentsCollector(esr.Module):
 
             # (nc,)
             self.cells_p[i].set_(self.cells[:, i])
-        
+
         for i in range(2):
             # (nbc,)
             self.bp[i].set_(self.bpoints[:, i])
@@ -177,7 +176,7 @@ class ShallowWaterInitializer(esr.Module):
         x43 = x4 - x3
 
         return (x31 * y43 - y31 * x43) / (x21 * y43 - y21 * x43)
-    
+
     def get_face_norm(self, p0, p1, p2):
         a1 = p0[:, 0]
         a2 = p0[:, 1]
@@ -194,11 +193,10 @@ class ShallowWaterInitializer(esr.Module):
         src_p0 = self.selector_src_p[0](self.points)
         src_p1 = self.selector_src_p[1](self.points)
         src_p2 = self.selector_src_p[2](self.points)
-        
+
         dst_p0 = self.selector_dst_p[0](self.points)
         dst_p1 = self.selector_dst_p[1](self.points)
         dst_p2 = self.selector_dst_p[2](self.points)
-
 
         src_cent = (src_p0 + src_p1 + src_p2) / 3.
         dst_cent = (dst_p0 + dst_p1 + dst_p2) / 3.
@@ -261,6 +259,7 @@ class ShallowWaterInitializer(esr.Module):
         self.bsx[:] = -bnorm_x
         self.bsy[:] = -bnorm_y
 
+
 def _assemble_shallow_water(mesh: str, shallow_water: str, device='cpu'):
     components = ShallowWaterMeshComponentsCollector(mesh)
     components.to(device)
@@ -301,6 +300,7 @@ class ShallowWaterEquation(esr.Module):
         super().__init__()
 
         mesh_path: str
+        sw_path: str
         sw_exists: bool
         if torch.distributed.get_rank() == 0:
             mesh_path = get_triangular_mesh(mesh_size)
@@ -310,15 +310,16 @@ class ShallowWaterEquation(esr.Module):
             sw_path = os.path.join(data_dir, f'SW_{mesh_size}.hdf5')
             sw_exists = os.path.exists(sw_path)
 
-            torch.distributed.broadcast_object_list([mesh_path, sw_exists], 0)
+            torch.distributed.broadcast_object_list(
+                [mesh_path, sw_path, sw_exists], 0
+            )
         else:
-            recv_objs = [None, None]
+            recv_objs = [None, None, None]
             torch.distributed.broadcast_object_list(recv_objs, 0)
-            [mesh_path, sw_exists] = recv_objs  # type: ignore
+            [mesh_path, sw_path, sw_exists] = recv_objs  # type: ignore
 
         if not sw_exists:
             _assemble_shallow_water(mesh_path, sw_path, device)
-
 
         self.dt = dt
         # src (torch.LongTensor): src cell indices, with shape `(ne,)`
@@ -387,6 +388,8 @@ class ShallowWaterEquation(esr.Module):
             esr.zeros((self.nc,), dtype=torch.double), mode='partition'
         )
 
+        self.to(device)
+
     def face_reconstruct(self, phi):
         return (1 - self.alpha) * self.gather_src(phi) + \
             self.alpha * self.gather_dst(phi)
@@ -447,8 +450,9 @@ class ShallowWaterEquation(esr.Module):
 
 if __name__ == "__main__":
     """
+    mkdir res
     torchrun --nnodes=1 --nproc_per_node=4 \
-        shallow_water_equation.py --backend=cpu
+        shallow_water_equation.py --backend=cpu --output=res
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -462,7 +466,6 @@ if __name__ == "__main__":
         "--comm_backend", type=str, choices=["gloo", "nccl"],
         default='gloo'
     )
-    parser.add_argument("--init_only", type=bool, default=False)
     parser.add_argument("--scale", type=int, default=100)
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--output", type=str)
@@ -471,8 +474,6 @@ if __name__ == "__main__":
     esr.init(args.comm_backend)
 
     eqn = ShallowWaterEquation(args.scale, args.dt, args.device)
-    eqn.to(args.device)
-
     [eqn] = esr.compile([eqn], args.backend)
 
     for i in tqdm(range(1000)):

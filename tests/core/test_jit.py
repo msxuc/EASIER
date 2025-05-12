@@ -23,7 +23,7 @@ from tests.core.utils import multi_stage_zero_length_partition
 
 
 class Model(esr.Module):
-    def __init__(self, nf, device: Union[str, torch.device]='cpu') -> None:
+    def __init__(self, nf, device: Union[str, torch.device] = 'cpu') -> None:
         super().__init__()
         eqn = Poisson(100, device)  # type: ignore
         nv = self.nv = eqn.x.shape[0]
@@ -326,9 +326,12 @@ class TestJittedUsage:
 
 
 def worker__test_none_collect(local_rank: int, world_size: int, dev_type: str):
-    model_dev = torch.device(dev_type)
-
     torch.manual_seed(2345)
+    if dev_type == 'cpu':
+        model_dev = 'cpu'
+    else:
+        model_dev = f'{dev_type}:{local_rank}'
+    model_dev = torch.device(model_dev)
     m = Model(3, model_dev)
 
     from h5py import File as _orig_h5py_File
@@ -344,7 +347,7 @@ def worker__test_none_collect(local_rank: int, world_size: int, dev_type: str):
         jitted: Model
         jitted()
         jitted()
-    
+
     if local_rank == 0:
         assert mock_h5py_File.call_count > 0
         assert mock_m_forward.call_count == 2
@@ -353,26 +356,30 @@ def worker__test_none_collect(local_rank: int, world_size: int, dev_type: str):
         assert mock_m_forward.call_count == 0
 
     # backend='none' also moves data to proper devices
-    def _assert_jit_device(tensor: torch.Tensor):
+    def _assert_device(tensor: torch.Tensor):
         if dev_type == 'cpu':
             assert tensor.device.type == 'cpu'
         else:
             jitted_dev = torch.device(dev_type, local_rank)
             assert tensor.device == jitted_dev
-    _assert_jit_device(jitted.vertex_tensor)
-    _assert_jit_device(jitted.edge_tensor)
-    _assert_jit_device(jitted.tensor)
+    _assert_device(jitted.vertex_tensor)
+    _assert_device(jitted.edge_tensor)
+    _assert_device(jitted.tensor)
 
+    # collect() moves to original device on each rank, but because
+    # esr.init() would call torch.cuda.set_device(local_rank),
+    # collected tensors are on individual devices.
     collected_vertex = jitted.vertex_tensor.collect()
     collected_edge = jitted.edge_tensor.collect()
     collected_replica = jitted.tensor.collect()
-    assert collected_vertex.device == model_dev
-    assert collected_edge.device == model_dev
-    assert collected_replica.device == model_dev
+    _assert_device(collected_vertex)
+    _assert_device(collected_edge)
+    _assert_device(collected_replica)
 
     from easier.core.runtime.utils import check_collective_equality
+
     def _assert_coll_eq(tensor: torch.Tensor):
-        check_collective_equality('collected', tensor, torch.equal)
+        check_collective_equality('collected', tensor.cpu(), torch.equal)
 
     _assert_coll_eq(collected_vertex)
     _assert_coll_eq(collected_edge)
@@ -398,7 +405,7 @@ def worker__test_none_save(local_rank: int, world_size: int, dev_type: str):
         jitted: Model
         jitted()
         jitted()
-    
+
     if local_rank == 0:
         assert mock_h5py_File.call_count > 0
         assert mock_m_forward.call_count == 2
@@ -426,7 +433,7 @@ def worker__test_none_save(local_rank: int, world_size: int, dev_type: str):
         return _orig_dist_save(tensor, h5d, chunk_size=13)
 
     with patch(f'{_orig_dist_save.__module__}._dist_save') as mock_dist_save, \
-        patch(f'h5py.File') as mock_h5py_File:
+            patch(f'h5py.File') as mock_h5py_File:
 
         mock_dist_save.side_effect = _dist_save_with_chunk_size
         mock_h5py_File.side_effect = _orig_h5py_File
@@ -603,7 +610,7 @@ def worker__test_smoke_zerolength_notfull(local_rank, world_size, dev_type):
     jitted: NotFullModel
     jitted()
     jitted()
-    
+
     from easier.core.runtime.dist_env import get_default_dist_env
     def_dist_env = get_default_dist_env()
     if def_dist_env.rank == 0:
