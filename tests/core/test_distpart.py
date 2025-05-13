@@ -555,26 +555,26 @@ def worker__test_exchange_merge_adj(local_rank: int, world_size: int):
 
     if local_rank == 0:
         assert torch.equal(crowptr, vec(
-            0, 0, 0, 0, 0, 0, 0, 0, 10, 10, 10
+            0, 0, 0, 0, 0, 0, 0, 0, 11, 11, 11
         ))
         assert torch.equal(ccolidx, vec(
-            3, 4, 5, 6, 8, 9, 10, 11, 15, 19  # no 7 -- self
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 19
         ))
         assert torch.equal(cw, -vec(
-            3, 4, 5, 6, 8, 9, 10, 11, 15, 19
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 19
         ))
     elif local_rank == 1:
         assert torch.equal(ccolidx, vec(
             # 15:
             5, 7, 9, 11, 12, 16, 20,
             # 17:
-            13, 21,  # rm 17
+            13, 17, 21,
             # 18:
             24, 35, 43, 44, 45,
             # 20:
             23, 33, 34, 37, 41, 42, 43, 44, 45,
             # 22:
-            33, 41, 42, 43  # em 22
+            22, 33, 41, 42, 43
         ))
 
 

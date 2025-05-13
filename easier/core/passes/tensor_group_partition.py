@@ -86,14 +86,7 @@ def parallel_partition_graph(
         else:
             selector_graph = selector_graph + commpair_graph
 
-    graph = (selector_graph.minimum(1) + reducer_graph).tolil()
-    # scipy warns against `setdiag` on CSR. LIL format is recommended instead.
-
-    # Set the diagonal (relatively to the global adjmat)
-    # zeros and excluded from sparsity.
-    off_diag: int = int(vtxdist[rank])
-    graph.setdiag(0, off_diag)
-    graph = graph.tocsr()
+    graph = selector_graph.minimum(1) + reducer_graph
 
     local_membership = distpart_kway(
         DistConfig(
