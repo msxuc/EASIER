@@ -367,24 +367,25 @@ class ElemPartArangeIdx:
     start: int
     end: int
 
+@dataclass
+class ElemPartReorderedArangeIdx:
+    """
+    """
+    start: int
+    end: int
 
 @dataclass
 class ElemPart:
 
     # Only for this worker.
-    idx_desc: Union[torch.Tensor, ElemPartArangeIdx]
+    idx_desc: Union[None, ElemPartArangeIdx, ElemPartReorderedArangeIdx]
+
+    idx: torch.Tensor
 
     # All lengths are replicated on all workers
     lengths: List[int]
 
     hint: str
-
-    @functools.cached_property
-    def idx(self) -> torch.Tensor:
-        if isinstance(self.idx_desc, ElemPartArangeIdx):
-            return torch.arange(self.idx_desc.start, self.idx_desc.end)
-        else:
-            return self.idx_desc
 
     def __hash__(self) -> int:
         return id(self)
@@ -477,7 +478,7 @@ def synchronize_partition_result(
         elempart_hint = get_elempart_hint(elempart_i, tensor_group)
 
         synced_elemparts[tensor_group] = ElemPart(
-            elempart, elempart_lengths, hint=elempart_hint
+            None, elempart, elempart_lengths, hint=elempart_hint
         )
 
     # endfor tensor_groups
@@ -575,6 +576,7 @@ def get_even_elemparts(modules, graphs):
 
         elemparts[tensor_group] = ElemPart(
             ElemPartArangeIdx(start, end),
+            torch.arange(start, end),
             lengths,
             hint=elempart_hint
         )

@@ -32,7 +32,7 @@ from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
 from easier.core.passes.tensor_group_partition import \
-    ElemPart, ElemPartArangeIdx
+    ElemPart, ElemPartArangeIdx, ElemPartReorderedArangeIdx
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.dataflow_distribution import \
     ConstantTensorMover, load_replicated_tensors_from_source, \
@@ -565,18 +565,15 @@ def dump_elemparts(
         # e.g. '/elemparts/0:EP:hint'
         grp_basepath: str = ep_grp.name  # type: ignore
 
-        if isinstance(elempart.idx_desc, torch.Tensor):
-            elempart_type = None
-            ep_grp.create_dataset(H5_DATASET_ELEMPART_IDX,
-                                  data=elempart.idx_desc)
-
-        elif isinstance(elempart.idx_desc, ElemPartArangeIdx):
+        if isinstance(elempart.idx_desc, ElemPartArangeIdx):
             # ArangeIdx.start/end can be accumulated from lengths
             # so we don't save it anymore.
             elempart_type = 'arange'
 
         else:
-            assert False, f'Unexpected idx_desc {elempart.idx_desc}'
+            # Whatever other idx_desc, dump it as a materialized tensor.
+            elempart_type = None
+            ep_grp.create_dataset(H5_DATASET_ELEMPART_IDX, data=elempart.idx)
 
         ep_info = ElemPartInfo(
             hint=elempart.hint,

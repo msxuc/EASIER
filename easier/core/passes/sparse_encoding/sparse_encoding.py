@@ -24,6 +24,8 @@ from easier.core.passes.tensor_grouping import \
     EasierTensorGroup, get_tensor_groups_relation
 from easier.core.passes.sparse_encoding.reorder_plan import \
     build_cascade_reorder_plan, CascadeReorderStep
+from easier.core.passes.sparse_encoding.utils import \
+    broadcast_elempart, isin_elempart, elempart_isin, reorder_elempart
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
     vector_index_of, zipsort_using_order, \
@@ -81,27 +83,16 @@ def calculate_paired_in_out_idx(
 
     # TODO depends on the lengths relatively, we may fix output_elempart
     # and gather idx_part instead.
+    # And because we are testing if output_gidx_part is in output_elempart,
+    # by fixing output_elempart we may benefit from sorting it once and do
+    # world_size times "isin" by binarysearch (particularly in cases where
+    # output_elempart is not about ArangeIdx/evenly-partition)
 
     # Stands from the point of taking idx partition on this worker only
     # and collects output_elempart from all other workers.
     for t in range(dist_env.world_size):
-        if dist_env.rank == t:
-            output_elempart_t = dist_env.broadcast(
-                t,
-                output_elempart.idx.to(dist_env.comm_device)
-            )
-        else:
-            output_elempart_t = dist_env.broadcast(
-                t,
-                shape=(output_elempart.lengths[t],),
-                dtype=output_elempart.idx.dtype
-            )
-
-        output_elempart_t = output_elempart_t.cpu()
-
-        pos = torch.isin(
-            output_gidx_part, output_elempart_t
-        ).argwhere().ravel()
+        output_elempart_t = broadcast_elempart(t, output_elempart)
+        gidx_part_this_to_t_mask = isin_elempart(output_gidx_part, output_elempart_t)
 
         # TODO if we really "zip" or `torch.stack` the in/out gidx tensors,
         # we see some similarity in both functions of two calculation phases,
@@ -111,8 +102,8 @@ def calculate_paired_in_out_idx(
 
         # The gidx data itself are stored on this worker, but the specified
         # elements may be not on this worker.
-        input_gidx_to_t = input_gidx_part[pos]
-        output_gidx_on_t = output_gidx_part[pos]
+        input_gidx_to_t = input_gidx_part[gidx_part_this_to_t_mask]
+        output_gidx_on_t = output_gidx_part[gidx_part_this_to_t_mask]
 
         input_gidxes_to_others.append(
             input_gidx_to_t.to(dist_env.comm_device)
@@ -174,29 +165,16 @@ def calculate_halo_info(
     halo_gidxes_to_this = []
 
     for u in range(dist_env.world_size):
-        if dist_env.rank == u:
-            input_elempart_u = dist_env.broadcast(
-                u,
-                input_elempart.idx.to(dist_env.comm_device)
-            )
+        input_elempart_u = broadcast_elempart(u, input_elempart)
 
-        else:
-            input_elempart_u = dist_env.broadcast(
-                u,
-                shape=(input_elempart.lengths[u],),
-                dtype=input_elempart.idx.dtype
-            )
-
-        input_elempart_u = input_elempart_u.cpu()
-
-        halo_lidx_u_to_this = torch.isin(
+        halo_lidx_u_to_this = elempart_isin(
             input_elempart_u, input_gidx_to_this
         ).argwhere().ravel()
         halo_lidxes_to_this.append(
             halo_lidx_u_to_this.to(dist_env.comm_device)
         )
 
-        halo_gidx_u_to_this = input_elempart_u[halo_lidx_u_to_this]
+        halo_gidx_u_to_this = input_elempart_u.idx[halo_lidx_u_to_this]
         halo_gidxes_to_this.append(
             halo_gidx_u_to_this
         )
@@ -558,15 +536,10 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
 
             else:
                 assert False, "Must be a Selector or Reducer"
-
-            # NOTE the raw ElemPart may be loaded from dumps, which may also
-            # be loaded... recursively. Don't modify `raw.hint`.
-            reordered_elempart = ElemPart(
-                idx_desc=reordered_elempart_idx,
-                lengths=target_elempart_raw.lengths,
-                hint=target_elempart_raw.hint
+            
+            elemparts[_rel.target] = reorder_elempart(
+                target_elempart_raw, reordered_elempart_idx
             )
-            elemparts[_rel.target] = reordered_elempart
 
         else:  # _rel is dict kv pair.
             submod = _rel[0]
