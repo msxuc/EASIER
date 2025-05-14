@@ -103,6 +103,21 @@ def elempart_isin(elempart: ElemPart, gidx: torch.Tensor) -> torch.Tensor:
         # assume_unique requires both arguments to be unique.
         return torch.isin(elempart.idx, gidx, assume_unique=True)
 
+def sort_elempart(elempart: ElemPart) -> ElemPart:
+    if isinstance(elempart.idx_desc, ElemPartArangeIdx):
+        return elempart
+
+    if isinstance(elempart.idx_desc, ElemPartReorderedArangeIdx):
+        start, end = elempart.idx_desc.start, elempart.idx_desc.end
+        idx_desc = ElemPartArangeIdx(start, end)
+        sorted_idx = torch.arange(start, end)
+    else:
+        idx_desc = None
+        sorted_idx = elempart.idx.sort()[0]
+
+    hint = f'{elempart.hint}:sorted'
+    return ElemPart(idx_desc, sorted_idx, elempart.lengths, hint)
+
 def reorder_elempart(elempart: ElemPart, reordered_idx: torch.Tensor) -> ElemPart:
     if isinstance(elempart.idx_desc, ElemPartArangeIdx):
         start, end = elempart.idx_desc.start, elempart.idx_desc.end

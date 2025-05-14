@@ -25,7 +25,7 @@ from easier.core.passes.tensor_grouping import \
 from easier.core.passes.sparse_encoding.reorder_plan import \
     build_cascade_reorder_plan, CascadeReorderStep
 from easier.core.passes.sparse_encoding.utils import \
-    broadcast_elempart, isin_elempart, elempart_isin, reorder_elempart
+    broadcast_elempart, isin_elempart, elempart_isin, reorder_elempart, sort_elempart
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
     vector_index_of, zipsort_using_order, \
@@ -60,7 +60,10 @@ def calculate_paired_in_out_idx(
 
         The order of idx in `ElemPart.idx` DOES NOT not matter,
         i.e. both default-ordered or reordered ElemPart can be accepted.
-
+        
+        Remarkably,
+        since output_elempart is only checked against for overlaping elements
+        in gidx_part, callers could sort_elempart() first to speed up.
 
     Returns:
     -   input_gidx_to_this
@@ -83,10 +86,6 @@ def calculate_paired_in_out_idx(
 
     # TODO depends on the lengths relatively, we may fix output_elempart
     # and gather idx_part instead.
-    # And because we are testing if output_gidx_part is in output_elempart,
-    # by fixing output_elempart we may benefit from sorting it once and do
-    # world_size times "isin" by binarysearch (particularly in cases where
-    # output_elempart is not about ArangeIdx/evenly-partition)
 
     # Stands from the point of taking idx partition on this worker only
     # and collects output_elempart from all other workers.
@@ -198,16 +197,18 @@ def reorder_output_by_selector(
 
     input_idx_part, output_idx_part = \
         get_selector_reducer_idx_partition_pair(selector)
+
+    sorted_output_elempart = sort_elempart(output_elempart_to_reorder)
     input_gidx_to_this, output_gidx_on_this = calculate_paired_in_out_idx(
         input_idx_part,
         output_idx_part,
-        output_elempart_to_reorder  # element order doesn't matter
+        sorted_output_elempart  # element order doesn't matter
     )
 
     # When output_elempart is loaded, it's already reordered.
     # As Selectors, all output_elempart elements are covered.
     assert torch.equal(
-        output_gidx_on_this.sort()[0], output_elempart_to_reorder.idx.sort()[0]
+        output_gidx_on_this.sort()[0], sorted_output_elempart.idx
     )
 
     halo_gidxes_to_this, _halo_lidxes_to_others = \
@@ -258,7 +259,7 @@ def reorder_input_by_reducer(
     input_gidx_to_this, output_gidx_on_this = calculate_paired_in_out_idx(
         input_idx_part,
         output_idx_part,
-        output_elempart  # element order doesn't matter, but has been reordered
+        sort_elempart(output_elempart)  # element order doesn't matter
     )
 
     # may be not full
