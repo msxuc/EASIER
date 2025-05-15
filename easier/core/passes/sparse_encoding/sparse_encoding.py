@@ -60,7 +60,6 @@ def calculate_paired_in_out_idx(
 
         The order of idx in `ElemPart.idx` DOES NOT not matter,
         i.e. both default-ordered or reordered ElemPart can be accepted.
-        
         Remarkably,
         since output_elempart is only checked against for overlaping elements
         in gidx_part, callers could sort_elempart() first to speed up.
@@ -165,8 +164,8 @@ def calculate_halo_info(
 
     # Currently we are fixing local input_gidx and calculate isin masks
     # for all input_elemparts among workers, so we can simplify gidx first.
-    # TODO add a flag param to control if to simplify or not, in case
-    # we might fix input_elempart instead.
+    # TODO if elemparts are also well-ordered e.g. ArangeIdx, we don't really
+    # need to simplify gidx -- doing unique() is slower in such cases.
     sorted_input_gidx = input_gidx_to_this.unique(sorted=True)
 
     for u in range(dist_env.world_size):
@@ -204,17 +203,21 @@ def reorder_output_by_selector(
     input_idx_part, output_idx_part = \
         get_selector_reducer_idx_partition_pair(selector)
 
-    sorted_output_elempart = sort_elempart(output_elempart_to_reorder)
+    # NOTE We are NOT reorder the target ElemPart.idx to be sorted,
+    # it's just for simplifying the examination of the raw output ElemPart,
+    # and `calculate_paired_in_out_idx()` doesn't care of the order at all.
+    _sorted_output_elempart = sort_elempart(output_elempart_to_reorder)
+
     input_gidx_to_this, output_gidx_on_this = calculate_paired_in_out_idx(
         input_idx_part,
         output_idx_part,
-        sorted_output_elempart  # element order doesn't matter
+        _sorted_output_elempart  # element order doesn't matter
     )
 
     # When output_elempart is loaded, it's already reordered.
     # As Selectors, all output_elempart elements are covered.
     assert torch.equal(
-        output_gidx_on_this.sort()[0], sorted_output_elempart.idx
+        output_gidx_on_this.sort()[0], _sorted_output_elempart.idx
     )
 
     halo_gidxes_to_this, _halo_lidxes_to_others = \
@@ -558,7 +561,7 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
 
             (input_gidx_to_this, output_gidx_on_this) = \
                 calculate_paired_in_out_idx(
-                    input_idx_part, output_idx_part, df_output_elempart
+                    input_idx_part, output_idx_part, sort_elempart(df_output_elempart)
             )
 
         #
