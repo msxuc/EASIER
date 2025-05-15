@@ -33,7 +33,7 @@ from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader
 from easier.core.passes.tensor_group_partition import \
-    ElemPart, ElemPartArangeIdx, ElemPartReorderedArangeIdx
+    ElemPart, ElemPartArangeIdx
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.dataflow_distribution import \
     ConstantTensorMover, load_replicated_tensors_from_source, \
