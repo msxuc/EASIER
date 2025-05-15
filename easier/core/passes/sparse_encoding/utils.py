@@ -58,9 +58,17 @@ def _isin_sorted(to_find: torch.Tensor, sorted_tests: torch.Tensor):
     assert sorted_tests.ndim == 1
 
     lowerbound_indexes = torch.searchsorted(sorted_tests, to_find)
+
+    # lowerbound_index may be N=len(sorted_tests) rather than N-1,
+    # if any elem of to_find is greater than the maximum test value.
+    # Which would cause directly indexing to be out-of-range.
+    greater_than_mask = lowerbound_indexes == sorted_tests.shape[0]
+
+    # Rewrite to whatever valid index, and eventually mask those positions out
+    lowerbound_indexes[greater_than_mask] = 0
     lowerbound_values = sorted_tests[lowerbound_indexes]
 
-    return lowerbound_values == to_find
+    return torch.logical_and(lowerbound_values == to_find, ~greater_than_mask)
 
 def isin_elempart(gidx: torch.Tensor, elempart: ElemPart) -> torch.Tensor:
     """
