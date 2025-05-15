@@ -122,8 +122,7 @@ def sort_elempart(elempart: ElemPart) -> ElemPart:
         idx_desc = ElemPartArangeIdx(start, end)
         sorted_idx = torch.arange(start, end)
     else:
-        # idx_desc = ElemPartSortedIdx()
-        idx_desc = None
+        idx_desc = ElemPartSortedIdx()
         sorted_idx = elempart.idx.sort()[0]
 
     hint = f'{elempart.hint}:sorted'
