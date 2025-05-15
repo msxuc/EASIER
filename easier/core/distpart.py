@@ -726,9 +726,9 @@ def distpart_kway(
     #
     # NOTE METIS asserts, although not reflected in release, that the CSR data
     # should not have self edges. Let's remove them. This essentially
-    # discards all adj weights within the (most) coarsened vertex. 
+    # discards all adj weights within the (most) coarsened vertex.
     new_lv = new_lv.remove_self_edges()
-    
+
     cgraph = gather_csr_graph(0, new_lv)
     if dist_env.rank == 0:
         assert cgraph is not None

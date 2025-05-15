@@ -249,7 +249,7 @@ def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
     components.to(device)
 
     [components] = esr.compile(
-        [components], 'none'
+        [components], 'none', partition_mode='evenly'
     )  # type: ignore
     components: PoissonMeshComponentsCollector
     components()
@@ -265,7 +265,7 @@ def _assemble_poisson(mesh: str, poisson: str, device='cpu'):
     initializer.to(device)
 
     [initializer] = esr.compile(
-        [initializer], 'none'
+        [initializer], 'none', partition_mode='evenly'
     )  # type: ignore
     initializer: PoissonInitializer
     initializer()

@@ -360,7 +360,7 @@ def test_sync_parmetis_result(mock_mpi_dist_env):
             local_membership
         )
         for k, v in r.items():
-            assert isinstance(v.idx_desc, torch.Tensor)
+            assert v.idx_desc is None
 
         return r
 

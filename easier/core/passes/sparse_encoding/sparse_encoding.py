@@ -25,7 +25,8 @@ from easier.core.passes.tensor_grouping import \
 from easier.core.passes.sparse_encoding.reorder_plan import \
     build_cascade_reorder_plan, CascadeReorderStep
 from easier.core.passes.sparse_encoding.utils import \
-    broadcast_elempart, isin_elempart, elempart_isin, reorder_elempart, sort_elempart
+    broadcast_elempart, isin_elempart, elempart_isin, \
+    reorder_elempart, sort_elempart
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, \
     vector_index_of, zipsort_using_order, \
@@ -90,7 +91,9 @@ def calculate_paired_in_out_idx(
     # and collects output_elempart from all other workers.
     for t in range(dist_env.world_size):
         output_elempart_t = broadcast_elempart(t, output_elempart)
-        gidx_part_this_to_t_mask = isin_elempart(output_gidx_part, output_elempart_t)
+        gidx_part_this_to_t_mask = isin_elempart(
+            output_gidx_part, output_elempart_t
+        )
 
         # TODO if we really "zip" or `torch.stack` the in/out gidx tensors,
         # we see some similarity in both functions of two calculation phases,
@@ -546,7 +549,7 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
 
             else:
                 assert False, "Must be a Selector or Reducer"
-            
+
             elemparts[_rel.target] = reorder_elempart(
                 target_elempart_raw, reordered_elempart_idx
             )
@@ -561,7 +564,10 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
 
             (input_gidx_to_this, output_gidx_on_this) = \
                 calculate_paired_in_out_idx(
-                    input_idx_part, output_idx_part, sort_elempart(df_output_elempart)
+                    input_idx_part,
+                    output_idx_part,
+                    sort_elempart(df_output_elempart)
+                    # TODO cache the sorted
             )
 
         #

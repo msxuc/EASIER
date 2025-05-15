@@ -264,7 +264,9 @@ def _assemble_shallow_water(mesh: str, shallow_water: str, device='cpu'):
     components = ShallowWaterMeshComponentsCollector(mesh)
     components.to(device)
 
-    [components] = esr.compile([components], 'none')  # type: ignore
+    [components] = esr.compile(
+        [components], 'torch', partition_mode='evenly'
+    )  # type: ignore
     components: ShallowWaterMeshComponentsCollector
     components()
 
@@ -278,7 +280,9 @@ def _assemble_shallow_water(mesh: str, shallow_water: str, device='cpu'):
     initializer = ShallowWaterInitializer(shallow_water, mesh)
     initializer.to(device)
 
-    [initializer] = esr.compile([initializer], 'none')  # type: ignore
+    [initializer] = esr.compile(
+        [initializer], 'torch', partition_mode='evenly'
+    )  # type: ignore
     initializer: ShallowWaterInitializer
     initializer()
 

@@ -1135,6 +1135,7 @@ def load_elemparts(
 
     for ep_info in elempart_infos:
         if ep_info.elempart_type == None:
+            idx_desc = None
             idx = torch.from_numpy(
                 h5_ep_root[ep_info.h5_group_basepath][  # type: ignore
                     H5_DATASET_ELEMPART_IDX][...]

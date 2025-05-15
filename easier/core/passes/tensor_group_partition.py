@@ -367,30 +367,47 @@ class ElemPartArangeIdx:
     start: int
     end: int
 
+
 @dataclass
 class ElemPartReorderedArangeIdx:
     """
+    A shuffled ArangeIdx. Generally resulted from ElemPart reordering on
+    ArangeIdx ElemPart.
     """
     start: int
     end: int
 
+
 @dataclass
 class ElemPartSortedIdx:
+    """
+    This idx_desc will appear when any general ElemPart is made, or, determined
+    to be sorted.
+    Some inspection algorithm which used to use e.g. torch.isin()
+    could benefit from the sorted-ness.
+
+    NOTE a temp sorted ElemPart could be created to locally boost analysis,
+    even the sorted ElemPart will not get stored.
+    """
     pass
+
 
 """
 4 idx_desc types, including None, form a partial order of "well-ordered-ness"
 
        ___  ReorderedArangeIdx ___
-None  -|                         |-- ArangeIdx
+None --|                         |-- ArangeIdx
        ---  SortedIdx  -----------
 """
+
 
 @dataclass
 class ElemPart:
 
     # Only for this worker.
-    idx_desc: Union[None, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx]
+    idx_desc: Union[
+        None, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx
+    ]
 
     idx: torch.Tensor
 
