@@ -14,7 +14,7 @@ from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument, map_arg
 from easier.core.passes.tensor_group_partition import \
-    ElemPart, ElemPartArangeIdx, ElemPartReorderedArangeIdx
+    ElemPart, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.utils import \
@@ -50,6 +50,17 @@ def broadcast_elempart(src: int, elempart: ElemPart) -> ElemPart:
         # Only elempart.lengths is constantly replicated
         return ElemPart(idx_desc, idx, elempart.lengths, hint)
 
+def _isin_sorted(to_find: torch.Tensor, sorted_tests: torch.Tensor):
+    """
+    Returns the mask.
+    """
+    assert to_find.ndim == 1
+    assert sorted_tests.ndim == 1
+
+    lowerbound_indexes = torch.searchsorted(sorted_tests, to_find)
+    lowerbound_values = sorted_tests[lowerbound_indexes]
+
+    return lowerbound_values == to_find
 
 def isin_elempart(gidx: torch.Tensor, elempart: ElemPart) -> torch.Tensor:
     """
@@ -63,11 +74,14 @@ def isin_elempart(gidx: torch.Tensor, elempart: ElemPart) -> torch.Tensor:
     ):
         start, end = elempart.idx_desc.start, elempart.idx_desc.end
         return torch.logical_and(start <= gidx, gidx < end)
+    
+    elif isinstance(elempart.idx_desc, ElemPartSortedIdx):
+        return _isin_sorted(gidx, elempart.idx)
 
     else:
         return torch.isin(gidx, elempart.idx)
 
-def elempart_isin(elempart: ElemPart, gidx: torch.Tensor) -> torch.Tensor:
+def elempart_isin(elempart: ElemPart, gidx: torch.Tensor, gidx_sorted = False) -> torch.Tensor:
     """
     Test if elements of `elempart.idx` are in `gidx`.
     """
@@ -94,17 +108,13 @@ def elempart_isin(elempart: ElemPart, gidx: torch.Tensor) -> torch.Tensor:
         return arange_mask[elempart.idx - elempart.idx_desc.start]
 
     else:
-        # Currently we are fixing local input_gidx and calculate isin masks
-        # for all input_elemparts among workers, so we can simplify gidx first.
-        # TODO add a flag param to control if to simplify or not, in case
-        # we might fix input_elempart instead.
-        gidx = gidx.unique(sorted=True)
-
-        # assume_unique requires both arguments to be unique.
-        return torch.isin(elempart.idx, gidx, assume_unique=True)
+        if gidx_sorted:
+            return _isin_sorted(elempart.idx, gidx)
+        else:
+            return torch.isin(elempart.idx, gidx)
 
 def sort_elempart(elempart: ElemPart) -> ElemPart:
-    if isinstance(elempart.idx_desc, ElemPartArangeIdx):
+    if isinstance(elempart.idx_desc, (ElemPartArangeIdx, ElemPartSortedIdx)):
         return elempart
 
     if isinstance(elempart.idx_desc, ElemPartReorderedArangeIdx):
@@ -112,6 +122,7 @@ def sort_elempart(elempart: ElemPart) -> ElemPart:
         idx_desc = ElemPartArangeIdx(start, end)
         sorted_idx = torch.arange(start, end)
     else:
+        # idx_desc = ElemPartSortedIdx()
         idx_desc = None
         sorted_idx = elempart.idx.sort()[0]
 
@@ -119,12 +130,10 @@ def sort_elempart(elempart: ElemPart) -> ElemPart:
     return ElemPart(idx_desc, sorted_idx, elempart.lengths, hint)
 
 def reorder_elempart(elempart: ElemPart, reordered_idx: torch.Tensor) -> ElemPart:
-    if isinstance(elempart.idx_desc, ElemPartArangeIdx):
+    if isinstance(elempart.idx_desc, (ElemPartArangeIdx, ElemPartReorderedArangeIdx)):
         start, end = elempart.idx_desc.start, elempart.idx_desc.end
         idx_desc = ElemPartReorderedArangeIdx(start, end)
     else:
-        # We won't reorder ReorderedArangeIdx again.
-        # And it makes nothing wrong not to annotate the ElemPart.
         idx_desc = None
 
     hint = f'{elempart.hint}:reordered'

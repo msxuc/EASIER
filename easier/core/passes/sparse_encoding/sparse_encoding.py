@@ -163,11 +163,17 @@ def calculate_halo_info(
     halo_lidxes_to_this = []
     halo_gidxes_to_this = []
 
+    # Currently we are fixing local input_gidx and calculate isin masks
+    # for all input_elemparts among workers, so we can simplify gidx first.
+    # TODO add a flag param to control if to simplify or not, in case
+    # we might fix input_elempart instead.
+    sorted_input_gidx = input_gidx_to_this.unique(sorted=True)
+
     for u in range(dist_env.world_size):
         input_elempart_u = broadcast_elempart(u, input_elempart)
 
         halo_lidx_u_to_this = elempart_isin(
-            input_elempart_u, input_gidx_to_this
+            input_elempart_u, sorted_input_gidx
         ).argwhere().ravel()
         halo_lidxes_to_this.append(
             halo_lidx_u_to_this.to(dist_env.comm_device)

@@ -375,10 +375,22 @@ class ElemPartReorderedArangeIdx:
     end: int
 
 @dataclass
+class ElemPartSortedIdx:
+    pass
+
+"""
+4 idx_desc types, including None, form a partial order of "well-ordered-ness"
+
+       ___  ReorderedArangeIdx ___
+None  -|                         |-- ArangeIdx
+       ---  SortedIdx  -----------
+"""
+
+@dataclass
 class ElemPart:
 
     # Only for this worker.
-    idx_desc: Union[None, ElemPartArangeIdx, ElemPartReorderedArangeIdx]
+    idx_desc: Union[None, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx]
 
     idx: torch.Tensor
 
