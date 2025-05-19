@@ -87,7 +87,7 @@ py::tuple get_mesh(long nx, long ny) {
       if (j != 0) {
         offset = 8 * nx * ny + nx * (j - 1) + i;
         src[offset] = ncell;
-        dst[offset] = ncell - 4 * n + 2;
+        dst[offset] = ncell - 4 * nx + 2;
       } else {
         bcells[i] = ncell;
         bpoints[i * 2] = p0;
@@ -95,36 +95,36 @@ py::tuple get_mesh(long nx, long ny) {
       }
 
       // upward edges
-      if (j != n - 1) {
-        offset = 8 * nx * ny + n * (n - 1) + nx * j + i;
+      if (j != ny - 1) {
+        offset = 8 * nx * ny + nx * (ny - 1) + nx * j + i;
         src[offset] = ncell + 2;
-        dst[offset] = ncell + 4 * n;
+        dst[offset] = ncell + 4 * nx;
       } else {
-        bcells[n + i] = ncell + 2;
-        bpoints[n * 2 + i * 2] = p1;
-        bpoints[n * 2 + i * 2 + 1] = p2;
+        bcells[nx + i] = ncell + 2;
+        bpoints[nx * 2 + i * 2] = p1;
+        bpoints[nx * 2 + i * 2 + 1] = p2;
       }
 
       // leftward edges
       if (i != 0) {
-        offset = 8 * nx * ny + 2 * n * (n - 1) + (n - 1) * j + i - 1;
+        offset = 8 * nx * ny + 2 * nx * (ny - 1) + (nx - 1) * j + i - 1;
         src[offset] = ncell + 3;
         dst[offset] = ncell - 3;
       } else {
-        bcells[n * 2 + j] = ncell + 3;
-        bpoints[n * 2 * 2 + j * 2] = p0;
-        bpoints[n * 2 * 2 + j * 2 + 1] = p1;
+        bcells[nx * 2 + j] = ncell + 3;
+        bpoints[nx * 2 * 2 + j * 2] = p0;
+        bpoints[nx * 2 * 2 + j * 2 + 1] = p1;
       }
 
       // right edges
-      if (i != n - 1) {
-        offset = 8 * nx * ny + 3 * n * (n - 1) + (n - 1) * j + i;
+      if (i != nx - 1) {
+        offset = 8 * nx * ny + 2 * nx * (ny - 1) + (nx - 1) * ny + (nx - 1) * j + i;
         src[offset] = ncell + 1;
         dst[offset] = ncell + 7;
       } else {
-        bcells[n * 3 + j] = ncell + 1;
-        bpoints[n * 3 * 2 + j * 2] = p2;
-        bpoints[n * 3 * 2 + j * 2 + 1] = p3;
+        bcells[nx * 2 + ny + j] = ncell + 1;
+        bpoints[nx * 2 * 2 + ny * 2 + j * 2] = p2;
+        bpoints[nx * 2 * 2 + ny * 2 + j * 2 + 1] = p3;
       }
     }
   }
