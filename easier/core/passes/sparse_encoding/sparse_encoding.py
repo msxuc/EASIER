@@ -537,6 +537,8 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
         if isinstance(_rel, CascadeReorderStep):
             submod = _rel.pattern
 
+            logger.debug(f"Reorder {submod.easier_hint_name} TensorGroup")
+
             basis_elempart = elemparts[_rel.basis]
             target_elempart_raw = elemparts[_rel.target]
 
@@ -580,6 +582,8 @@ def encode_sparsity(modules: List[esr.Module], graphs: List[Graph]):
                 calculate_paired_in_out_idx(
                     input_idx_part, output_idx_part, df_output_elempart
             )
+
+        logger.debug(f"Rewrite {submod.easier_hint_name}")
 
         #
         #   Rewrite the instance for both CascadeReorderStep and those aren't,

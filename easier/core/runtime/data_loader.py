@@ -14,6 +14,7 @@ import torch
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
+from easier.core.utils import EasierJitException
 
 
 ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
@@ -271,9 +272,26 @@ class DataLoaderBase:
         if len(self.shape) == 0:
             ph = torch.zeros((), dtype=self.dtype, device=device)
         else:
+            # TODO using `.expand()` is compatible (i.e. works with
+            # `Tensor.data=ph` and propagates shape/dtype) and simple.
+            # However, `torch.nn.Parameter.__new__` may have indicated
+            # the protocol to make a very customized object to be compatible.
+            #
+            # That would be good because we can get totally ride of OOM,
+            # not only by `.to()`, and also prevent `esr.Tensor` from e.g.
+            # `torch.ones_like()`.
             ph = torch.zeros(
                 (1,), dtype=self.dtype, device=device
             ).expand(self.shape)  # can even expand to (0,0,0)
+
+        ########################################
+        #              WARNING
+        ########################################
+        # .to() method on placeholder tensors must be strictly disabled,
+        # otherwise it will materialize the memory and cause OOM!
+        def _to_forbidden(self, *args, **kwargs):
+            raise EasierJitException("Cannot can .to() on placeholders!")
+        ph.to = _to_forbidden.__get__(ph)
 
         setattr(ph, ATTRIBUTE_PLACEHOLDER, True)
         return ph
@@ -705,15 +723,20 @@ class H5DataLoader(DataLoaderBase):
                     dist_env.broadcast(0, t)
             else:
                 t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            return t.to(device)
 
         else:
             if rank == 0:
                 with self._dataset_as_dtype() as d:
                     t = torch.from_numpy(d[...])
-            else:
-                t = self.get_placeholder(device)
+                return t.to(device)
 
-        return t.to(device)
+            else:
+                # We cannot call .to(device) on the placeholder
+                # (therefore we have to calls .to(device) many times above)
+                ph = self.get_placeholder(device)
+                return ph
+
 
     def __repr__(self) -> str:
         return ''.join([
