@@ -274,8 +274,11 @@ class DataLoaderBase:
         else:
             # TODO using `.expand()` is compatible (i.e. works with
             # `Tensor.data=ph` and propagates shape/dtype) and simple.
-            # However, `torch.nn.Parameter.__new__` may have indicated
-            # the protocol to make a very customized object to be compatible.
+            #
+            # However, `torch.nn.Parameter.__new__` and
+            # `torch.nn._ParameterMeta(torch._C._TensorMeta)`
+            # may have indicated the protocol to make a very customized object
+            # to be compatible.
             #
             # That would be good because we can get totally ride of OOM,
             # not only by `.to()`, and also prevent `esr.Tensor` from e.g.
@@ -288,7 +291,7 @@ class DataLoaderBase:
         #              WARNING
         ########################################
         # .to() method on placeholder tensors must be strictly disabled,
-        # otherwise it will materialize the memory and cause OOM!
+        # otherwise it might materialize the memory and cause OOM!
         def _to_forbidden(self, *args, **kwargs):
             raise EasierJitException("Cannot can .to() on placeholders!")
         ph.to = _to_forbidden.__get__(ph)
