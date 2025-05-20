@@ -12,6 +12,7 @@ import easier as esr
 from easier.numeric import Linsys
 from easier.numeric.solver import CG, GMRES
 
+
 class Poisson(esr.Module):
     def __init__(self, mesh: str, poisson: str, device='cpu', x=None) -> None:
         super().__init__()
@@ -93,7 +94,7 @@ if __name__ == '__main__':
         sol = CG(eqn.A, eqn.b, eqn.x)
     else:
         sol = GMRES(eqn.A, eqn.b, eqn.x)
-    
+
     eqn, sol = esr.compile([eqn, sol], args.backend)
 
     tol = 1e-5

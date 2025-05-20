@@ -10,6 +10,7 @@ import numpy as np
 import easier as esr
 from easier.numeric import Linsys
 
+
 class ShallowWaterEquation(esr.Module):
     def __init__(self, mesh_path: str, sw_path: str, dt=0.005, device='cpu') -> None:
         super().__init__()

@@ -8,6 +8,7 @@ import torch
 import easier as esr
 from easier.numeric import Linsys
 
+
 class ShallowWaterMeshComponentsCollector(esr.Module):
     def __init__(self, mesh: str):
         super().__init__()

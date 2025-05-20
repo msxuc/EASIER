@@ -740,7 +740,6 @@ class H5DataLoader(DataLoaderBase):
                 ph = self.get_placeholder(device)
                 return ph
 
-
     def __repr__(self) -> str:
         return ''.join([
             f'{self.__class__.__name__}(',

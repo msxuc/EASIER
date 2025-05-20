@@ -23,7 +23,6 @@ if __name__ == '__main__':
     parser.add_argument("--filename", type=str)
     args = parser.parse_args()
 
-
     fig = plot.figure()
     ax = fig.add_subplot(projection='3d')
     writer = anime.PillowWriter(fps=5)

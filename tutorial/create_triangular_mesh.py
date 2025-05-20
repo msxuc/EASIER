@@ -8,6 +8,7 @@ import torch
 
 import easier.cpp_extension as ext
 
+
 def get_triangular_mesh(nx, ny=None, data_dir='~/.easier') -> str:
     # type: (int, int|None, str) -> str
     data_dir = os.path.expanduser(data_dir)
@@ -16,7 +17,7 @@ def get_triangular_mesh(nx, ny=None, data_dir='~/.easier') -> str:
 
     if os.path.exists(path):
         return path
-    
+
     src, dst, cells, bcells, bpoints, points = \
         ext.generate_triangular_mesh(nx, ny)
     src = src.numpy()
@@ -35,6 +36,7 @@ def get_triangular_mesh(nx, ny=None, data_dir='~/.easier') -> str:
         h5f.create_dataset('bpoints', data=bpoints)
 
     return path
+
 
 if __name__ == '__main__':
     """

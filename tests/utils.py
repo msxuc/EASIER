@@ -21,6 +21,7 @@ from easier.core.utils import get_random_str
 MESH = os.path.expanduser('~/.easier/triangular_100_100.hdf5')
 POISSON = os.path.expanduser('~/.easier/Poisson_100_100.hdf5')
 
+
 def import_poisson():
     assert os.path.exists(MESH), \
         "Run `python tutorial/create_triangular_mesh.py 100`"

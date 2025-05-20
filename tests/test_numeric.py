@@ -17,7 +17,7 @@ from tests.utils import \
 
 def worker__test_cg(local_rank: int, world_size: int, backend: str):
     Poisson = import_poisson()
-    
+
     # for prec_type in ['symmetric', None]:
     for prec_type in [None]:
 
@@ -28,6 +28,7 @@ def worker__test_cg(local_rank: int, world_size: int, backend: str):
 
         info = sol.solve(atol=1e-4, maxiter=1000)
         assert info["residual"] < 1e-4
+
 
 def worker__test_gmres(local_rank: int, world_size: int, backend: str):
     Poisson = import_poisson()
@@ -43,6 +44,7 @@ def worker__test_gmres(local_rank: int, world_size: int, backend: str):
         info = sol.solve(atol=1e-4, maxiter=1000)
         assert info["residual"] < 1e-4
 
+
 @pytest.mark.parametrize('nprocs, backend', [
     (1, 'torch'),
     (1, 'cpu'),
@@ -52,7 +54,7 @@ def worker__test_gmres(local_rank: int, world_size: int, backend: str):
     pytest.param(2, 'cuda', marks=when_ngpus_ge_2),
 ])
 class TestLinearSolver:
-    
+
     def test_cg(self, nprocs: int, backend: str):
         if backend != 'cuda':
             init_type = 'cpu'

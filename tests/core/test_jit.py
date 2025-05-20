@@ -340,7 +340,7 @@ def worker__test_none_collect(local_rank: int, world_size: int, dev_type: str):
     _orig_m_forward = m.forward
 
     with patch(f'h5py.File') as mock_h5py_File, \
-        patch.object(m, 'forward') as mock_m_forward:
+            patch.object(m, 'forward') as mock_m_forward:
 
         mock_h5py_File.side_effect = _orig_h5py_File
         mock_m_forward.side_effect = _orig_m_forward
@@ -398,7 +398,7 @@ def worker__test_none_save(local_rank: int, world_size: int, dev_type: str):
     _orig_m_forward = m.forward
 
     with patch(f'h5py.File') as mock_h5py_File, \
-        patch.object(m, 'forward') as mock_m_forward:
+            patch.object(m, 'forward') as mock_m_forward:
 
         mock_h5py_File.side_effect = _orig_h5py_File
         mock_m_forward.side_effect = _orig_m_forward
