@@ -29,7 +29,8 @@ def import_poisson():
 
     esr_dir = os.path.dirname(easier.__file__)
     path = os.path.join(esr_dir, '..', 'tutorial', 'poisson')
-    sys.path.append(path)
+    if path not in sys.path:
+        sys.path.append(path)
 
     from poisson_main import Poisson  # type: ignore
 

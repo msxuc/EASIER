@@ -27,7 +27,7 @@ Poisson = import_poisson()
 class Model(esr.Module):
     def __init__(self, nf, device: Union[str, torch.device] = 'cpu') -> None:
         super().__init__()
-        eqn = Poisson(100, device)  # type: ignore
+        eqn = Poisson(MESH, POISSON, device)  # type: ignore
         nv = self.nv = eqn.x.shape[0]
         ne = self.ne = eqn.src.shape[0]
 
