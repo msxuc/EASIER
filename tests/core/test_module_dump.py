@@ -8,9 +8,10 @@ import tempfile
 import os
 
 import easier as esr
+from easier.core.utils import get_random_str
 
 from ..utils import \
-    torchrun_singlenode, get_random_str, assert_tensor_list_equal, \
+    torchrun_singlenode, assert_tensor_list_equal, \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
     import_poisson, MESH, POISSON
 from tests.core.utils import multi_stage_zero_length_partition

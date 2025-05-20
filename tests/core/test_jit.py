@@ -12,11 +12,11 @@ import h5py
 
 import easier as esr
 from easier.core.jit import EasierTracer
+from easier.core.utils import get_random_str
 from easier.core.passes.utils import OrderedSet
 
 from tests.utils import \
-    torchrun_singlenode, get_random_str, \
-    mpi_e2e, mpirun_singlenode, when_ngpus_ge_2, \
+    torchrun_singlenode, mpi_e2e, mpirun_singlenode, when_ngpus_ge_2, \
     import_poisson, MESH, POISSON
 from tests.core.utils import multi_stage_zero_length_partition
 
