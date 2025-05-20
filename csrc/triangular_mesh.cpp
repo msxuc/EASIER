@@ -118,7 +118,8 @@ py::tuple get_mesh(long nx, long ny) {
 
       // right edges
       if (i != nx - 1) {
-        offset = 8 * nx * ny + 2 * nx * (ny - 1) + (nx - 1) * ny + (nx - 1) * j + i;
+        offset =
+          8 * nx * ny + 2 * nx * (ny - 1) + (nx - 1) * ny + (nx - 1) * j + i;
         src[offset] = ncell + 1;
         dst[offset] = ncell + 7;
       } else {

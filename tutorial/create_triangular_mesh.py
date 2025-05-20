@@ -38,7 +38,9 @@ def get_triangular_mesh(nx, ny=None, data_dir='~/.easier') -> str:
 
 if __name__ == '__main__':
     """
+    Usage:
 
+    python tutorial/create_triangular_mesh.py 100 [100] [~/.easier]
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("nx", type=int)
@@ -53,7 +55,9 @@ if __name__ == '__main__':
     else:
         ny: int = args.ny
 
-    print(args)
+    mesh = get_triangular_mesh(nx, ny, data_dir)
 
-    get_triangular_mesh(nx, ny, data_dir)
-
+    print("Create triangular mesh:")
+    print("nx:", args.nx)
+    print("ny:", args.ny)
+    print("output HDF5 file:", mesh)

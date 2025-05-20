@@ -11,13 +11,15 @@ import h5py
 import tempfile
 import os
 
-from easier.examples.models import Poisson
 import easier as esr
 
 from ..utils import \
     torchrun_singlenode, get_random_str, assert_tensor_list_equal, \
-    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode
+    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
+    import_poisson, MESH, POISSON
 from tests.core.utils import multi_stage_zero_length_partition
+
+Poisson = import_poisson()
 
 
 class Model(esr.Module):
