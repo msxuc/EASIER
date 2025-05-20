@@ -1,25 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
-import torch.utils
-from typing_extensions import Literal, OrderedDict, TypeAlias
-import functools
-import more_itertools
 import time
 
 import torch
-from torch.fx.graph import Graph
-from torch.fx.node import Node
 
-import numpy as np
 import scipy.sparse
-from torch.nn.modules import Module
 
-import easier.core.module as esr
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import EasierJitException, logger
+from easier.core.utils import logger
 import easier.cpp_extension as _C
 
 

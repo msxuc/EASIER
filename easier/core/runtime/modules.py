@@ -1,16 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Optional, Sequence
-from typing_extensions import Literal, TypeAlias
-import typing
+from typing import List, Optional
 
 import torch
-from torch import LongTensor
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
-
-from easier.core.utils import logger
 
 
 class HaloExchanger(torch.nn.Module):

@@ -1,11 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import importlib
-import os
 import pytest
-import sys
-import torch
 
 import easier as esr
 from easier.numeric import solver

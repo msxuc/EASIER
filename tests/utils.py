@@ -1,10 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import random
-import string
-from typing import Callable, List, Literal, Tuple
-from unittest.mock import patch
+from typing import List, Literal, Tuple
 import os
 import sys
 import pytest
@@ -15,7 +12,6 @@ from torch.multiprocessing.spawn import spawn
 
 import easier
 import easier.core.runtime.dist_env as _DM
-from easier.core.utils import get_random_str
 
 
 MESH = os.path.expanduser('~/.easier/triangular_100_100.hdf5')

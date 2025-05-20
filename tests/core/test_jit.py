@@ -13,7 +13,6 @@ import h5py
 import easier as esr
 from easier.core.jit import EasierTracer
 from easier.core.passes.utils import OrderedSet
-from easier.core.runtime.dist_env import DummyDistEnv
 
 from tests.utils import \
     torchrun_singlenode, get_random_str, \

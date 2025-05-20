@@ -2,11 +2,9 @@
 # Licensed under the MIT License.
 
 import argparse
-import os
 import torch
 
 import easier as esr
-from easier.numeric import Linsys
 
 
 class PoissonMeshComponentsCollector(esr.Module):

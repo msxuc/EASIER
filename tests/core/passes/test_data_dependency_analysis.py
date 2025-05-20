@@ -1,18 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import operator
-from typing import Dict, Iterable, List, Set, cast, AbstractSet, Union
-from typing_extensions import TypeAlias
+from typing import Dict, Iterable, List, Set, cast, Union
 import pytest
 import torch
 
-from torch.fx.graph import Graph
 from torch.fx.node import Node
 
 from easier.core.jit import EasierTracer
 
-from easier.core.module import Selector, Reducer, Tensor
+from easier.core.module import Reducer, Tensor
 from easier.core.passes.data_dependency_analysis import \
     get_data_dependency_inputs, get_data_dependency_users, \
     KEY__DATA_DEPENDENCY_USERS, KEY__DATA_DEPENDENCY_INPUTS
@@ -22,7 +19,7 @@ from easier.core.runtime.jit_engine.jit_engine import \
     JitEngine
 from easier.core import passes
 import easier as esr
-from easier.core.passes.utils import FX, tree_map
+from easier.core.passes.utils import FX
 
 
 def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):

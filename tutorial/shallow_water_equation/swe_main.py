@@ -8,7 +8,6 @@ from tqdm import tqdm
 import numpy as np
 
 import easier as esr
-from easier.numeric import Linsys
 
 
 class ShallowWaterEquation(esr.Module):

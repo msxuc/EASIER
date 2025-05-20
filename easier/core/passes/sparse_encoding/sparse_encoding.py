@@ -1,23 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from dataclasses import dataclass
 import itertools
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
-from typing_extensions import TypeAlias
+from typing import Dict, List, Sequence, Tuple, Union
 
 
 import torch
-import torch.overrides
-from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
 from easier.core.passes.tensor_group_partition import ElemPart
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.utils import \
-    logger, EasierJitException
+    logger
 import easier.core.module as esr
 
 from easier.core.passes.tensor_grouping import \
@@ -25,8 +19,7 @@ from easier.core.passes.tensor_grouping import \
 from easier.core.passes.sparse_encoding.reorder_plan import \
     build_cascade_reorder_plan, CascadeReorderStep
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, \
-    vector_index_of, zipsort_using_order, \
+    EasierInterpreter, vector_index_of, zipsort_using_order, \
     get_selector_reducer_idx_partition_pair, get_selectors_reducers
 
 

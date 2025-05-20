@@ -1,13 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing_extensions import Literal
-from unittest.mock import patch
 import torch
 import pytest
-import contextlib
 
-import h5py
 import tempfile
 import os
 

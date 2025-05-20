@@ -4,7 +4,6 @@
 import argparse
 import os
 import h5py
-import torch
 
 import easier.cpp_extension as ext
 

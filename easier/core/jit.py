@@ -5,15 +5,13 @@ import math
 import operator
 from types import ModuleType
 from typing import \
-    Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union, cast
+    Callable, Dict, List, Optional, Tuple, Union, cast
 from typing_extensions import Literal
 import more_itertools
-import os
 
 import torch
 from torch import nn
 from torch.fx._symbolic_trace import Tracer
-from torch.fx.graph_module import GraphModule
 from torch.fx.node import Node
 from torch.fx.proxy import Proxy
 from torch.fx.graph import Graph

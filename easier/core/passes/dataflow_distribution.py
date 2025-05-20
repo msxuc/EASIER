@@ -1,18 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import itertools
 from types import FunctionType
-from typing import Dict, Iterable, List, Optional, Sequence, Set, \
-    Tuple, Union, cast
-from typing_extensions import Literal, TypeVar, assert_never
+from typing import Dict, List
 import torch
-from torch import LongTensor
 from torch.fx.graph import Graph
 from torch.fx.node import Node
-from torch.nn.modules import Module
 from easier.core.passes.tensor_grouping import \
-    EasierTensorDef, EasierTensorGroup, get_node_tensor_group
+    EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import EasierInterpreter, SubmodNameAllocator, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     get_easier_tensors
@@ -21,7 +16,7 @@ from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
 
 import easier.core.module as esr
-from easier.core.module import Module, Selector, Reducer
+from easier.core.module import Selector
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
 from easier.core.passes.tensor_group_partition import \
     ElemPart

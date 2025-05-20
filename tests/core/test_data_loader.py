@@ -2,9 +2,7 @@
 # Licensed under the MIT License.
 
 from typing_extensions import Literal
-from unittest.mock import patch
 import torch
-from torch.fx import GraphModule
 import pytest
 
 import h5py

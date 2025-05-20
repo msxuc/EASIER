@@ -2,11 +2,9 @@
 # Licensed under the MIT License.
 
 from typing import \
-    Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, cast, \
-    overload, TYPE_CHECKING
+    Dict, List, Optional, Sequence, Tuple, Union, overload, TYPE_CHECKING
 from typing_extensions import TypeAlias, Self
 import os
-import dataclasses
 
 # REMARK
 # Because of our custom definition of `easier.sum` function,
@@ -27,7 +25,6 @@ from easier.core.runtime.dist_env import \
 from easier.core.runtime.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
     FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
-from easier.core.utils import logger, get_random_str
 
 
 if TYPE_CHECKING:

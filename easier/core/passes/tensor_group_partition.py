@@ -1,12 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Dict, List, Sequence, Tuple, Union
 from dataclasses import dataclass
-from typing_extensions import Literal, OrderedDict, TypeAlias
+from typing_extensions import Literal, OrderedDict
 import functools
-import more_itertools
-import os
 
 import torch
 from torch.fx.graph import Graph
@@ -27,7 +25,7 @@ from easier.core.passes.utils import \
 from easier.core.runtime.dist_env import \
     get_runtime_dist_env
 from easier.core.distpart import distpart_kway, DistConfig
-from easier.core.utils import EasierJitException, logger
+from easier.core.utils import EasierJitException
 
 # METIS adj weights are ints
 METIS_ADJWGT_REDUCER: int = 10
