@@ -46,6 +46,7 @@ class NodeHandlerBase:
         # =================
         self.current_module: esr.Module
         self.current_graph: Graph
+        self.stackframe: Dict[Node, RuntimeValue]
 
         #
         # Context variables, the lifetime is the execution period of a Node.

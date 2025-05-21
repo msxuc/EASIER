@@ -169,6 +169,10 @@ def get_meta_role_size(meta: StructuredTensorMeta) -> Tuple[Role, int]:
         return replica
 
 
+class Evaluator(NodeHandlerBase):
+    pass
+
+
 class MetadataValidation(NodeHandlerBase):
     """
     Postprocess-only.
@@ -719,6 +723,8 @@ class JitEngine:
         self.run_count = 0
 
         self.first_run_handlers: List[NodeHandlerBase] = [
+            Evaluator(),
+
             FirstRunMetadataPropagation(),
 
             FirstRunAggregatorMetadataPropagation(),
@@ -731,6 +737,8 @@ class JitEngine:
         ]
 
         self.runtime_handlers: List[NodeHandlerBase] = [
+            Evaluator(),
+
             MetadataValidation(),
             SkipZeroLengthNonHalo(),
 
@@ -761,6 +769,11 @@ class JitEngine:
             node evaluation result.
         """
         if self.run_count == 0:
+            ms, gs = [self.module], [self.graph]
+
+            ms, gs = passes.analyze_life_range(ms, gs)
+
+            [self.module], [self.graph] = ms, gs
             self._update_handlers(self.first_run_handlers)
             handlers = self.first_run_handlers
         else:
@@ -776,6 +789,7 @@ class JitEngine:
                 return x
 
         for h in handlers:
+            h.stackframe = stackframe
             h.enter_forward()
 
         for node in list(self.graph.nodes):
@@ -826,6 +840,7 @@ class JitEngine:
 
         for h in handlers:
             h.exit_forward()
+            del h.stackframe  # avoid leaking local variable stackframe
 
         if self.run_count == 0:
             ms, gs = [self.module], [self.graph]

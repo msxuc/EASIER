@@ -7,6 +7,7 @@ from .reducer_binding import bind_reducer
 from .tensor_group_partition import partition_tensor_groups
 from .sparse_encoding import encode_sparsity
 from .dataflow_distribution import distribute_dataflow
+from .life_range_analysis import analyze_life_range
 from .data_dependency_analysis import analyze_data_dependency
 # from .dataflow_fusion import fuse_dataflow
 # from .codegen_simulation import simulate_codegen
