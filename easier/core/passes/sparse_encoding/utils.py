@@ -1,19 +1,55 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
-
-
 import torch
 from easier.core.passes.tensor_group_partition import \
     ElemPart, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import \
-    logger, EasierJitException
 
+"""
+In certain cases ElemParts have some good properties,
+e.g. being sorted, being simply `torch.arange()` result.
+Such properties can be leveraged to boost speed of sparse_encoding analyses.
+
+`ElemPart.idx_desc` is a (light-weight) descriptor for such properties,
+and must be maintained properly during transformation on ElemParts.
+
+Currently:
+-   Cases about `torch.isin` are handled by util methods here,
+    as `torch.isin` essentially traverses all data, not taking advantage of
+    possible sorted-ness etc.
+
+
+TODO More cases can be refined to further boost sparse_encoding.
+
+However, in contrast to a single `torch.isin` call that used to take 90% time,
+those cases are scattered among sparse_encoding and summed up to less than
+50% (namely, `50%*(1-90%)`, but still several hours in large-scale settings):
+
+P.S. the N% below are taken from a certain experiment and are reference-only.
+
+-   In `zipsort_with_order` we sort the "orderables" (~25%)
+    
+    P.S. However `torch.sort` tend to return quickly, depending on how much
+    its input is relatively sorted.
+
+-   In `vector_index_of` we `torch.searchsorted` (~13%)
+    
+    -   In the evenly partition mode, the output ElemPart to search against
+        may be just ArangeIdx or ReorderedArangeIdx,
+        they are consecutive and bounded.
+
+-   `torch.unique` (~23%)
+
+    We do `torch.unique(SR.idx)` if we only search for intersection between
+    ElemPart and S/R.idx, however we can group the S/R to unique only once.
+
+-   Besides ElemParts, the concat-ed halo `chunk_gidx_space` are used in
+    `zipsort_with_order` and `vector_index_of` too.
+    Since its piece are sliced from the input ElemPart, it largely inherits
+    any properties the input ElemPart has.
+"""
 
 def broadcast_elempart(src: int, elempart: ElemPart) -> ElemPart:
     dist_env = get_runtime_dist_env()
