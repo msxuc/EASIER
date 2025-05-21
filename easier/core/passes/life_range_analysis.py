@@ -52,16 +52,21 @@ class LifeRangeAnalyzer(EasierInterpreter):
         if len(self.current_node.users) == 0:
             self.current_node.meta[KEY__LAST_USER] = None
 
-        last_user, _offset = max(
-            [
-                (user, self.node2offset[user])
-                for user in self.current_node.users
-            ], key=lambda uo: uo[1]
-        )
+            # no users, life range ends immediately.
+            range_end = self.current_node
 
-        self.current_node.meta[KEY__LAST_USER] = last_user
+        else:
+            range_end, _offset = max(  # must not be empty list
+                [
+                    (user, self.node2offset[user])
+                    for user in self.current_node.users
+                ],
+                key=lambda uo: uo[1]
+            )
 
-        last_user.meta.setdefault(
+            self.current_node.meta[KEY__LAST_USER] = range_end
+
+        range_end.meta.setdefault(
             KEY__ARGS_END_HERE, []
         ).append(self.current_node)
 

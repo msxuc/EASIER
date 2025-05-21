@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Final, List, Tuple, cast
+from typing import Dict, Final, List, Tuple
 
 import torch
 from torch.fx.node import Node
@@ -10,6 +10,7 @@ from torch.fx.graph import Graph
 import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
+from easier.core.passes.life_range_analysis import get_args_end_at
 from easier.core.passes.utils import \
     FX, tree_map, normalize_reducer_call_into_args, \
     get_called_module, get_attr_value, get_easier_tensors
@@ -24,7 +25,7 @@ from easier.core.runtime.metadata import \
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
-    JitSkipped, jit_skipped, evaluate_node, RuntimeValue, \
+    JitSkipped, jit_skipped, jit_released, evaluate_node, RuntimeValue, \
     allgather_meta_for_collective_input, exchange_meta_for_halo_exchanger, \
     get_aggregator_neutral_value
 
@@ -169,8 +170,56 @@ def get_meta_role_size(meta: StructuredTensorMeta) -> Tuple[Role, int]:
         return replica
 
 
-class Evaluator(NodeHandlerBase):
-    pass
+class StackframeLoadStoreRelease(NodeHandlerBase):
+    def preprocess(
+        self, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+    ) -> PreprocessDecision:
+        """
+        Load RuntimeValues from the stackframe to be arguments.
+        """
+        assert len(args) == 0
+        assert len(kwargs) == 0
+        node = self.current_node
+
+        def _eval(x):
+            # instead sf.get(x,x) we want to also check type consistency.
+            if isinstance(x, Node):
+                return self.stackframe[x]
+            else:
+                return x
+        
+        args.clear()
+        args.extend(
+            tree_map(v, _eval) for v in node.args  # type: ignore
+        )
+
+        kwargs.clear()
+        kwargs.update({
+            k: tree_map(v, _eval)
+            for k, v in node.kwargs.items()}  # type: ignore
+        )
+
+        return PreprocessDecision.CONTINUE
+
+    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+        """
+        Store the resultant RuntimeValue into the stackframe.
+
+        If any Nodes' life ranges end at this Node, release their
+        RuntimeValues.
+
+        This must be the last postprocess, as JitSkipped should also be stored.
+        """
+        self.stackframe[self.current_node] = res
+
+        # May release stackframe[self.current_node] immediately
+        # if it has no users at all.
+        for ends_here in get_args_end_at(self.current_node):
+            self.stackframe[ends_here] = jit_released
+        
+        # TODO better to check `if get_last_user()==None: return jit_released`
+        # in case `res` get leaked?
+        return res
 
 
 class MetadataValidation(NodeHandlerBase):
@@ -237,7 +286,8 @@ class SkipZeroLengthNonHalo(NodeHandlerBase):
     -   Inspect the Node meta, if it is DIST and zero-length, skip it;
     -   By default, continue the preprocess pipeline.
 
-    Generally, this should be the first preprocess in runtime.
+    Generally, this should be the first preprocess in runtime
+    after StackframeLoadStore.
     """
 
     def preprocess(self, args, kwargs) -> PreprocessDecision:
@@ -311,6 +361,10 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         #
         # Context for the whole forward() session
         # =================
+        # A key is a memory address, a value is the Node that allocates the
+        # memory.
+        # NOTE the memory may be freed and the next allocation reuse an
+        # invalidated address, the allocator Nodes must be differentiated.
         self.addr2viewsrc: Dict[int, Node]
 
         #
@@ -408,6 +462,13 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         runtime_meta = get_value_runtime_metadata(
             self.addr2viewsrc, self.current_node, role, res
         )
+
+        # TODO wrong! releasing Node or releasing the tensor don't mean
+        # the memory is freed!
+        # ends_here = get_args_end_at(self.current_node)
+        # for addr, view_src in list(self.addr2viewsrc.items()):
+        #     if view_src in ends_here:
+        #         del self.addr2viewsrc[addr]  # memory regions may be reused
 
         def _collect_dist_bs(x: RuntimeTensorMeta):
             if x.role == Role.DISTRIBUTED:
@@ -723,7 +784,7 @@ class JitEngine:
         self.run_count = 0
 
         self.first_run_handlers: List[NodeHandlerBase] = [
-            Evaluator(),
+            StackframeLoadStoreRelease(),
 
             FirstRunMetadataPropagation(),
 
@@ -737,7 +798,7 @@ class JitEngine:
         ]
 
         self.runtime_handlers: List[NodeHandlerBase] = [
-            Evaluator(),
+            StackframeLoadStoreRelease(),
 
             MetadataValidation(),
             SkipZeroLengthNonHalo(),
@@ -781,31 +842,13 @@ class JitEngine:
 
         stackframe: Dict[Node, RuntimeValue] = {}
 
-        def _eval(x):
-            # instead sf.get(x,x) we want to also check type consistency.
-            if isinstance(x, Node):
-                return stackframe[x]
-            else:
-                return x
-
         for h in handlers:
             h.stackframe = stackframe
             h.enter_forward()
 
         for node in list(self.graph.nodes):
             # args and kwargs collections are mutable for Handlers to modify.
-            args = cast(
-                List[RuntimeValue],
-                list(tree_map(v, _eval) for v in node.args)
-            )
-            kwargs = cast(
-                Dict[str, RuntimeValue],
-                {k: tree_map(v, _eval) for k, v in node.kwargs.items()}
-            )
-
-            # rank = get_runtime_dist_env().rank
-            # s = "    " * rank + "||"
-            # logger.info(s + node.format_node())
+            args, kwargs = [], {}
 
             for i_handler, handler in enumerate(handlers):
                 handler.current_node = node
@@ -835,8 +878,6 @@ class JitEngine:
                 rev_handler = handlers[rev_i]
                 # Pass in the final args/kwargs values
                 res = rev_handler.postprocess(res, args, kwargs)
-
-            stackframe[node] = res
 
         for h in handlers:
             h.exit_forward()
