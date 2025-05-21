@@ -1,24 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import dataclasses
 import enum
-import itertools
 from typing import Dict, List, Union, cast, Callable
-from typing_extensions import Literal
 
 import torch
-from torch import nn
 from torch.fx.node import Node
 from torch.fx.graph import Graph
 
 import easier as esr
-from easier.core import module as _EsrMod
 from easier.core.passes.utils import \
-    FX, OrderedSet, tree_map, normalize_reducer_call_into_args, \
-    get_called_module, get_attr_value
-from easier.core.utils import EasierJitException, logger
-from easier.core.runtime.dist_env import get_runtime_dist_env
+    FX
+from easier.core.utils import EasierJitException
 from easier.core.runtime.jit_engine.values import RuntimeValue
 
 

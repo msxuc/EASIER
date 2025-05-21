@@ -1,29 +1,19 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import dataclasses
 import itertools
-import operator
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast, FrozenSet, TYPE_CHECKING
-from typing_extensions import TypeAlias
-from enum import Enum, auto
+from typing import Dict, Iterable, List, Optional, Sequence
 
-import torch
-import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
+from torch.fx.node import Node
 from easier.core.runtime.metadata import \
-    Role, RuntimeTensorMeta, StructuredTensorMeta, ViewSrc, \
-    get_node_meta
+    Role, RuntimeTensorMeta, ViewSrc, get_node_meta
 
-from easier.core.runtime.modules import HaloExchanger
-from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    FX, EasierInterpreter, OrderedSet, tree_map, get_easier_tensors
+    FX, EasierInterpreter, OrderedSet, tree_map
 
 
 KEY__DATA_DEPENDENCY_INPUTS = 'easier_dataDependency_inputs'

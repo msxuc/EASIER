@@ -2,24 +2,18 @@
 # Licensed under the MIT License.
 
 import datetime
-from typing import Callable, Dict, List, Optional, Tuple, Type, TypeVar, \
-    Union, cast, overload
-from typing_extensions import Literal, TypeAlias
+from typing import Dict, List, Optional, Tuple, Type, TypeVar, Union, cast
+from typing_extensions import Literal
 import os
 import dataclasses
 import json
-import enum
-import contextlib
 import tempfile
 import numpy
-import pickle
 import itertools
 
 import torch
 import torch.fx
 from torch.fx.graph import Graph
-import torch.fx.graph_module
-import torch.types
 
 import h5py
 
@@ -27,7 +21,7 @@ import easier.core.module as esr
 from easier.core.passes.utils import EasierInterpreter, OrderedSet, \
     get_easier_tensors, get_selectors_reducers, \
     pickle_ir, unpickle_ir, get_easier_objects, \
-    fx_graph_to_serializable_ir, serializable_ir_to_fx_graph, IRNode
+    fx_graph_to_serializable_ir, serializable_ir_to_fx_graph
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.data_loader import \

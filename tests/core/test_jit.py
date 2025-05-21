@@ -12,20 +12,21 @@ import h5py
 
 import easier as esr
 from easier.core.jit import EasierTracer
+from easier.core.utils import get_random_str
 from easier.core.passes.utils import OrderedSet
-from easier.examples import Poisson
-from easier.core.runtime.dist_env import DummyDistEnv
 
 from tests.utils import \
-    torchrun_singlenode, get_random_str, \
-    mpi_e2e, mpirun_singlenode, when_ngpus_ge_2
+    torchrun_singlenode, mpi_e2e, mpirun_singlenode, when_ngpus_ge_2, \
+    import_poisson, MESH, POISSON
 from tests.core.utils import multi_stage_zero_length_partition
+
+Poisson = import_poisson()
 
 
 class Model(esr.Module):
     def __init__(self, nf, device: Union[str, torch.device] = 'cpu') -> None:
         super().__init__()
-        eqn = Poisson(100, device)  # type: ignore
+        eqn = Poisson(MESH, POISSON, device)  # type: ignore
         nv = self.nv = eqn.x.shape[0]
         ne = self.ne = eqn.src.shape[0]
 

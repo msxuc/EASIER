@@ -7,11 +7,10 @@
 
 from collections import defaultdict
 from typing import Any, Callable, Dict, Generic, Iterable, Iterator, List, \
-    Optional, Set, Tuple, Type, Union, MutableSet, Sequence, cast, \
-    TYPE_CHECKING
+    Optional, Tuple, Type, Union, MutableSet, Sequence, cast
 from torch.nn.modules import Module
 from typing_extensions import \
-    OrderedDict, TypeVar, TypeGuard, Literal, TypeAlias
+    OrderedDict, TypeVar, TypeGuard, TypeAlias
 import string
 import dataclasses
 import numpy
@@ -19,7 +18,6 @@ import pickle
 import itertools
 
 import torch
-import torch.fx
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair

@@ -1,14 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Tuple, Union
-from unittest.mock import patch, Mock
+from typing import Tuple
+from unittest.mock import patch
 import contextlib
-import unittest.mock
 import torch
-import pytest
 
-import easier
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 from easier.core.runtime.data_loader import \
     _get_offset_exactly_nparts

@@ -2,9 +2,7 @@
 # Licensed under the MIT License.
 
 from typing_extensions import Literal
-from unittest.mock import patch
 import torch
-from torch.fx import GraphModule
 import pytest
 
 import h5py
@@ -15,7 +13,8 @@ from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 
-from ..utils import torchrun_singlenode, get_random_str, have_cuda
+from tests.utils import torchrun_singlenode, have_cuda
+from easier.core.utils import get_random_str
 
 
 def get_in_memory_tensor_loader(

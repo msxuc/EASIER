@@ -1,11 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Callable, List, Optional, Dict, Any, Sequence
-from typing_extensions import Literal, TypeAlias
+from typing import Optional, Dict, Any
 
 import torch
-import torch.fx
 from torch import nn
 
 import easier as esr

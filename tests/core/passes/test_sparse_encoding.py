@@ -1,16 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Union
-from types import MethodType
-import pytest
-from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
-import easier.core.runtime.dist_env as _JitRuntimeDistEnv
-from easier.core.runtime.dist_env import DistEnv
 from easier.core.module import Selector, Reducer
 from easier.core.passes.utils import OrderedSet
 from easier.core.passes.sparse_encoding.reorder_plan import \

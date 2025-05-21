@@ -37,21 +37,29 @@ pip install -e .                            # equals `python setup.py develop`
 
 Simulating water waves in a square tub by solving shallow water equations with EASIER:
 ```shell
+# create mesh file on the machine of rank-0 process
+python tutorial/create_triangular_mesh.py 100 ~/.easier/
+
 # create folder to store simulation results
 mkdir res
 
 # launch the simulation using `torchrun`,
 # just add `--master_addr` argument to the launcher if there are multiple nodes.
-torchrun --nnodes=1 --nproc_per_node=4 tutorial/shallow_water_equation.py --backend=cpu --output=res
+torchrun --nnodes=1 --nproc_per_node=4 \
+  tutorial/shallow_water_equation/assemble_shallow_water.py --backend=cpu \
+  ~/.easier/triangular_100_100.hdf5 ~/.easier/SW_100_100.hdf5
+torchrun --nnodes=1 --nproc_per_node=4 \
+  tutorial/shallow_water_equation/swe_main.py --backend=cpu --output=res/ \
+  ~/.easier/triangular_100_100.hdf5 ~/.easier/SW_100_100.hdf5
 
 # Visualize simulation results
-python tutorial/swe_plot.py --data_dir res --filename swe.gif
+python tutorial/shallow_water_equation/swe_plot.py --data_dir res --filename swe.gif
 ```
 
 <div align="center">
-  <img width="300px" src="tutorial/swe.png">
+  <img width="300px" src="tutorial/shallow_water_equation/swe.png">
   &nbsp &nbsp &nbsp &nbsp &nbsp &nbsp
-  <img width="330px" src="tutorial/swe.gif"/>
+  <img width="330px" src="tutorial/shallow_water_equation/swe.gif"/>
 </div>
 
 # Tutorial
