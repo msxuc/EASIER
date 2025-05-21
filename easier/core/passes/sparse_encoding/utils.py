@@ -185,6 +185,9 @@ def sort_elempart(elempart: ElemPart) -> ElemPart:
 def reorder_elempart(
     elempart: ElemPart, reordered_idx: torch.Tensor
 ) -> ElemPart:
+    """
+    `reordered_idx` must be a permutation of `elempart.idx`.
+    """
     if isinstance(
         elempart.idx_desc, (ElemPartArangeIdx, ElemPartReorderedArangeIdx)
     ):

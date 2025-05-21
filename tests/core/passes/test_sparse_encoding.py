@@ -4,7 +4,8 @@
 
 import torch
 from easier.core.passes.tensor_grouping import EasierTensorGroup
-from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
+from easier.core.passes.tensor_group_partition import \
+    ElemPart as _EP_raw, ElemPartReorderedArangeIdx
 from easier.core.module import Selector, Reducer
 from easier.core.passes.utils import OrderedSet
 from easier.core.passes.sparse_encoding.reorder_plan import \
@@ -13,6 +14,8 @@ from easier.core.passes.sparse_encoding.reorder_plan import \
 from easier.core.passes.sparse_encoding.sparse_encoding import \
     reorder_output_by_selector, rewrite_selector_instance, \
     reorder_input_by_reducer, rewrite_reducer_instance
+from easier.core.passes.sparse_encoding.utils import \
+    elempart_isin
 from tests.utils import assert_tensor_list_equal, torchrun_singlenode
 
 
@@ -303,3 +306,34 @@ def worker__test_reroder_rewrite_reducer(
 
 def test_reroder_rewrite_reducer():
     torchrun_singlenode(3, worker__test_reroder_rewrite_reducer)
+
+
+def test_elempart_isin_reordered():
+    reordered_elempart = _EP_raw(
+        ElemPartReorderedArangeIdx(10, 15), vec(13, 10, 14, 12, 11), [5], ""
+    )
+
+    assert torch.equal(
+        vec(0, 1, 0, 0, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(8, 12))
+    )
+
+    assert torch.equal(
+        vec(0, 0, 0, 1, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(11, 13))
+    )
+
+    assert torch.equal(
+        vec(1, 0, 1, 0, 0).bool(),
+        elempart_isin(reordered_elempart, torch.arange(13, 15))
+    )
+
+    assert torch.equal(
+        vec(1, 1, 1, 1, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(8, 15))
+    )
+
+    assert torch.equal(
+        vec(0, 0, 0, 0, 0).bool(),
+        elempart_isin(reordered_elempart, torch.arange(20, 30))
+    )
