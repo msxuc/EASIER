@@ -14,8 +14,8 @@ import easier
 import easier.core.runtime.dist_env as _DM
 
 
-MESH = os.path.expanduser('~/.easier/triangular_100_100.hdf5')
-POISSON = os.path.expanduser('~/.easier/Poisson_100_100.hdf5')
+MESH = os.path.expanduser('~/.easier/triangular_100.hdf5')
+POISSON = os.path.expanduser('~/.easier/Poisson_100.hdf5')
 
 
 def import_poisson():

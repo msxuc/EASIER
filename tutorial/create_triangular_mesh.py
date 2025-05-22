@@ -8,17 +8,17 @@ import h5py
 import easier.cpp_extension as ext
 
 
-def get_triangular_mesh(nx, ny=None, data_dir='~/.easier') -> str:
-    # type: (int, int|None, str) -> str
+def get_triangular_mesh(n, data_dir='~/.easier') -> str:
+    # type: (int, str) -> str
     data_dir = os.path.expanduser(data_dir)
     os.makedirs(data_dir, exist_ok=True)
-    path = os.path.join(data_dir, f'triangular_{nx}_{ny}.hdf5')
+    path = os.path.join(data_dir, f'triangular_{n}.hdf5')
 
     if os.path.exists(path):
         return path
 
     src, dst, cells, bcells, bpoints, points = \
-        ext.generate_triangular_mesh(nx, ny)
+        ext.generate_triangular_mesh(n)
     src = src.numpy()
     dst = dst.numpy()
     cells = cells.reshape(-1, 3).numpy()
@@ -41,24 +41,18 @@ if __name__ == '__main__':
     """
     Usage:
 
-    python tutorial/create_triangular_mesh.py 100 [100] ~/.easier
+    python tutorial/create_triangular_mesh.py 100 ~/.easier
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("nx", type=int)
-    parser.add_argument("ny", nargs="?", default=None, type=int)
-    parser.add_argument("data_dir", type=str, default='~/.easier')
+    parser.add_argument("mesh_size", type=int)
+    parser.add_argument("data_dir", type=str)
     args = parser.parse_args()
 
     data_dir: str = os.path.expanduser(args.data_dir)
-    nx: int = args.nx
-    if args.ny is None:
-        ny: int = nx
-    else:
-        ny: int = args.ny
+    mesh_size: int = args.mesh_size
 
-    mesh = get_triangular_mesh(nx, ny, data_dir)
+    mesh = get_triangular_mesh(mesh_size, data_dir)
 
     print("Create triangular mesh:")
-    print("nx:", nx)
-    print("ny:", ny)
+    print("mesh size:", mesh_size)
     print("output HDF5 file:", mesh)

@@ -270,7 +270,7 @@ if __name__ == '__main__':
     Usage:
 
     torchrun --nproc_per_node=4 tutorial/poisson/assemble_poisson.py \
-        ~/.easier/triangular_100_100.hdf5 ~/.easier/Poisson_100_100.hdf5
+        ~/.easier/triangular_100.hdf5 ~/.easier/Poisson_100.hdf5
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(

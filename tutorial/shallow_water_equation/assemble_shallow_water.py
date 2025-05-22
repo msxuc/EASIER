@@ -298,7 +298,7 @@ if __name__ == '__main__':
 
     torchrun --nproc_per_node=4 \
         tutorial/shallow_water_equation/assemble_shallow_water.py \
-        ~/.easier/triangular_100_100.hdf5 ~/.easier/SW_100_100.hdf5
+        ~/.easier/triangular_100.hdf5 ~/.easier/SW_100.hdf5
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
