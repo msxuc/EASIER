@@ -46,7 +46,7 @@ mkdir res
 # launch the simulation using `torchrun`,
 # just add `--master_addr` argument to the launcher if there are multiple nodes.
 torchrun --nnodes=1 --nproc_per_node=4 \
-  tutorial/shallow_water_equation/assemble_shallow_water.py --backend=cpu \
+  tutorial/shallow_water_equation/assemble_shallow_water.py --device=cpu \
   ~/.easier/triangular_100_100.hdf5 ~/.easier/SW_100_100.hdf5
 torchrun --nnodes=1 --nproc_per_node=4 \
   tutorial/shallow_water_equation/swe_main.py --backend=cpu --output=res/ \
