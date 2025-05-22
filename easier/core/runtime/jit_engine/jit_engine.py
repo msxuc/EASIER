@@ -221,6 +221,45 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
         # in case `res` get leaked?
         return res
 
+class RefCountBasedMemoryTracker(NodeHandlerBase):
+    # def preprocess(
+    #     self, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+    # ) -> PreprocessDecision:
+    #     pass
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.addr2refcount: Dict[int, int]
+
+    def enter_forward(self):
+        self.addr2refcount = {}
+
+    def exit_forward(self):
+        self.addr2refcount.clear()
+
+    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+
+        # TODO nested
+        if isinstance(res, torch.Tensor):
+            # Get the memory address of the underlying memory
+            # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
+            res_addr: int = res.untyped_storage().data_ptr()
+
+        if self.current_node.op == FX.GET_ATTR:
+            self.addr2refcount.setdefault(res_addr, 1)
+
+            self.addr2refcount[res_addr] += 1
+        
+        for ends_here in get_args_end_at(self.current_node):
+            val = self.stackframe[ends_here]
+
+            # TODO nested
+            if isinstance(val, torch.Tensor):
+                val_addr: int = val.untyped_storage().data_ptr()
+
+            self.addr2refcount[val_addr] -= 1
+
+        pass
 
 class MetadataValidation(NodeHandlerBase):
     """
