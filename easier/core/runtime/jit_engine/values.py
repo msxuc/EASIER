@@ -11,8 +11,7 @@ import torch
 from torch.fx.node import Node
 
 import easier as esr
-from easier.core.passes.utils import \
-    FX, get_called_module, get_attr_value
+from easier.core.passes.utils import FX, get_called_module, get_attr_value
 from easier.core.utils import EasierJitException
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger

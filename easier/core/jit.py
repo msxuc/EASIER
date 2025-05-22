@@ -4,8 +4,7 @@
 import math
 import operator
 from types import ModuleType
-from typing import \
-    Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Callable, Dict, List, Optional, Tuple, Union, cast
 from typing_extensions import Literal
 import more_itertools
 
@@ -20,14 +19,12 @@ import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
 from easier.core.dump import load_dumps
-from easier.core.passes.utils import \
-    get_easier_objects
+from easier.core.passes.utils import get_easier_objects
 from easier.core.utils import EasierJitException, logger, init_logger
 from easier.core.runtime.dist_env import \
     set_dist_env_runtime_backend_config, set_dist_env_runtime_device_type, \
     get_default_dist_env
-from easier.core.runtime.jit_engine import \
-    JitEngine, BackendNoneEngine
+from easier.core.runtime.jit_engine import JitEngine, BackendNoneEngine
 
 
 class EasierProxy(Proxy):
