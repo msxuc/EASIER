@@ -1,16 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Union
-from types import MethodType
-import pytest
-from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from easier.core.passes.tensor_grouping import EasierTensorGroup
 from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
-import easier.core.runtime.dist_env as _JitRuntimeDistEnv
-from easier.core.runtime.dist_env import DistEnv
 from easier.core.module import Selector, Reducer
 from easier.core.passes.utils import OrderedSet
 from easier.core.passes.sparse_encoding.reorder_plan import \
@@ -37,6 +31,9 @@ def test_break_reducer_cycle():
     r5 = Reducer(torch.arange(5), 99)
     r6 = Reducer(torch.arange(6), 99)
     r4 = Reducer(torch.arange(4), 99)
+    r5.easier_hint_name = 'r5'
+    r6.easier_hint_name = 'r6'
+    r4.easier_hint_name = 'r4'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_nnodes = {
         r5: 1,
@@ -67,6 +64,10 @@ def test_break_selector_reducer_cycle():
     s9 = Selector(torch.arange(9))
     s8 = Selector(torch.arange(8))
     s7 = Selector(torch.arange(7))
+    r5.easier_hint_name = 'r5'
+    s9.easier_hint_name = 's9'
+    s8.easier_hint_name = 's8'
+    s7.easier_hint_name = 's7'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_edges = {
         # Reducer.n does not matter as we are not running metadata propagation
@@ -107,6 +108,10 @@ def test_resolve_conflict():
     s22 = Selector(torch.arange(22))
     s33A = Selector(torch.arange(33))
     s33B = Selector(torch.arange(33))
+    r5.easier_hint_name = 'r5'
+    s22.easier_hint_name = 's22'
+    s33A.easier_hint_name = 's33A'
+    s33B.easier_hint_name = 's33B'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_edges = {
         # Reducer.n does not matter as we are not running metadata propagation

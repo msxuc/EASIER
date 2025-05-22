@@ -7,11 +7,9 @@
 
 from collections import defaultdict
 from typing import Any, Callable, Dict, Generic, Iterable, Iterator, List, \
-    Optional, Set, Tuple, Type, Union, MutableSet, Sequence, cast, \
-    TYPE_CHECKING
+    Optional, Tuple, Type, Union, MutableSet, Sequence, cast
 from torch.nn.modules import Module
-from typing_extensions import \
-    OrderedDict, TypeVar, TypeGuard, Literal, TypeAlias
+from typing_extensions import OrderedDict, TypeVar, TypeGuard, TypeAlias
 import string
 import dataclasses
 import numpy
@@ -19,7 +17,6 @@ import pickle
 import itertools
 
 import torch
-import torch.fx
 from torch.fx.graph import Graph
 from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
@@ -500,6 +497,11 @@ def get_easier_objects(
             topmod.named_modules(),
             topmod.named_parameters(),
         ):
+            # Exclude topmod and avoid naming it under itself again,
+            # other we'll get an empty path and a bad alias like 'A.(:A)'
+            if obj is topmod:
+                continue
+
             if isinstance(obj, EasierObj.__args__):
                 obj_name = f"{topmod_name}.({path}:{obj.__class__.__name__})"
                 objs.setdefault(obj, []).append(obj_name)

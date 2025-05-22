@@ -4,16 +4,14 @@
 import dataclasses
 import enum
 from typing import \
-    Callable, List, Optional, Sequence, Tuple, TypeVar, Union, cast
-from typing_extensions import Literal, TypeAlias
-import more_itertools
+    Callable, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing_extensions import TypeAlias
 
 import torch
 from torch.fx.node import Node
 
-from easier.core.passes.utils import \
-    FX, get_easier_objects, EasierInterpreter, tree_map
-from easier.core.utils import EasierJitException, logger
+from easier.core.passes.utils import tree_map
+from easier.core.utils import EasierJitException
 
 
 KEY__METADATA_RUNTIME = 'easier_metadata_runtimeTensorMeta'

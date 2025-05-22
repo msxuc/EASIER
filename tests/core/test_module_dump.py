@@ -1,29 +1,28 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing_extensions import Literal
-from unittest.mock import patch
 import torch
 import pytest
-import contextlib
 
-import h5py
 import tempfile
 import os
 
-from easier.examples.models import Poisson
 import easier as esr
+from easier.core.utils import get_random_str
 
 from ..utils import \
-    torchrun_singlenode, get_random_str, assert_tensor_list_equal, \
-    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode
+    torchrun_singlenode, assert_tensor_list_equal, \
+    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
+    import_poisson, MESH, POISSON
 from tests.core.utils import multi_stage_zero_length_partition
+
+Poisson = import_poisson()
 
 
 class Model(esr.Module):
     def __init__(self, nf, device='cpu') -> None:
         super().__init__()
-        eqn = Poisson(100, device)
+        eqn = Poisson(MESH, POISSON, device)
         nv = self.nv = eqn.x.shape[0]
         ne = self.ne = eqn.src.shape[0]
 

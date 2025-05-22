@@ -1,36 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import dataclasses
-import enum
-import itertools
-import math
 import operator
 from typing import \
-    Callable, Dict, List, Optional, Sequence, Tuple, TypeAlias, Union, cast
+    Callable, Dict, List, Sequence, Tuple, TypeAlias, Union, cast
 import numpy
-from typing_extensions import Literal
-import more_itertools
 import pickle
 
 import torch
-from torch import nn
 from torch.fx.node import Node
-from torch.fx.graph import Graph
 
 import easier as esr
-from easier.core import passes
-from easier.core import module as _EsrMod
-from easier.core.passes.utils import \
-    FX, OrderedSet, tree_map, normalize_reducer_call_into_args, \
-    get_called_module, get_attr_value
-from easier.core.utils import EasierJitException, logger
+from easier.core.passes.utils import FX, get_called_module, get_attr_value
+from easier.core.utils import EasierJitException
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger
-from easier.core.runtime.metadata import \
-    RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
-    get_node_meta, set_node_meta, \
-    get_runtime_metadata_from_scalar, collect_meta
 
 
 class JitSkipped:

@@ -1,23 +1,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import operator
 from typing import List, cast
 import pytest
 import torch
 
-from torch.fx.graph import Graph
 from torch.fx.node import Node
 
 from easier.core.jit import EasierTracer, _fully_load_data_backend_none
 
 from easier.core.module import Selector, Reducer, Tensor
 from easier.core.runtime.jit_engine.jit_engine import JitEngine
-from easier.core.runtime.metadata import \
-    Role, get_node_meta, collect_meta, RuntimeTensorMeta
-from easier.core.passes.utils import \
-    FX
-from easier.core import passes
+from easier.core.runtime.metadata import Role, get_node_meta, RuntimeTensorMeta
+from easier.core.passes.utils import FX
 import easier as esr
 
 

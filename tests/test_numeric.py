@@ -3,69 +3,68 @@
 
 import pytest
 
-import torch
-
 import easier as esr
 from easier.numeric import solver
-from easier.examples.models import Poisson, Circuit, Poisson1D
+
+from tests.utils import \
+    have_cuda, when_ngpus_ge_2, torchrun_singlenode, \
+    import_poisson, MESH, POISSON
 
 
-@pytest.mark.usefixtures('dummy_dist_env')
+def worker__test_cg(local_rank: int, world_size: int, backend: str):
+    Poisson = import_poisson()
+
+    # for prec_type in ['symmetric', None]:
+    for prec_type in [None]:
+
+        eqn = Poisson(MESH, POISSON)
+        sol = solver.CG(eqn.A, eqn.b, eqn.x)
+        [sol] = esr.compile([sol], backend=backend)  # type: ignore
+        sol: solver.CG
+
+        info = sol.solve(atol=1e-4, maxiter=1000)
+        assert info["residual"] < 1e-4
+
+
+def worker__test_gmres(local_rank: int, world_size: int, backend: str):
+    Poisson = import_poisson()
+
+    # for prec_type in ['forward', 'backward', 'symmetric', None]:
+    for prec_type in [None]:
+
+        eqn = Poisson(MESH, POISSON)
+        sol = solver.GMRES(eqn.A, eqn.b, eqn.x)
+        [sol] = esr.compile([sol], backend=backend)  # type: ignore
+        sol: solver.GMRES
+
+        info = sol.solve(atol=1e-4, maxiter=1000)
+        assert info["residual"] < 1e-4
+
+
+@pytest.mark.parametrize('nprocs, backend', [
+    (1, 'torch'),
+    (1, 'cpu'),
+    pytest.param(1, 'cuda', marks=have_cuda),
+    (2, 'torch'),
+    (2, 'cpu'),
+    pytest.param(2, 'cuda', marks=when_ngpus_ge_2),
+])
 class TestLinearSolver:
 
-    backend_list = ['torch', 'cpu', 'cuda'] if torch.cuda.is_available() \
-        else ['torch', 'cpu']
+    def test_cg(self, nprocs: int, backend: str):
+        if backend != 'cuda':
+            init_type = 'cpu'
+        else:
+            init_type = 'cuda'
+        torchrun_singlenode(
+            nprocs, worker__test_cg, (backend,), init_type=init_type
+        )
 
-    def test_cg(self):
-        for backend in self.backend_list:
-            for eqn_type in ['poi2d', 'poi1d', 'circuit']:
-                # for prec_type in ['symmetric', None]:
-                for prec_type in [None]:
-                    if eqn_type == 'circuit' and prec_type == 'symmetric':
-                        continue
-
-                    if eqn_type == 'poi2d':
-                        eqn = Poisson(100)
-                        initializers = []
-                    elif eqn_type == 'poi1d':
-                        eqn = Poisson1D(100)
-                        initializers = []
-                    elif eqn_type == 'circuit':
-                        eqn = Circuit()
-                        initializers = []
-
-                    sol = solver.CG(eqn.A, eqn.b, eqn.x)
-                    esr.compile([sol] + initializers, backend=backend)
-
-                    for init in initializers:
-                        init()
-
-                    info = sol.solve(atol=1e-4, maxiter=1000)
-                    assert info["residual"] < 1e-4
-
-    def test_gmres(self):
-        for backend in self.backend_list:
-            for eqn_type in ['poi2d', 'poi1d', 'circuit']:
-                for prec_type in [None]:
-                    # for prec_type in ['forward', 'backward', 'symmetric', None]:
-                    if eqn_type == 'circuit' and prec_type is not None:
-                        continue
-
-                    if eqn_type == 'poi2d':
-                        eqn = Poisson(100)
-                        initializers = []
-                    elif eqn_type == 'poi1d':
-                        eqn = Poisson1D(100)
-                        initializers = []
-                    elif eqn_type == 'circuit':
-                        eqn = Circuit()
-                        initializers = []
-
-                    sol = solver.GMRES(eqn.A, eqn.b, eqn.x)
-                    esr.compile([sol] + initializers, backend=backend)
-
-                    for init in initializers:
-                        init()
-
-                    info = sol.solve(atol=1e-4, maxiter=1000)
-                    assert info["residual"] < 1e-4
+    def test_gmres(self, nprocs: int, backend: str):
+        if backend != 'cuda':
+            init_type = 'cpu'
+        else:
+            init_type = 'cuda'
+        torchrun_singlenode(
+            nprocs, worker__test_gmres, (backend,), init_type=init_type
+        )

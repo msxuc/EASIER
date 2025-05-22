@@ -1,25 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
-import torch.utils
-from typing_extensions import Literal, OrderedDict, TypeAlias
-import functools
-import more_itertools
 import time
 
 import torch
-from torch.fx.graph import Graph
-from torch.fx.node import Node
 
-import numpy as np
 import scipy.sparse
-from torch.nn.modules import Module
 
-import easier.core.module as esr
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import EasierJitException, logger
+from easier.core.utils import logger
 import easier.cpp_extension as _C
 
 
@@ -767,12 +758,17 @@ def log_metis_input_statistics(
         return
 
     def _debug(category, ints: torch.Tensor):
-        amin, amax = torch.aminmax(ints)
-        std, mean = torch.std_mean(ints.to(torch.float32))
+        # If all vertexes are isolated, adjw is zero-length.
+        if ints.nelement() == 0:
+            amin, amax, median, std, mean = 0, 0, 0, 0, 0
+        else:
+            amin, amax = torch.aminmax(ints)
+            median = ints.median()
+            std, mean = torch.std_mean(ints.to(torch.float32))
         logger.debug(
             f"METIS input of EASIER-coarsened {category}"
             f": max={int(amax)}, min={int(amin)}"
-            f", median={int(ints.median())}"
+            f", median={int(median)}"
             f", mean={float(mean)}, std={float(std)}"
         )
 

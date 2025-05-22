@@ -12,7 +12,6 @@ import pytest
 import warnings
 
 import torch
-import torch.distributed
 
 from easier.core.runtime.dist_env import DummyDistEnv, CommBackendConfig
 

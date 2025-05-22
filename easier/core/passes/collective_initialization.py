@@ -2,19 +2,16 @@
 # Licensed under the MIT License.
 
 import itertools
-from typing import Dict, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
+from typing import List, Tuple, Union, cast
 
 import torch
 from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, fx_graph_to_serializable_ir, \
     get_easier_objects, get_easier_tensors, get_selectors_reducers
 
-from easier.core.utils import \
-    logger, EasierJitException
+from easier.core.utils import EasierJitException
 import easier.core.module as _EsrMod
 
 from easier.core.runtime.utils import check_collective_equality

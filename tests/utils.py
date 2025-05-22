@@ -1,20 +1,38 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import random
-import string
-from typing import Callable, List, Literal, Tuple
-from unittest.mock import patch
+from typing import List, Literal, Tuple
 import os
+import sys
 import pytest
 
 import torch
 import torch.distributed
 from torch.multiprocessing.spawn import spawn
 
+import easier
 import easier.core.runtime.dist_env as _DM
-from easier.core.utils import get_random_str
-from easier import init
+
+
+MESH = os.path.expanduser('~/.easier/triangular_100_100.hdf5')
+POISSON = os.path.expanduser('~/.easier/Poisson_100_100.hdf5')
+
+
+def import_poisson():
+    assert os.path.exists(MESH), \
+        "Run `python tutorial/create_triangular_mesh.py 100`"
+    assert os.path.exists(POISSON), \
+        "Run `torchrun tutorial/poisson/assemble_poisson.py MESH POISSON`"
+
+    esr_dir = os.path.dirname(easier.__file__)
+    path = os.path.join(esr_dir, '..', 'tutorial', 'poisson')
+    if path not in sys.path:
+        sys.path.append(path)
+
+    from poisson_main import Poisson  # type: ignore
+
+    return Poisson
+
 
 have_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -93,7 +111,7 @@ def _torchrun_spawn_target(
     os.environ["TORCHELASTIC_RUN_ID"] = "EASIER_UNIT_TEST_RUN"
 
     if init_type in ['cpu', 'cuda']:
-        init(
+        easier.init(
             'gloo' if init_type == 'cpu' else 'nccl',
             init_method='tcp://localhost:24689',
             world_size=world_size,
@@ -146,7 +164,7 @@ def _mpirun_spawn_target(
     world_size = MPI.COMM_WORLD.size
 
     if init_type in ['cpu', 'cuda']:
-        init('mpi')
+        easier.init('mpi')
         _DM.set_dist_env_runtime_device_type(init_type)
 
     else:

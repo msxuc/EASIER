@@ -2,24 +2,20 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from typing_extensions import TypeAlias
 
 import torch
-import torch.overrides
-from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
+from torch.fx.node import Node
 
-from easier.core.utils import \
-    logger, EasierJitException
+from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, get_easier_tensors, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    FX, DisjointSet, tree_map
+    DisjointSet
 
 
 KEY__TENSORGROUPING_GROUP = "easier_tensorGrouping_group"

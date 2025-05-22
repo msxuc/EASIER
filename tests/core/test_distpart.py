@@ -3,11 +3,7 @@
 
 from unittest.mock import patch
 import torch
-import pytest
 
-import h5py
-import tempfile
-import os
 import numpy
 import scipy.sparse
 

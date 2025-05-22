@@ -1,26 +1,19 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
-from typing_extensions import TypeAlias
+from typing import Dict, List, Sequence
 
-import torch
-import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
+from torch.fx.node import Node
 
-from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import \
-    logger, EasierJitException
+from easier.core.utils import logger
 import easier.core.module as esr
 
 from easier.core.passes.tensor_grouping import \
     EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import \
-    EasierInterpreter, OrderedSet, SubmodNameAllocator, \
+    EasierInterpreter, SubmodNameAllocator, \
     normalize_reducer_call_into_args
 
 

@@ -2,12 +2,9 @@
 # Licensed under the MIT License.
 
 import operator
-from typing import Dict, List, Set, cast, AbstractSet
-import pytest
+from typing import AbstractSet
 import torch
 
-from torch.fx.graph import Graph
-from torch.fx.node import Node
 
 from easier.core.jit import EasierTracer
 
