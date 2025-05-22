@@ -9,8 +9,7 @@ from collections import defaultdict
 from typing import Any, Callable, Dict, Generic, Iterable, Iterator, List, \
     Optional, Tuple, Type, Union, MutableSet, Sequence, cast
 from torch.nn.modules import Module
-from typing_extensions import \
-    OrderedDict, TypeVar, TypeGuard, TypeAlias
+from typing_extensions import OrderedDict, TypeVar, TypeGuard, TypeAlias
 import string
 import dataclasses
 import numpy

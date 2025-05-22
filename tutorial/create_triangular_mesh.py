@@ -41,12 +41,12 @@ if __name__ == '__main__':
     """
     Usage:
 
-    python tutorial/create_triangular_mesh.py 100 [100] [~/.easier]
+    python tutorial/create_triangular_mesh.py 100 [100] ~/.easier
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("nx", type=int)
     parser.add_argument("ny", nargs="?", default=None, type=int)
-    parser.add_argument("data_dir", type=str, nargs="?", default='~/.easier')
+    parser.add_argument("data_dir", type=str, default='~/.easier')
     args = parser.parse_args()
 
     data_dir: str = os.path.expanduser(args.data_dir)
@@ -59,6 +59,6 @@ if __name__ == '__main__':
     mesh = get_triangular_mesh(nx, ny, data_dir)
 
     print("Create triangular mesh:")
-    print("nx:", args.nx)
-    print("ny:", args.ny)
+    print("nx:", nx)
+    print("ny:", ny)
     print("output HDF5 file:", mesh)

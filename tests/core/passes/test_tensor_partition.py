@@ -15,8 +15,7 @@ import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.passes.tensor_group_partition import \
     CommPair, partition_tensor_groups_with_adjmat, parallel_partition_graph, \
     synchronize_partition_result, get_runtime_dist_env, ElemPartArangeIdx
-from easier.core.passes.tensor_grouping import \
-    EasierTensorGroup
+from easier.core.passes.tensor_grouping import EasierTensorGroup
 from tests.utils import assert_tensor_list_equal
 
 
