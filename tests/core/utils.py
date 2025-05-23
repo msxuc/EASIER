@@ -159,7 +159,7 @@ def multi_stage_zero_length_partition(
                 ep_idx = dist_env.scatter_object_list(0)
                 lengths = dist_env.broadcast_object_list(0)
 
-            elemparts[grp] = ElemPart(ep_idx, lengths, ep.hint)
+            elemparts[grp] = ElemPart(None, ep_idx, lengths, ep.hint)
 
         return elemparts
 

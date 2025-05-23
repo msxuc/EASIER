@@ -13,7 +13,7 @@ from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 
-from tests.utils import torchrun_singlenode, have_cuda
+from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2
 from easier.core.utils import get_random_str
 
 
@@ -160,7 +160,7 @@ class TestDataLoader:
 
     @pytest.mark.parametrize('final_device_type', [
         'cpu',
-        pytest.param('cuda', marks=have_cuda)
+        pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
     def test_fully_load(self, data_loader_ctor, dtype: torch.dtype,
                         device_type: str, final_device_type: str):

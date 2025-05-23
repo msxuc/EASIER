@@ -299,6 +299,12 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
         root = modules[rooti]
 
         if not hasattr(p, 'easier_tensor_group'):
+            # NOTE
+            # the assignment to never-used tensors will only happened in the
+            # first run of tensor_grouping pass, even tensor_grouping will be
+            # run multiple times.
+            # After the 1st run `p.easier_tensor_group` will be bound, and
+            # those EasierTensorGroup objects are inherited.
 
             logger.warning(
                 "Distributed easier.Tensor "
