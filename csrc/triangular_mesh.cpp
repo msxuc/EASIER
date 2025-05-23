@@ -7,7 +7,7 @@
 #include <iostream>
 #include <math.h>
 
-py::tuple get_mesh(int mesh_size) {
+py::tuple get_mesh(long mesh_size) {
   long n = mesh_size;
   double delta = 1. / n;
   double area = delta * delta / 4.;
