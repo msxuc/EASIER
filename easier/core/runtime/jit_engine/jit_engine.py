@@ -1,9 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Final, List, Tuple
+from hmac import new
+from typing import Dict, Final, List, Tuple, Union
 
 from git import Optional
+from numpy import add
 import torch
 from torch.fx.node import Node
 from torch.fx.graph import Graph
@@ -21,7 +23,8 @@ from easier.core.runtime.dist_env import \
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
-    get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, collect_meta
+    get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, \
+    StructuredTensorViewSrc, collect_meta
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
@@ -45,7 +48,7 @@ jit_skipped_meta = RuntimeTensorMeta(
 
 
 def get_value_runtime_metadata(
-    addr2viewsrc: Dict[int, Node], node: Node, role: Role, val,
+    node: Node, role: Role, val,
     *,
     _rec_depth=0  # debug-only
 ) -> StructuredTensorMeta:
@@ -56,12 +59,7 @@ def get_value_runtime_metadata(
     Such a value is normally the result of evaluating `self.current_node`
     or jit_skipped.
 
-    If a newly allocated tensor is visited, argument `add2viewsrc` dict will
-    be updated.
-
     Args:
-    -   addr2viewsrc:
-            normally the keys are tensor.untyped_storage().data_ptr()
     -   node
     -   role:
             the statically inferred role for this Node
@@ -70,17 +68,8 @@ def get_value_runtime_metadata(
             nested structure.
     """
     if isinstance(val, torch.Tensor):
-        # Get the memory address of the underlying memory
-        # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
-        addr: int = val.untyped_storage().data_ptr()
-        if addr in addr2viewsrc:
-            view_src: ViewSrc = addr2viewsrc[addr]
-        else:
-            view_src: ViewSrc = node
-            addr2viewsrc[addr] = view_src
-
         tensor_runtime_meta = RuntimeTensorMeta(
-            role, tuple(val.shape), val.dtype, view_src=view_src
+            role, tuple(val.shape), val.dtype
         )
         return tensor_runtime_meta
 
@@ -110,24 +99,14 @@ def get_value_runtime_metadata(
         for i in range(n_items):
             item = val[i]
             item_meta = get_value_runtime_metadata(
-                addr2viewsrc, node, role, item,
+                node, role, item,
                 _rec_depth=_rec_depth+1
             )
 
             # assume being only one level nested.
             assert isinstance(item, torch.Tensor)
             assert isinstance(item_meta, RuntimeTensorMeta)
-
-            if item_meta.view_src is node:
-                # additionally mark it's allocated by a multi-res operation,
-                # give i:int we can only have at most 1 nested level.
-                item_meta = RuntimeTensorMeta(
-                    role=item_meta.role,
-                    shape=item_meta.shape,
-                    dtype=item_meta.dtype,
-                    view_src=(node, i)
-                )
-
+            
             item_metas.append(item_meta)
 
         item_metas = type(val)(item_metas)  # tuple or list
@@ -238,33 +217,44 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
     def exit_forward(self):
         self.addr2refcount.clear()
     
-    def _collect_addrs(self, res) -> List[int]:
-        class _AddrCollector:
-            def __init__(self) -> None:
-                # NOTE this must be a list rather than a set, as each item
-                # in the nested result becomes a local variable in forward()
-                # and contributes one ref count, even they are the same
-                # tensor instance.
-                self.addrs: List[int] = []
-            
-            def collect(self, x):
-                # Get the memory address of the underlying memory
-                # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
-                if isinstance(x, torch.Tensor):
-                    self.addrs.append(x.untyped_storage().data_ptr())
+    def _collect_indexed_addrs(
+        self, res, index: Optional[int]=None
+    ) -> List[Tuple[int, Optional[int]]]:
+        """
+        Each resultant item tuple is:
+        an addr int with either a) None, b) an index within multi-result.
+
+        Addr int will become Node, with memory block lifetime taken into
+        consideration, which means:
+        a) (addr:int, None)     becomes (allocator:Node,)
+        b) (addr:int, item:int)  becomes (allocator:Node, item:int)
+        and these two cases are exactly the cases for ViewSrc.
+        """
+        if isinstance(res, torch.Tensor):
+            addr = res.untyped_storage().data_ptr()
+            return [(addr, index)]
         
-        addr_coll = _AddrCollector()
-        _ = tree_map(res, addr_coll.collect)
+        elif isinstance(res, (tuple, list)):
+            indexed_addrs = []
+            for i, item in enumerate(res):
+                indexed_addr = self._collect_indexed_addrs(item, i)
+                indexed_addrs.extend(indexed_addr)
+            return indexed_addrs
 
-        return addr_coll.addrs
+        elif res in [None, jit_skipped] or isinstance(res, (int, float, bool)):
+            return []
+        
+        else:
+            raise EasierJitException(
+                f"Unexpected runtime value {res} or nested structure"
+            )
 
+    
     def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
-        res_addrs = self._collect_addrs(res)
+        for (res_addr, res_idx) in self._collect_indexed_addrs(res):
+            prev_res_refcount = self.addr2refcount.setdefault(res_addr, 0)
 
-        if self.current_node.op == FX.GET_ATTR:
-            for addr in res_addrs:
-                self.addr2refcount.setdefault(addr, 0)
-
+            if self.current_node.op == FX.GET_ATTR:
                 # GET_ATTR increases ref count by 2 = 1 + 1:
                 # - 1 ref count is because of the local variable of GET_ATTR
                 # - 1 extra ref count is because of everlasting esr.Tensor
@@ -273,16 +263,28 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
                 #
                 # And it's OK to have multiple extra 1s for esr.Tensor aliases,
                 # as long as it remains `refcount > 0`.
-                self.addr2refcount[addr] += 2
+                self.addr2refcount[res_addr] += 2
+            
+            else:
+                self.addr2refcount[res_addr] += 1
+
+            if prev_res_refcount == 0:
+                # Find an allocator
+                if res_idx is None:
+                    view_src = ViewSrc(self.current_node)
+                else:
+                    view_src = ViewSrc((self.current_node, res_idx))
         
         for ends_here in get_args_end_at(self.current_node):
-            val = self.stackframe[ends_here]
+            # If cur_node has no users, it ends at itself immediately.
 
-            # TODO nested
-            if isinstance(val, torch.Tensor):
-                val_addr: int = val.untyped_storage().data_ptr()
+            end_val = self.stackframe[ends_here]
+            # NOTE for multi-res Nodes, the stackframe[ends_here:Node] will
+            # be a nested structure -- it gets unpacked in following
+            # operator.getitem Nodes.
 
-            self.addr2refcount[val_addr] -= 1
+            for (end_addr, val_idx) in self._collect_indexed_addrs(end_val):
+                self.addr2refcount[end_addr] -= 1
 
         pass
 

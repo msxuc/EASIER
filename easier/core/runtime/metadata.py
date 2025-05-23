@@ -4,7 +4,7 @@
 import dataclasses
 import enum
 from typing import \
-    Callable, List, Sequence, Tuple, TypeVar, Union, overload
+    Callable, List, Sequence, Tuple, Type, TypeVar, Union, overload
 from typing_extensions import TypeAlias
 
 import torch
@@ -98,11 +98,21 @@ def collect_meta(
     sentinel: _TSentinel = None
 ) -> List[_T]: ...
 
-def collect_meta(meta, f = lambda x: x, sentinel = None) -> list:
+@overload
+def collect_meta(
+    meta: object,
+    f: Callable[[_T], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None,
+    *,
+    leaf_type: Type[_T]
+) -> List[_T]: ...
+
+def collect_meta(meta, f = lambda x: x, sentinel = None, leaf_type = (RuntimeTensorMeta, ViewSrc)) -> list:
     ys = []
 
     def _collect(x):
-        if isinstance(x, (RuntimeTensorMeta, ViewSrc)):
+        if isinstance(x, leaf_type):
             y = f(x)
             if y is not sentinel:
                 ys.append(y)

@@ -25,6 +25,8 @@ def get_args_end_at(node: Node) -> List[Node]:
     Get the argument Nodes of `node` whose last user is also `node`,
     i.e. argument Nodes whose life ranges end at `node`.
 
+    A Node without users end at itself immediately.
+
     For example, at runtime, after evaluating `node`,
     jit_engine.values.RuntimeValues for those argument Nodes can be freed
     (this does not mean the underlying tensor memory is freed too).
