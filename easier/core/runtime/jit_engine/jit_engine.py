@@ -3,6 +3,7 @@
 
 from typing import Dict, Final, List, Tuple
 
+from git import Optional
 import torch
 from torch.fx.node import Node
 from torch.fx.graph import Graph
@@ -20,8 +21,7 @@ from easier.core.runtime.dist_env import \
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
-    get_node_meta, set_node_meta, \
-    get_runtime_metadata_from_scalar, collect_meta
+    get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, collect_meta
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
@@ -31,7 +31,7 @@ from easier.core.runtime.jit_engine.values import \
 
 
 replica_none_meta = RuntimeTensorMeta(
-    Role.REPLICATED, (), torch.int32, view_src=None
+    Role.REPLICATED, (), torch.int32
 )
 
 jit_skipped_meta = RuntimeTensorMeta(
@@ -40,7 +40,7 @@ jit_skipped_meta = RuntimeTensorMeta(
     # no matter what shape[1:] will be in the runtime.
     #
     # The '0' here should be interpreted as the batch size.
-    Role.DISTRIBUTED, (0,), torch.int32, view_src=None
+    Role.DISTRIBUTED, (0,), torch.int32
 )
 
 
@@ -221,7 +221,7 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
         # in case `res` get leaked?
         return res
 
-class RefCountBasedMemoryTracker(NodeHandlerBase):
+class RefCountBasedViewSrcTracker(NodeHandlerBase):
     # def preprocess(
     #     self, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
     # ) -> PreprocessDecision:
@@ -230,25 +230,50 @@ class RefCountBasedMemoryTracker(NodeHandlerBase):
     def __init__(self) -> None:
         super().__init__()
         self.addr2refcount: Dict[int, int]
+        self.addr2viewsrc: Dict[int, Node]
 
     def enter_forward(self):
         self.addr2refcount = {}
 
     def exit_forward(self):
         self.addr2refcount.clear()
+    
+    def _collect_addrs(self, res) -> List[int]:
+        class _AddrCollector:
+            def __init__(self) -> None:
+                # NOTE this must be a list rather than a set, as each item
+                # in the nested result becomes a local variable in forward()
+                # and contributes one ref count, even they are the same
+                # tensor instance.
+                self.addrs: List[int] = []
+            
+            def collect(self, x):
+                # Get the memory address of the underlying memory
+                # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
+                if isinstance(x, torch.Tensor):
+                    self.addrs.append(x.untyped_storage().data_ptr())
+        
+        addr_coll = _AddrCollector()
+        _ = tree_map(res, addr_coll.collect)
+
+        return addr_coll.addrs
 
     def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
-
-        # TODO nested
-        if isinstance(res, torch.Tensor):
-            # Get the memory address of the underlying memory
-            # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
-            res_addr: int = res.untyped_storage().data_ptr()
+        res_addrs = self._collect_addrs(res)
 
         if self.current_node.op == FX.GET_ATTR:
-            self.addr2refcount.setdefault(res_addr, 1)
+            for addr in res_addrs:
+                self.addr2refcount.setdefault(addr, 0)
 
-            self.addr2refcount[res_addr] += 1
+                # GET_ATTR increases ref count by 2 = 1 + 1:
+                # - 1 ref count is because of the local variable of GET_ATTR
+                # - 1 extra ref count is because of everlasting esr.Tensor
+                #   instance that will never be released,
+                #   even all local variables of GET_ATTR die out.
+                #
+                # And it's OK to have multiple extra 1s for esr.Tensor aliases,
+                # as long as it remains `refcount > 0`.
+                self.addr2refcount[addr] += 2
         
         for ends_here in get_args_end_at(self.current_node):
             val = self.stackframe[ends_here]
@@ -260,6 +285,9 @@ class RefCountBasedMemoryTracker(NodeHandlerBase):
             self.addr2refcount[val_addr] -= 1
 
         pass
+
+class RefCountBasedViewSrcValidation(NodeHandlerBase):
+    1
 
 class MetadataValidation(NodeHandlerBase):
     """
@@ -762,6 +790,12 @@ class NotFullReducerOutputAllocation(NodeHandlerBase):
     this Handler will not be run, this will be skipped because of
     either SkipZeroLengthNonHalo for runtime or FirstRunReducerMetaProp.
     """
+    def __init__(self):
+        super().__init__()
+
+        # Must be released in postprocess() to ensure not leaking refcount
+        self.input_val: RuntimeValue
+        self.opt_out_val: Optional[RuntimeValue]
 
     def preprocess_call_module(
         self, submod, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
@@ -784,6 +818,8 @@ class NotFullReducerOutputAllocation(NodeHandlerBase):
             assert isinstance(res, JitSkipped)
 
             input_val, opt_out_val = self.input_val, self.opt_out_val
+
+            # Release refcount to runtime values in time
             del self.input_val
             del self.opt_out_val
 
@@ -823,27 +859,68 @@ class JitEngine:
         self.run_count = 0
 
         self.first_run_handlers: List[NodeHandlerBase] = [
+            # -> Load values from stackframe
+            # <- Store result into stackframe, release unused tensors
             StackframeLoadStoreRelease(),
 
+            # ->
+            # <- Updates refcount and sets view_src
+            RefCountBasedViewSrcTracker(),
+
+            # -> Calculates expected role and batchsize --/
+            # -> if to skip and not sum/halo etc.: SKIP_EVAL --\--------
+            # <- Calculates and sets metadata _________________/________
             FirstRunMetadataPropagation(),
 
+            # -> Allgathers metadata for aggreagators and sets Node metadata
+            # <- Updates metadata (e.g. int32 -> int64)
             FirstRunAggregatorMetadataPropagation(),
+            # -> Exchanges metadata for Halos and sets Node metadata
+            # <-
             FirstRunHaloExchangerMetadataPropagation(),
+            # -> Allgathers metadata for Reducers and sets Node metadata
+            # <-
             FirstRunReducerMetadataPropagation(),
 
+            # -> Prepares neutral input to esr.sum etc. and GOTO_EVAL
+            # <-
             AggregatorNeutralInputPreparation(),
+            # -> Prepares input to HaloExchanger and GOTO_EVAL
+            # <-
             HaloExchangerZeroLengthInputPreparation(),
+            # -> if input is zero-length: SKIP_EVAL --\-----------------
+            # <---- Allocates zero-ed output _________/
+            # <--else --------------------------------------------------
             NotFullReducerOutputAllocation(),
         ]
 
         self.runtime_handlers: List[NodeHandlerBase] = [
+            # -> Loads arguments from stackframe
+            # <- Stores result into stackframe, releases unused tensors
             StackframeLoadStoreRelease(),
 
+            # ->
+            # <- Updates refcount and asserts view_src no changes
+            RefCountBasedViewSrcValidation(),
+
+            # ->
+            # <- Validates metadata and asserts no changes
             MetadataValidation(),
+
+            # -> if any dist input is zero-length: SKIP_EVAL --\--------
+            # <____ res=jit_skipped ___________________________/
+            # <--else --------------------------------------------------
             SkipZeroLengthNonHalo(),
 
+            # -> Prepares neutral input to esr.sum etc. and GOTO_EVAL
+            # <-
             AggregatorNeutralInputPreparation(),
+            # -> Prepares input to HaloExchanger and GOTO_EVAL
+            # <-
             HaloExchangerZeroLengthInputPreparation(),
+            # -> if input is zero-length: SKIP_EVAL --\-----------------
+            # <---- Allocates zero-ed output _________/
+            # <--else --------------------------------------------------
             NotFullReducerOutputAllocation(),
         ]
 
