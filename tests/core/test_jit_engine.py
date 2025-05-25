@@ -339,3 +339,12 @@ class TestMetadataPropagation:
         f3, = _case(lambda v, w, t, s: torch.einsum('ij,ji->', t, s))
         equation, arg1, arg2 = cast(List[Node], f3.args)
         _assert_replica(f3)
+
+
+class TestViewSrc:
+    pass
+
+"""
+TODO
+1. multi-res op: a) return input mem; b) two items are actually the same mem
+"""

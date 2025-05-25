@@ -59,6 +59,11 @@ class ViewSrc:
     memory blocks/tensors. Each of these memory blocks are identified with
     an extra index for the resultant item.
 
+    For example, if one op returns/allocates two individual tensors, subsequent
+    reads/writes on one tensor will not be regarded as dependent on
+    reads/writes of the other tensor. Because their view_srcs are different
+    in the extra index.
+
     To diferentiate the Tuple[Node, int] for one result of multi-result op
     from Tuple[ViewSrc] for the whole nested structure,
     make ViewSrc a distinct dataclass.
