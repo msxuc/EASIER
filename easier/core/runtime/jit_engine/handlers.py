@@ -9,8 +9,7 @@ from torch.fx.node import Node
 from torch.fx.graph import Graph
 
 import easier as esr
-from easier.core.passes.utils import \
-    FX
+from easier.core.passes.utils import FX
 from easier.core.utils import EasierJitException
 from easier.core.runtime.jit_engine.values import RuntimeValue
 

@@ -18,8 +18,7 @@ from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
 import easier.core.module as esr
 from easier.core.module import Selector
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
-from easier.core.passes.tensor_group_partition import \
-    ElemPart
+from easier.core.passes.tensor_group_partition import ElemPart
 
 
 class ConstantTensorMover(EasierInterpreter):

@@ -10,8 +10,7 @@ from torch.fx.graph import Graph
 from easier.core.passes.tensor_group_partition import ElemPart
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import \
-    logger
+from easier.core.utils import logger
 import easier.core.module as esr
 
 from easier.core.passes.tensor_grouping import \

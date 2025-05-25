@@ -22,8 +22,7 @@ from easier.core.passes.utils import \
     get_selector_reducer_idx_partition_pair, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     get_easier_tensors
-from easier.core.runtime.dist_env import \
-    get_runtime_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.distpart import distpart_kway, DistConfig
 from easier.core.utils import EasierJitException
 
