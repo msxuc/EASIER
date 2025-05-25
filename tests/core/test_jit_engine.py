@@ -345,4 +345,5 @@ class TestViewSrc:
 """
 TODO
 1. multi-res op: a) return input mem; b) two items are actually the same mem
+2. memory reused
 """
