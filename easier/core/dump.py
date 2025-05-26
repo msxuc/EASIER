@@ -394,7 +394,7 @@ def dump(
         original modules, users should consider not dumping them.
         Instead, compile that subset of modules from scratch for better runtime
         performance.
-    -   Each rank will firstly write to local temporary directory
+    -   Each rank will firstly write to the local temporary directory
         (e.g. `/tmp` in Linux).
         In case of insufficient disk space, users can specify TMP environment
         variable (on each machine) with an existing, writable directory.

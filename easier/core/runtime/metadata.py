@@ -4,8 +4,7 @@
 import dataclasses
 import enum
 from typing import \
-    Callable, List, Sequence, Tuple, Type, TypeVar, Union, overload
-from git import Optional
+    Callable, List, Sequence, Tuple, Type, TypeVar, Union, overload, Optional
 from typing_extensions import TypeAlias
 
 import torch
@@ -164,8 +163,42 @@ StructuredIndexedAddr: TypeAlias = Union[
 #
 # Metadata relevant utils
 #
+
+
+_T = TypeVar('_T')
+_TSentinel = TypeVar('_TSentinel')
+_TLeaf = TypeVar('_TLeaf')
+
+
+@overload
+def collect_meta(
+    meta: StructuredTensorMeta,
+    f: Callable[[RuntimeTensorMeta], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None
+) -> List[_T]:
+    # Specialized for TensorMeta
+    ...
+
+
+@overload
+def collect_meta(
+    meta: object,
+    f: Callable[[_TLeaf], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None,
+    *,
+    leaf_type: Type[_TLeaf]
+) -> List[_T]:
+    # General cases for whatever nested Node-meta data,
+    # specialized for `leaf_type`
+    ...
+
+
 def collect_meta(  # type: ignore
-    meta, f=lambda x: x, sentinel=None,
+    meta,
+    f=lambda x: x,
+    sentinel=None,
     *,
     leaf_type=RuntimeTensorMeta
 ):
@@ -180,33 +213,3 @@ def collect_meta(  # type: ignore
     _ = tree_map(meta, _collect)
 
     return ys
-
-
-_T = TypeVar('_T')
-_TSentinel = TypeVar('_TSentinel')
-_TLeaf = TypeVar('_TLeaf')
-
-# Specialized for TensorMeta
-
-
-@overload
-def collect_meta(
-    meta: StructuredTensorMeta,
-    f: Callable[[RuntimeTensorMeta], Union[_T, _TSentinel]] = lambda x: x,
-    # use other sentinel value if None is desired.
-    sentinel: _TSentinel = None
-) -> List[_T]: ...
-
-# General cases for whatever nested Node-meta data,
-# specialized for `leaf_type`
-
-
-@overload
-def collect_meta(
-    meta: object,
-    f: Callable[[_TLeaf], Union[_T, _TSentinel]] = lambda x: x,
-    # use other sentinel value if None is desired.
-    sentinel: _TSentinel = None,
-    *,
-    leaf_type: Type[_TLeaf]
-) -> List[_T]: ...

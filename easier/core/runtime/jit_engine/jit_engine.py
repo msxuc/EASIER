@@ -1,9 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Final, List, Tuple, cast
+from typing import Dict, Final, List, Tuple, cast, Optional
 
-from git import Optional
 import torch
 from torch.fx.node import Node
 from torch.fx.graph import Graph

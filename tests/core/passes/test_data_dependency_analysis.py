@@ -1,22 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import contextlib
 from typing import Dict, Iterable, List, Set, Union, cast
-from httpx import patch
 import pytest
 import torch
-from unittest.mock import patch
 
 from torch.fx.node import Node
-from torch.fx.graph import Graph
 
-from easier.core.jit import EasierTracer
+from easier.core.jit import EasierTracer, _fully_load_data_backend_none
 
 from easier.core.module import Reducer, Tensor
 from easier.core.passes.data_dependency_analysis import \
     get_data_dependency_inputs, get_data_dependency_users, \
     KEY__DATA_DEPENDENCY_USERS, KEY__DATA_DEPENDENCY_INPUTS
+from easier.core.runtime.jit_engine.handlers import \
+    NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.metadata import ViewSrc, get_node_view_src
 from easier.core.runtime.jit_engine.jit_engine import JitEngine as _orig_JE
 from easier.core import passes
@@ -62,6 +60,8 @@ def _get_viewsrc_node(node: Node) -> Union[Node, None]:
         return None
     else:
         assert isinstance(view_src, ViewSrc)
+        assert view_src.index is None, "use get_node_view_src explicitly"
+
         return view_src.node
 
 
@@ -79,7 +79,6 @@ def test_data_dependency__none():
             d = esr.sum(c)
 
     m = M()
-    from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
 
@@ -239,4 +238,83 @@ def test_data_dependency_nested_call():
         call_intermediate: [set_a],
         a_view2: [call_intermediate],
         set_a2: [a_view2]
+    }, graph.nodes)
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_multi_res_separated_dep_subgraphs():
+    """
+    On a multi-res operation, subsequent data dependency edges only occur
+    on the resultant item that's really related, those edges shouldn't be mixed
+    with other resultant items from that multi-res op.
+    So that we get finest granularity of data dependency.
+    """
+    class M(esr.Module):
+        def __init__(self):
+            super().__init__()
+            self.x = Tensor(torch.zeros([11, 8, 3, 4]), mode='partition')
+
+        def forward(self):
+            neg = torch.neg(self.x)
+
+            u, s, v = torch.svd(neg)
+
+            torch.abs_(neg)  # connected only with u
+
+            s2 = s[:, 3]
+            sin = torch.sin(s2)
+            torch.log_(s)
+
+    called_watcher = []
+
+    class _ValueStubHandler(NodeHandlerBase):
+        def preprocess(self, args, kwargs):
+            if self.current_node.target is torch.svd:
+                return PreprocessDecision.SKIP_EVAL
+            else:
+                return PreprocessDecision.CONTINUE
+
+        def postprocess(self, res, args, kwargs):
+            if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
+
+                called_watcher.append(1)
+
+                neg: torch.Tensor = args[0]  # type: ignore
+                return neg, torch.zeros_like(neg), torch.ones_like(neg)
+            else:
+                return res
+
+    m = M()
+    graph = EasierTracer().trace(m)
+
+    _fully_load_data_backend_none([m], 'cpu')
+    engine = JitEngine(m, graph)
+    engine.first_run_handlers.append(_ValueStubHandler())
+    engine.forward()
+
+    assert called_watcher == [1]
+
+    attr_x, neg, svd, u, s, v, abs_, s2, sin, log_, out = graph.nodes
+
+    assert _get_viewsrc_node(attr_x) == attr_x
+    assert _get_viewsrc_node(neg) == neg
+    assert list(get_node_view_src(svd)) == [  # type: ignore
+        ViewSrc(neg, None),
+        ViewSrc(svd, 1),
+        ViewSrc(svd, 2),
+    ]
+    assert _get_viewsrc_node(u) == neg
+
+    assert get_node_view_src(s) == ViewSrc(svd, 1)
+    assert get_node_view_src(v) == ViewSrc(svd, 2)
+
+    assert _get_viewsrc_node(abs_) == neg
+
+    assert get_node_view_src(s2) == get_node_view_src(s) == ViewSrc(svd, 1)
+    assert _get_viewsrc_node(sin) == sin
+    assert get_node_view_src(log_) == get_node_view_src(s) == ViewSrc(svd, 1)
+
+    _assert_deps({
+        abs_: [u],
+        log_: [s2, sin],
     }, graph.nodes)

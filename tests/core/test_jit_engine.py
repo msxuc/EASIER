@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import operator
 from typing import List, cast
 import pytest
 import torch
@@ -10,8 +11,11 @@ from torch.fx.node import Node
 from easier.core.jit import EasierTracer, _fully_load_data_backend_none
 
 from easier.core.module import Selector, Reducer, Tensor
+from easier.core.runtime.jit_engine.handlers import \
+    NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.jit_engine import JitEngine
-from easier.core.runtime.metadata import Role, get_node_meta, RuntimeTensorMeta
+from easier.core.runtime.metadata import \
+    Role, ViewSrc, get_node_meta, RuntimeTensorMeta, get_node_view_src
 from easier.core.passes.utils import FX
 import easier as esr
 
@@ -45,7 +49,8 @@ class TestMetadataPropagation:
     Cases that TensorMeta.view_src being static and fixed are tested in
     passes/test_data_dependency_analysis.py
 
-    TODO in the future we may allow metadata change between runs.
+    Set JitEngine.compile_after_first_run to NO-OP to avoid passes like
+    fusion and codegen to modify graphs.
     """
 
     def test_easier_primitives(self):
@@ -65,6 +70,7 @@ class TestMetadataPropagation:
 
         _fully_load_data_backend_none([m], 'cpu')
         engine = JitEngine(m, graph)
+        engine.compile_after_first_run = lambda: None
         engine.forward()
 
         getattr_v, call_s, call_r, output = graph.nodes
@@ -92,6 +98,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v, t, ..., out
@@ -141,6 +148,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v1, v2, ..., out
@@ -169,6 +177,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v, ..., out
@@ -200,6 +209,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v, t, ..., out
@@ -248,6 +258,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v1, v2, ..., out
@@ -286,6 +297,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v1, v2, t1, t2, ..., out
@@ -321,6 +333,7 @@ class TestMetadataPropagation:
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
+            engine.compile_after_first_run = lambda: None
             engine.forward()
 
             # nodes: v1, v2, t1, t2, ..., out
@@ -339,11 +352,178 @@ class TestMetadataPropagation:
         _assert_replica(f3)
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 class TestViewSrc:
-    pass
+    def test_memory_reuse(self):
+        """
+        When a memory address is reused, the subsequent Node should not
+        inherit the ViewSrc but make itself the ViewSrc.
+        """
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.x = Tensor(torch.zeros([11, 8, 3, 4]), mode='partition')
 
-"""
-TODO
-1. multi-res op: a) return input mem; b) two items are actually the same mem
-2. memory reused
-"""
+            def forward(self):
+                abs = torch.abs(self.x)
+                neg = torch.neg(self.x)
+                # Whatever unary functions, will be hooked to return same mem,
+                # but if they are normally run, they will fail.
+                end1 = torch.cholesky_inverse(neg)
+                end2 = torch.cholesky(neg)
+
+        same_memory = torch.rand(11, 9)
+        called_watcher = []
+
+        class _ValueStubHandler(NodeHandlerBase):
+            def preprocess(self, args, kwargs):
+                if self.current_node.target in [
+                    torch.cholesky_inverse, torch.cholesky
+                ]:
+                    return PreprocessDecision.SKIP_EVAL
+                else:
+                    return PreprocessDecision.CONTINUE
+
+            def postprocess(self, res, args, kwargs):
+                if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
+                    called_watcher.append(1)
+                    return same_memory
+                else:
+                    return res
+
+        m = M()
+        graph = EasierTracer().trace(m)
+
+        _fully_load_data_backend_none([m], 'cpu')
+        engine = JitEngine(m, graph)
+        engine.first_run_handlers.append(_ValueStubHandler())
+        engine.compile_after_first_run = lambda: None
+        engine.forward()
+
+        assert called_watcher == [1]
+
+        attr_x, abs, neg, end1, end2, out = graph.nodes
+
+        assert attr_x.op == FX.GET_ATTR
+        assert get_node_view_src(attr_x) == ViewSrc(attr_x, None)
+
+        assert abs.target == torch.abs
+        assert get_node_view_src(abs) == ViewSrc(abs, None)
+
+        assert neg.target == torch.neg
+        assert get_node_view_src(neg) == ViewSrc(neg, None)
+
+        assert end1.target == torch.cholesky_inverse
+        assert get_node_view_src(end1) == ViewSrc(end1, None)
+
+        assert end2.target == torch.cholesky
+        assert get_node_view_src(end2) == ViewSrc(end2, None)
+
+    def test_indexed_multi_result(self):
+        """
+        When multi-result operator returns the same addr as well as allocates
+        new addrs, they are counted as individual ViewSrcs.
+        """
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.x = Tensor(torch.zeros([11, 8, 3, 4]), mode='partition')
+
+            def forward(self):
+                neg = torch.neg(self.x)
+
+                u, s, v = torch.svd(neg)
+
+        called_watcher = []
+
+        class _ValueStubHandler(NodeHandlerBase):
+            def preprocess(self, args, kwargs):
+                if self.current_node.target is torch.svd:
+                    return PreprocessDecision.SKIP_EVAL
+                else:
+                    return PreprocessDecision.CONTINUE
+
+            def postprocess(self, res, args, kwargs):
+                if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
+
+                    called_watcher.append(1)
+
+                    neg: torch.Tensor = args[0]  # type: ignore
+                    return neg, torch.zeros_like(neg), torch.ones_like(neg)
+                else:
+                    return res
+
+        m = M()
+        graph = EasierTracer().trace(m)
+
+        _fully_load_data_backend_none([m], 'cpu')
+        engine = JitEngine(m, graph)
+        engine.first_run_handlers.append(_ValueStubHandler())
+        engine.compile_after_first_run = lambda: None
+        engine.forward()
+
+        assert called_watcher == [1]
+
+        attr_x, neg, svd, u, s, v, out = graph.nodes
+
+        assert attr_x.op == FX.GET_ATTR
+        assert get_node_view_src(attr_x) == ViewSrc(attr_x, None)
+        assert neg.target == torch.neg
+        assert get_node_view_src(neg) == ViewSrc(neg, None)
+
+        assert svd.target == torch.svd
+        assert list(get_node_view_src(svd)) == [  # type: ignore
+            ViewSrc(neg, None),
+            ViewSrc(svd, 1),
+            ViewSrc(svd, 2)
+        ]
+
+        assert u.target == operator.getitem
+        assert get_node_view_src(u) == ViewSrc(neg, None)  # inherited
+
+        assert s.target == operator.getitem
+        assert get_node_view_src(s) == ViewSrc(svd, 1)
+
+        assert v.target == operator.getitem
+        assert get_node_view_src(v) == ViewSrc(svd, 2)
+
+    def test_skipped(self):
+        """
+        When multi-result operator returns the same addr as well as allocates
+        new addrs, they are counted as individual ViewSrcs.
+        """
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.x = Tensor(torch.zeros([11, 8, 3, 4]), mode='partition')
+                self.z = Tensor(torch.zeros([0, 8, 3, 4]), mode='partition')
+
+            def forward(self):
+                neg = torch.neg(self.x)
+                sin = torch.sin(self.z)
+
+                sums = esr.sum(neg)
+
+        m = M()
+        graph = EasierTracer().trace(m)
+
+        _fully_load_data_backend_none([m], 'cpu')
+        engine = JitEngine(m, graph)
+        engine.compile_after_first_run = lambda: None
+        engine.forward()
+
+        attr_x, neg, attr_z, sin, sums, out = graph.nodes
+
+        assert attr_x.op == FX.GET_ATTR
+        assert get_node_view_src(attr_x) == ViewSrc(attr_x, None)
+        assert neg.target == torch.neg
+        assert get_node_view_src(neg) == ViewSrc(neg, None)
+
+        assert attr_z.op == FX.GET_ATTR
+        assert get_node_view_src(attr_z) == None
+        assert sin.target == torch.sin
+        assert get_node_view_src(sin) == None
+
+        # replica is counted.
+        assert sums.target == esr.sum
+        assert get_node_view_src(sums) == ViewSrc(sums, None)

@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import itertools
+import operator
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from torch import nn
@@ -179,14 +180,36 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
         if self.is_skipped(self.current_node):
             return
 
-        arg_srcs = collect_meta(
-            [
-                get_node_view_src(arg)
-                for arg in self.current_node.all_input_nodes
-                if not self.is_skipped(arg)
-            ],
-            leaf_type=ViewSrc
-        )
+        arg_srcs = None  # type: ignore
+
+        # If getitem is for tuple indexing, which is essentially a syntactic
+        # construct of EASIER IR, R/W relations only cover that specified item.
+        if self.current_node.target == operator.getitem:
+            arg0 = self.current_node.all_input_nodes[0]
+            assert not self.is_skipped(arg0)
+            is_tuple_indexing = not isinstance(
+                get_node_meta(arg0), RuntimeTensorMeta
+            )
+            if is_tuple_indexing:
+                tuple_item_index = self.current_node.args[1]
+                assert isinstance(tuple_item_index, int)
+                arg_srcs = collect_meta(
+                    get_node_view_src(arg0)[tuple_item_index],  # type: ignore
+                    leaf_type=ViewSrc
+                )
+
+        # For all other cases than tuple indexing:
+        if arg_srcs is None:
+            arg_srcs = collect_meta(
+                [
+                    get_node_view_src(arg)
+                    for arg in self.current_node.all_input_nodes
+                    if not self.is_skipped(arg)
+                ],
+                leaf_type=ViewSrc
+            )
+
+        arg_srcs: List[ViewSrc]
         for arg_src in arg_srcs:
             self.add_reader_dependency(arg_src)
 
