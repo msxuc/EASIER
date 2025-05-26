@@ -400,7 +400,7 @@ class TestViewSrc:
         engine.compile_after_first_run = lambda: None
         engine.forward()
 
-        assert called_watcher == [1]
+        assert called_watcher == [1, 1]  # called twice
 
         attr_x, abs, neg, end1, end2, out = graph.nodes
 
