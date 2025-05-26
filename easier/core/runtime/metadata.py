@@ -5,6 +5,7 @@ import dataclasses
 import enum
 from typing import \
     Callable, List, Sequence, Tuple, Type, TypeVar, Union, overload
+from git import Optional
 from typing_extensions import TypeAlias
 
 import torch
@@ -16,6 +17,11 @@ from easier.core.utils import EasierJitException
 
 KEY__METADATA_RUNTIME = 'easier_metadata_runtimeTensorMeta'
 KEY__METADATA_VIEW_SRC = 'easier_metadata_viewSrc'
+
+#
+# TensorMetadata
+# (role, shape, dtype)
+#
 
 
 class Role(enum.Enum):
@@ -50,83 +56,6 @@ StructuredTensorMeta: TypeAlias = Union[
 ]
 
 
-@dataclasses.dataclass(frozen=True, eq=True)
-class ViewSrc:
-    """
-    `ViewSrc` are Nodes that allocate the memory blocks for the tensors.
-
-    Also, some certain multi-result operation/Node might allocate multiple
-    memory blocks/tensors. Each of these memory blocks are identified with
-    an extra index for the resultant item.
-
-    For example, if one op returns/allocates two individual tensors, subsequent
-    reads/writes on one tensor will not be regarded as dependent on
-    reads/writes of the other tensor. Because their view_srcs are different
-    in the extra index.
-
-    To diferentiate the Tuple[Node, int] for one result of multi-result op
-    from Tuple[ViewSrc] for the whole nested structure,
-    make ViewSrc a distinct dataclass.
-    """
-    src: Union[
-        Node,              # non-multi-result op, including get_attr
-        Tuple[Node, int],  # item of multi-result Nodes
-    ]
-
-StructuredTensorViewSrc: TypeAlias = Union[
-    ViewSrc,
-    Sequence['StructuredTensorViewSrc'],
-
-    # NOTE we are treating scalars as ()-shape tensors, those scalars do not
-    # have allocators, and set `view_src = None` for them
-    None
-]
-
-
-_T = TypeVar('_T')
-_TSentinel = TypeVar('_TSentinel')
-
-
-@overload
-def collect_meta(
-    meta: StructuredTensorViewSrc,
-    f: Callable[[ViewSrc], Union[_T, _TSentinel]] = lambda x: x,
-    # use other sentinel value if None is desired.
-    sentinel: _TSentinel = None
-) -> List[_T]: ...
-
-@overload
-def collect_meta(
-    meta: StructuredTensorMeta,
-    f: Callable[[RuntimeTensorMeta], Union[_T, _TSentinel]] = lambda x: x,
-    # use other sentinel value if None is desired.
-    sentinel: _TSentinel = None
-) -> List[_T]: ...
-
-@overload
-def collect_meta(
-    meta: object,
-    f: Callable[[_T], Union[_T, _TSentinel]] = lambda x: x,
-    # use other sentinel value if None is desired.
-    sentinel: _TSentinel = None,
-    *,
-    leaf_type: Type[_T]
-) -> List[_T]: ...
-
-def collect_meta(meta, f = lambda x: x, sentinel = None, leaf_type = (RuntimeTensorMeta, ViewSrc)) -> list:
-    ys = []
-
-    def _collect(x):
-        if isinstance(x, leaf_type):
-            y = f(x)
-            if y is not sentinel:
-                ys.append(y)
-
-    _ = tree_map(meta, _collect)
-
-    return ys
-
-
 def set_node_meta(node: Node, tensor_meta: StructuredTensorMeta):
     node.meta[KEY__METADATA_RUNTIME] = tensor_meta
 
@@ -158,9 +87,126 @@ def get_runtime_metadata_from_scalar(
             ' cannot have associated metadata'
         )
 
+#
+# ViewSrc
+#
 
-def set_node_view_src(node: Node, view_src: StructuredTensorViewSrc):
+
+@dataclasses.dataclass(frozen=True, eq=True)
+class ViewSrc:
+    """
+    `ViewSrc` are Nodes that allocate the memory blocks for the tensors.
+
+    Also, some certain multi-result operation/Node might allocate multiple
+    memory blocks/tensors. Each of these memory blocks are identified with
+    an extra index for the resultant item.
+
+    For example, if one op returns/allocates two individual tensors, subsequent
+    reads/writes on one tensor will not be regarded as dependent on
+    reads/writes of the other tensor. Because their view_srcs are different
+    in the extra index.
+
+    To diferentiate the Tuple[Node, int|None] for one result of multi-result op
+    from Tuple[ViewSrc] for the whole nested structure,
+    make ViewSrc a distinct dataclass.
+
+    TODO if the number of being nested is more than 1, the index needs to be
+    of type Optional[List[int]].
+    """
+    node: Node
+    index: Optional[int]
+
+
+StructuredViewSrc: TypeAlias = Union[
+    ViewSrc,
+    Sequence['StructuredViewSrc'],
+
+    # NOTE we are treating scalars as ()-shape tensors, those scalars do not
+    # have allocators, and set `view_src = None` for them
+    None
+]
+
+
+def set_node_view_src(node: Node, view_src: StructuredViewSrc):
     node.meta[KEY__METADATA_VIEW_SRC] = view_src
 
-def get_node_view_src(node: Node) -> StructuredTensorViewSrc:
+
+def get_node_view_src(node: Node) -> StructuredViewSrc:
     return node.meta[KEY__METADATA_VIEW_SRC]
+
+#
+# Tensor memory address
+# (Auxiliary data to calculate ViewSrc)
+#
+
+
+@dataclasses.dataclass(frozen=True, eq=True)
+class IndexedAddr:
+    """
+    ViewSrc is calculated from the memory address of the tensor. I.e. if two
+    tensors have the same memory address, they share the same ViewSrc.
+
+    Both a single IndexedAddr or the nested StructuredIndexedAddr
+    can be 1:1 mapped to ViewSrc and StructureViewSrc.
+    """
+    addr: int
+    index: Optional[int]
+
+
+StructuredIndexedAddr: TypeAlias = Union[
+    IndexedAddr,
+
+    Sequence['StructuredIndexedAddr'],
+    None
+]
+
+
+#
+# Metadata relevant utils
+#
+def collect_meta(  # type: ignore
+    meta, f=lambda x: x, sentinel=None,
+    *,
+    leaf_type=RuntimeTensorMeta
+):
+    ys = []
+
+    def _collect(x):
+        if isinstance(x, leaf_type):
+            y = f(x)
+            if y is not sentinel:
+                ys.append(y)
+
+    _ = tree_map(meta, _collect)
+
+    return ys
+
+
+_T = TypeVar('_T')
+_TSentinel = TypeVar('_TSentinel')
+_TLeaf = TypeVar('_TLeaf')
+
+# Specialized for TensorMeta
+
+
+@overload
+def collect_meta(
+    meta: StructuredTensorMeta,
+    f: Callable[[RuntimeTensorMeta], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None
+) -> List[_T]: ...
+
+# General cases for whatever nested Node-meta data,
+# specialized for `leaf_type`
+
+
+@overload
+def collect_meta(
+    meta: object,
+    f: Callable[[_TLeaf], Union[_T, _TSentinel]] = lambda x: x,
+    # use other sentinel value if None is desired.
+    sentinel: _TSentinel = None,
+    *,
+    leaf_type: Type[_TLeaf]
+) -> List[_T]: ...

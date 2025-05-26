@@ -27,12 +27,14 @@ class JitSkipped:
 
 jit_skipped = JitSkipped()
 
+
 class JitReleased:
     """
     Represent that the reference to the runtime object,
     i.e. an instance of _RuntimeValue, has been released.
     """
     pass
+
 
 jit_released = JitReleased()
 

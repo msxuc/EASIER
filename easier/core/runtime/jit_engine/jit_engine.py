@@ -1,12 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import dataclasses
-from hmac import new
-from typing import Dict, Final, List, Sequence, Tuple, Union, TypeAlias
+from typing import Dict, Final, List, Tuple, cast
 
 from git import Optional
-from numpy import add
 import torch
 from torch.fx.node import Node
 from torch.fx.graph import Graph
@@ -14,7 +11,7 @@ from torch.fx.graph import Graph
 import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
-from easier.core.passes.life_range_analysis import get_args_end_at
+from easier.core.passes.life_range_analysis import get_nodes_end_at
 from easier.core.passes.utils import \
     FX, tree_map, normalize_reducer_call_into_args, \
     get_called_module, get_attr_value, get_easier_tensors
@@ -25,14 +22,14 @@ from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
     get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, \
-    StructuredTensorViewSrc, collect_meta, set_node_view_src, get_node_view_src
+    StructuredViewSrc, set_node_view_src, get_node_view_src, \
+    IndexedAddr, StructuredIndexedAddr, collect_meta
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
     JitSkipped, jit_skipped, jit_released, evaluate_node, RuntimeValue, \
     allgather_meta_for_collective_input, exchange_meta_for_halo_exchanger, \
     get_aggregator_neutral_value
-from easier.core.utils import logger
 
 
 replica_none_meta = RuntimeTensorMeta(
@@ -108,7 +105,7 @@ def get_value_runtime_metadata(
             # assume being only one level nested.
             assert isinstance(item, torch.Tensor)
             assert isinstance(item_meta, RuntimeTensorMeta)
-            
+
             item_metas.append(item_meta)
 
         item_metas = type(val)(item_metas)  # tuple or list
@@ -168,7 +165,7 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
                 return self.stackframe[x]
             else:
                 return x
-        
+
         args.clear()
         args.extend(
             tree_map(v, _eval) for v in node.args  # type: ignore
@@ -193,39 +190,21 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
         """
         self.stackframe[self.current_node] = res
 
-        # May release stackframe[self.current_node] immediately
-        # if it has no users at all.
-        for ends_here in get_args_end_at(self.current_node):
-            self.stackframe[ends_here] = jit_released
-        
-        # TODO better to check `if get_last_user()==None: return jit_released`
-        # in case `res` get leaked?
+        nodes_end_here = get_nodes_end_at(self.current_node)
+
+        for ending_node in nodes_end_here:
+            # May release stackframe[self.current_node] immediately
+            # if it has no users at all.
+            self.stackframe[ending_node] = jit_released
+
+        if self.current_node in nodes_end_here:
+            # in case `res` get leaked
+            return jit_released
+
         return res
 
-@dataclasses.dataclass
-class IndexedAddr:
-    indexed_addr: Union[int, Tuple[int, int]]
-    # TODO simplify to addr:int and index:int|None ?
 
-    def get_addr(self):
-        if isinstance(self.indexed_addr, int):
-            return self.indexed_addr
-        else:
-            return self.indexed_addr[0]
-    
-
-StructuredIndexedAddr: TypeAlias = Union[
-    IndexedAddr,
-    None,
-    Sequence['StructuredIndexedAddr']
-]
-
-class RefCountBasedViewSrcTracker(NodeHandlerBase):
-    # def preprocess(
-    #     self, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
-    # ) -> PreprocessDecision:
-    #     pass
-
+class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
     def __init__(self) -> None:
         super().__init__()
         self.addr2refcount: Dict[int, int]
@@ -238,7 +217,7 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
     def exit_forward(self):
         self.addr2refcount.clear()
         self.addr2viewsrc.clear()
-    
+
     def _get_indexed_addr(
         self, res,
         *,
@@ -255,25 +234,34 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
         """
         if isinstance(res, torch.Tensor):
             item_iaddr = res.untyped_storage().data_ptr()
-            return IndexedAddr(item_iaddr)
-        
+            return IndexedAddr(item_iaddr, None)
+
         elif isinstance(res, (tuple, list)):
+            if _rec_depth > 0:
+                raise EasierJitException(
+                    "Unexpected nested result with nested depth > 1 from"
+                    f" {self.current_node.format_node()}"
+                )
+
             indexed_addrs = []
             for i, item in enumerate(res):
-                item_iaddr = self._get_indexed_addr(item)
+                item_iaddr = self._get_indexed_addr(
+                    item,
+                    _rec_depth=_rec_depth+1
+                )
 
                 if isinstance(item_iaddr, IndexedAddr):
                     # So far, if the recursive item is IndexedAddr,
                     # it must have a single addr int.
-                    assert isinstance(item_iaddr.indexed_addr, int)
-                    indexed_addr = IndexedAddr(indexed_addr=(item_iaddr.indexed_addr, i))
+                    assert item_iaddr.index is None
+                    indexed_addr = IndexedAddr(item_iaddr.addr, i)
                 else:
                     indexed_addr = None
 
                 indexed_addrs.append(indexed_addr)
 
             return indexed_addrs
-        
+
         elif res is None:
             # TODO assert _rec_depth == 0  # possible?
             return None
@@ -282,28 +270,37 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
             assert _rec_depth == 0, \
                 "Scalars and jit_skipped are always not nested"
             return None
-        
+
         else:
             raise EasierJitException(
                 f"Unexpected runtime value {res} or nested structure"
             )
 
-    
     def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
-        res_struct_iaddr: StructuredIndexedAddr = self._get_indexed_addr(res)
-        res_iaddrs: List[IndexedAddr] = collect_meta(res_struct_iaddr, leaf_type=IndexedAddr)
+        #
+        # Increase ref count;
+        # If previous ref count is 0, set current_node as ViewSrc.
+        #
+        res_siaddr: StructuredIndexedAddr = self._get_indexed_addr(res)
 
-        _list_view_src = []  # TODO tree_map(res_strucu_iaddr)
+        def _to_view_src(
+            res_item_iaddr: Optional[IndexedAddr]
+        ) -> Optional[ViewSrc]:
+            if not isinstance(res_item_iaddr, IndexedAddr):
+                assert res_item_iaddr is None
+                return res_item_iaddr
 
-        for res_iaddr in res_iaddrs:
-            res_item_addr = res_iaddr.get_addr()
-            prev_res_item_addr_refcount = self.addr2refcount.get(res_item_addr, 'first_alloc')
+            res_item_addr = res_item_iaddr.addr
 
-            if prev_res_item_addr_refcount is 'first_alloc':
+            prev_refcount: int
+            if res_item_addr not in self.addr2refcount:
                 self.addr2refcount[res_item_addr] = 0
-                prev_res_item_addr_refcount = 0
-            elif prev_res_item_addr_refcount == 0:
-                logger.debug(f"Reuse memory addr {res_item_addr}")
+                prev_refcount = 0
+            else:
+                prev_refcount = self.addr2refcount[res_item_addr]
+                # if prev_refcount == 0:
+                #     # TODO don't log, it's very frequent, almost per-node
+                #     logger.debug(f"Reuse memory addr {res_item_addr}")
 
             if self.current_node.op == FX.GET_ATTR:
                 # GET_ATTR increases ref count by 2 = 1 + 1:
@@ -315,42 +312,55 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
                 # And it's OK to have multiple extra 1s for esr.Tensor aliases,
                 # as long as it remains `refcount > 0`.
                 self.addr2refcount[res_item_addr] += 2
-            
             else:
                 self.addr2refcount[res_item_addr] += 1
 
-            if prev_res_item_addr_refcount == 0:
+            if prev_refcount == 0:
                 # Find an allocator
-                if isinstance(res_iaddr.indexed_addr, int):
-                    res_item_view_src = ViewSrc(self.current_node)
-                else:
-                    res_item_view_src = ViewSrc((self.current_node, res_iaddr.indexed_addr[1]))
-
+                res_item_view_src = ViewSrc(
+                    self.current_node, res_item_iaddr.index
+                )
                 self.addr2viewsrc[res_item_addr] = res_item_view_src
             else:
                 res_item_view_src = self.addr2viewsrc[res_item_addr]
-            
-            _list_view_src.append(res_item_view_src)
-            
-        set_node_view_src(self.current_node, _list_view_src)
-        
-        for ends_here in get_args_end_at(self.current_node):
-            # If cur_node has no users, it ends at itself immediately.
-            if ends_here is self.current_node:
-                # not in stackframe yet
-                end_val = res
 
+            return res_item_view_src
+        # enddef _to_view_src()
+
+        #
+        # Determine the (nested) ViewSrc and let subclasses handle it.
+        #
+        res_view_src = cast(
+            StructuredViewSrc,
+            tree_map(res_siaddr, _to_view_src)
+        )
+
+        self.handle_view_src(res_view_src)
+
+        #
+        # Decrease ref count.
+        #
+        for node_ends_here in get_nodes_end_at(self.current_node):
+            # If cur_node has no users, it ends at itself immediately.
+            if node_ends_here is self.current_node:
+                # but cur res is not in stackframe yet
+                end_val = res
             else:
-                end_val = self.stackframe[ends_here]
-            # NOTE for multi-res Nodes, the stackframe[ends_here:Node] will
+                end_val = self.stackframe[node_ends_here]
+            # For multi-res Nodes, the stackframe[ends_here:Node] will
             # be a nested structure -- it gets unpacked in following
             # operator.getitem Nodes.
 
-            end_struct_iaddr: StructuredIndexedAddr = self._get_indexed_addr(end_val)
-            end_iaddrs: List[IndexedAddr] = collect_meta(end_struct_iaddr, leaf_type=IndexedAddr)
+            # NOTE currently for the sake of simplicity _get_indexed_addr()
+            # cannot handle nester layer > 1, so we cannot concat `env_val`s
+            # into a list first.
+            end_siaddr: StructuredIndexedAddr = self._get_indexed_addr(end_val)
+            end_item_iaddrs: List[IndexedAddr] = collect_meta(
+                end_siaddr, leaf_type=IndexedAddr
+            )
 
-            for end_iaddr in end_iaddrs:
-                end_item_addr = end_iaddr.get_addr()
+            for end_item_iaddr in end_item_iaddrs:
+                end_item_addr = end_item_iaddr.addr
                 self.addr2refcount[end_item_addr] -= 1
 
                 if self.addr2refcount[end_item_addr] == 0:
@@ -358,145 +368,25 @@ class RefCountBasedViewSrcTracker(NodeHandlerBase):
 
         return res
 
-class RefCountBasedViewSrcValidation(NodeHandlerBase):
+    def handle_view_src(self, view_src: StructuredViewSrc) -> None:
+        pass
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.addr2refcount: Dict[int, int]
-        self.addr2viewsrc: Dict[int, ViewSrc]
 
-    def enter_forward(self):
-        self.addr2refcount = {}
-        self.addr2viewsrc = {}
+class FirstRunRefCountBasedViewSrcTracker(RefCountBasedViewSrcHandlerBase):
+    def handle_view_src(self, view_src: StructuredViewSrc) -> None:
+        set_node_view_src(self.current_node, view_src)
 
-    def exit_forward(self):
-        self.addr2refcount.clear()
-        self.addr2viewsrc.clear()
-    
-    def _get_indexed_addr(
-        self, res,
-        *,
-        _rec_depth=0  # debug-only
-    ) -> StructuredIndexedAddr:
-        """
-        Each resultant item tuple is:
-        an addr int with either a) None, b) an index within multi-result.
 
-        Addr int will become Node, with memory block lifetime taken into
-        consideration, which means:
-        ......
-        and these two cases are exactly the cases for ViewSrc.
-        """
-        if isinstance(res, torch.Tensor):
-            item_iaddr = res.untyped_storage().data_ptr()
-            return IndexedAddr(item_iaddr)
-        
-        elif isinstance(res, (tuple, list)):
-            indexed_addrs = []
-            for i, item in enumerate(res):
-                item_iaddr = self._get_indexed_addr(item)
-
-                if isinstance(item_iaddr, IndexedAddr):
-                    # So far, if the recursive item is IndexedAddr,
-                    # it must have a single addr int.
-                    assert isinstance(item_iaddr.indexed_addr, int)
-                    indexed_addr = IndexedAddr(indexed_addr=(item_iaddr.indexed_addr, i))
-                else:
-                    indexed_addr = None
-
-                indexed_addrs.append(indexed_addr)
-
-            return indexed_addrs
-        
-        elif res is None:
-            # TODO assert _rec_depth == 0  # possible?
-            return None
-
-        elif res is jit_skipped or isinstance(res, (int, float, bool)):
-            assert _rec_depth == 0, \
-                "Scalars and jit_skipped are always not nested"
-            return None
-        
-        else:
-            raise EasierJitException(
-                f"Unexpected runtime value {res} or nested structure"
-            )
-
-    
-    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
-        res_struct_iaddr: StructuredIndexedAddr = self._get_indexed_addr(res)
-        res_iaddrs: List[IndexedAddr] = collect_meta(res_struct_iaddr, leaf_type=IndexedAddr)
-
-        _list_view_src = []  # TODO tree_map(res_strucu_iaddr)
-
-        for res_iaddr in res_iaddrs:
-            res_item_addr = res_iaddr.get_addr()
-            prev_res_item_addr_refcount = self.addr2refcount.get(res_item_addr, 'first_alloc')
-
-            if prev_res_item_addr_refcount is 'first_alloc':
-                self.addr2refcount[res_item_addr] = 0
-                prev_res_item_addr_refcount = 0
-            elif prev_res_item_addr_refcount == 0:
-                logger.debug(f"Reuse memory addr {res_item_addr}")
-
-            if self.current_node.op == FX.GET_ATTR:
-                # GET_ATTR increases ref count by 2 = 1 + 1:
-                # - 1 ref count is because of the local variable of GET_ATTR
-                # - 1 extra ref count is because of everlasting esr.Tensor
-                #   instance that will never be released,
-                #   even all local variables of GET_ATTR die out.
-                #
-                # And it's OK to have multiple extra 1s for esr.Tensor aliases,
-                # as long as it remains `refcount > 0`.
-                self.addr2refcount[res_item_addr] += 2
-            
-            else:
-                self.addr2refcount[res_item_addr] += 1
-
-            if prev_res_item_addr_refcount == 0:
-                # Find an allocator
-                if isinstance(res_iaddr.indexed_addr, int):
-                    res_item_view_src = ViewSrc(self.current_node)
-                else:
-                    res_item_view_src = ViewSrc((self.current_node, res_iaddr.indexed_addr[1]))
-
-                self.addr2viewsrc[res_item_addr] = res_item_view_src
-            else:
-                res_item_view_src = self.addr2viewsrc[res_item_addr]
-            
-            _list_view_src.append(res_item_view_src)
-            
-        view_src = get_node_view_src(self.current_node)
-        if view_src != _list_view_src:
+class RefCountBasedViewSrcValidation(RefCountBasedViewSrcHandlerBase):
+    def handle_view_src(self, view_src: StructuredViewSrc) -> None:
+        prev_view_src = get_node_view_src(self.current_node)
+        if prev_view_src != view_src:
             raise EasierJitException(
                 "The allocator of the result tensor of the operation"
                 f" '{self.current_node.target}' changes:"
-                f" {_list_view_src} => {view_src}"
+                f" {prev_view_src} => {view_src}"
             )
-    
-        for ends_here in get_args_end_at(self.current_node):
-            # If cur_node has no users, it ends at itself immediately.
-            if ends_here is self.current_node:
-                # not in stackframe yet
-                end_val = res
 
-            else:
-                end_val = self.stackframe[ends_here]
-            # NOTE for multi-res Nodes, the stackframe[ends_here:Node] will
-            # be a nested structure -- it gets unpacked in following
-            # operator.getitem Nodes.
-
-            end_struct_iaddr: StructuredIndexedAddr = self._get_indexed_addr(end_val)
-            end_iaddrs: List[IndexedAddr] = collect_meta(end_struct_iaddr, leaf_type=IndexedAddr)
-
-            for end_iaddr in end_iaddrs:
-                end_item_addr = end_iaddr.get_addr()
-                self.addr2refcount[end_item_addr] -= 1
-
-                if self.addr2refcount[end_item_addr] == 0:
-                    del self.addr2viewsrc[end_item_addr]
-
-        return res
 
 class MetadataValidation(NodeHandlerBase):
     """
@@ -994,6 +884,7 @@ class NotFullReducerOutputAllocation(NodeHandlerBase):
     this Handler will not be run, this will be skipped because of
     either SkipZeroLengthNonHalo for runtime or FirstRunReducerMetaProp.
     """
+
     def __init__(self):
         super().__init__()
 
@@ -1068,7 +959,7 @@ class JitEngine:
 
             # ->
             # <- Updates refcount and sets view_src
-            RefCountBasedViewSrcTracker(),
+            FirstRunRefCountBasedViewSrcTracker(),
 
             # -> Calculates expected role and batchsize --/
             # -> if to skip and not sum/halo etc.: SKIP_EVAL --\--------
@@ -1136,6 +1027,22 @@ class JitEngine:
             h.current_module = self.module
             h.current_graph = self.graph
 
+    def compile_before_first_run(self):
+        ms, gs = [self.module], [self.graph]
+
+        ms, gs = passes.analyze_life_range(ms, gs)
+
+        [self.module], [self.graph] = ms, gs
+
+    def compile_after_first_run(self):
+        ms, gs = [self.module], [self.graph]
+
+        ms, gs = passes.analyze_data_dependency(ms, gs)
+        # ms, gs = passes.fuse(ms, gs)
+        # ms, gs = passes.codegen(ms, gs)
+
+        [self.module], [self.graph] = ms, gs
+
     def forward(self):
         """
         Run registered Handlers before and after evaluating each Node:
@@ -1149,11 +1056,7 @@ class JitEngine:
             node evaluation result.
         """
         if self.run_count == 0:
-            ms, gs = [self.module], [self.graph]
-
-            ms, gs = passes.analyze_life_range(ms, gs)
-
-            [self.module], [self.graph] = ms, gs
+            self.compile_before_first_run()
             self._update_handlers(self.first_run_handlers)
             handlers = self.first_run_handlers
         else:
@@ -1203,13 +1106,7 @@ class JitEngine:
             del h.stackframe  # avoid leaking local variable stackframe
 
         if self.run_count == 0:
-            ms, gs = [self.module], [self.graph]
-
-            # ms, gs = passes.analyze_data_dependency(ms, gs)
-            # ms, gs = passes.fuse(ms, gs)
-            # ms, gs = passes.codegen(ms, gs)
-
-            [self.module], [self.graph] = ms, gs
+            self.compile_after_first_run()
             self._update_handlers(self.runtime_handlers)
 
         self.run_count += 1

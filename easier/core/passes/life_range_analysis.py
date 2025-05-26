@@ -11,7 +11,8 @@ from easier.core.passes.utils import EasierInterpreter
 
 
 KEY__LAST_USER = 'easier_lifeRange_lastUser'
-KEY__ARGS_END_HERE = 'easier_lifeRange_argsEndHere'
+KEY__NODES_END_HERE = 'easier_lifeRange_nodesEndHere'
+
 
 def get_last_user(node: Node) -> Optional[Node]:
     """
@@ -20,18 +21,18 @@ def get_last_user(node: Node) -> Optional[Node]:
     """
     return node.meta[KEY__LAST_USER]
 
-def get_args_end_at(node: Node) -> List[Node]:
-    """
-    Get the argument Nodes of `node` whose last user is also `node`,
-    i.e. argument Nodes whose life ranges end at `node`.
 
-    A Node without users end at itself immediately.
+def get_nodes_end_at(node: Node) -> List[Node]:
+    """
+    Get Nodes whose life ranges end at the specified `node`, including:
+    -   the argument Nodes of `node` whose last user is `node`;
+    -   Node without users end at itself immediately.
 
     For example, at runtime, after evaluating `node`,
     jit_engine.values.RuntimeValues for those argument Nodes can be freed
     (this does not mean the underlying tensor memory is freed too).
     """
-    return node.meta[KEY__ARGS_END_HERE]
+    return node.meta[KEY__NODES_END_HERE]
 
 
 class LifeRangeAnalyzer(EasierInterpreter):
@@ -46,10 +47,10 @@ class LifeRangeAnalyzer(EasierInterpreter):
 
         for i, n in enumerate(g.nodes):
             self.node2offset[n] = i
-    
+
     def for_each_node(self):
         # If no previous for_each_node added LAST_USES, still add a [].
-        self.current_node.meta.setdefault(KEY__ARGS_END_HERE, [])
+        self.current_node.meta.setdefault(KEY__NODES_END_HERE, [])
 
         if len(self.current_node.users) == 0:
             self.current_node.meta[KEY__LAST_USER] = None
@@ -69,7 +70,7 @@ class LifeRangeAnalyzer(EasierInterpreter):
             self.current_node.meta[KEY__LAST_USER] = range_end
 
         range_end.meta.setdefault(
-            KEY__ARGS_END_HERE, []
+            KEY__NODES_END_HERE, []
         ).append(self.current_node)
 
 
@@ -89,7 +90,7 @@ def analyze_life_range(modules: List[esr.Module], graphs: List[Graph]):
     a two-level reference-count relation:
 
         Node -> torch.Tensor -> tensor's physical memory
-    
+
     It's beneficial for EASIER to know those Nodes' life ranges,
     so that we can decrement one reference count on the tensor,
     and let Python GC the memory in time.

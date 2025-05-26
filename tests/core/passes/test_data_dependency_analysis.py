@@ -1,11 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Iterable, List, Set, cast, Union
+import contextlib
+from typing import Dict, Iterable, List, Set, Union, cast
+from httpx import patch
 import pytest
 import torch
+from unittest.mock import patch
 
 from torch.fx.node import Node
+from torch.fx.graph import Graph
 
 from easier.core.jit import EasierTracer
 
@@ -13,13 +17,22 @@ from easier.core.module import Reducer, Tensor
 from easier.core.passes.data_dependency_analysis import \
     get_data_dependency_inputs, get_data_dependency_users, \
     KEY__DATA_DEPENDENCY_USERS, KEY__DATA_DEPENDENCY_INPUTS
-from easier.core.runtime.metadata import \
-    ViewSrc, get_node_meta, RuntimeTensorMeta
-from easier.core.runtime.jit_engine.jit_engine import \
-    JitEngine
+from easier.core.runtime.metadata import ViewSrc, get_node_view_src
+from easier.core.runtime.jit_engine.jit_engine import JitEngine as _orig_JE
 from easier.core import passes
 import easier as esr
 from easier.core.passes.utils import FX
+
+
+class JitEngine(_orig_JE):
+    """
+    After 1st run, do data dependency analysis only.
+    """
+
+    def compile_after_first_run(self):
+        ms, gs = [self.module], [self.graph]
+        ms, gs = passes.analyze_data_dependency(ms, gs)
+        [self.module], [self.graph] = ms, gs
 
 
 def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):
@@ -43,10 +56,13 @@ def _assert_deps(inputs: Dict[Node, List[Node]], nodes: Iterable[Node]):
         assert users_sets.get(n, set()) == set(get_data_dependency_users(n))
 
 
-def _get_viewsrc(node: Node) -> Union[None, ViewSrc]:
-    meta = get_node_meta(node)
-    assert isinstance(meta, RuntimeTensorMeta)
-    return meta.view_src
+def _get_viewsrc_node(node: Node) -> Union[Node, None]:
+    view_src = get_node_view_src(node)
+    if view_src is None:
+        return None
+    else:
+        assert isinstance(view_src, ViewSrc)
+        return view_src.node
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
@@ -66,9 +82,8 @@ def test_data_dependency__none():
     from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
-    stackframe = JitEngine(m, graph).forward()
 
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+    JitEngine(m, graph).forward()
 
     get_v, mul, add, sub, sum, output = graph.nodes
 
@@ -102,23 +117,21 @@ def test_data_dependency__two_path_inplace():
     from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
-    stackframe = JitEngine(m, graph).forward()
-
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+    JitEngine(m, graph).forward()
 
     v22, view22, v55, r55_22_v22, a22_add, set1, \
         aview22, r55_22_a22, add_, sub_, output = graph.nodes
 
-    assert _get_viewsrc(v22) == v22
-    assert _get_viewsrc(view22) == v22
-    assert _get_viewsrc(v55) == v55
-    assert _get_viewsrc(r55_22_v22) == v22
-    assert _get_viewsrc(a22_add) == a22_add
-    assert _get_viewsrc(set1) == v22
-    assert _get_viewsrc(aview22) == a22_add
-    assert _get_viewsrc(r55_22_a22) == a22_add
-    assert _get_viewsrc(add_) == v22
-    assert _get_viewsrc(sub_) == v22
+    assert _get_viewsrc_node(v22) == v22
+    assert _get_viewsrc_node(view22) == v22
+    assert _get_viewsrc_node(v55) == v55
+    assert _get_viewsrc_node(r55_22_v22) == v22
+    assert _get_viewsrc_node(a22_add) == a22_add
+    assert _get_viewsrc_node(set1) == v22
+    assert _get_viewsrc_node(aview22) == a22_add
+    assert _get_viewsrc_node(r55_22_a22) == a22_add
+    assert _get_viewsrc_node(add_) == v22
+    assert _get_viewsrc_node(sub_) == v22
 
     _assert_deps({
         r55_22_v22: [view22],
@@ -148,18 +161,16 @@ def test_data_dependency__undetermined():
     from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
-    stackframe = JitEngine(m, graph).forward()
-
-    [jm], [graph] = passes.analyze_data_dependency([m], [graph])
+    JitEngine(m, graph).forward()
 
     v, a, b, c, d, e, output = graph.nodes
 
-    assert _get_viewsrc(v) == v
-    assert _get_viewsrc(a) == v
-    assert _get_viewsrc(b) == v
-    assert _get_viewsrc(c) == v
-    assert _get_viewsrc(d) == d
-    assert _get_viewsrc(e) == d
+    assert _get_viewsrc_node(v) == v
+    assert _get_viewsrc_node(a) == v
+    assert _get_viewsrc_node(b) == v
+    assert _get_viewsrc_node(c) == v
+    assert _get_viewsrc_node(d) == d
+    assert _get_viewsrc_node(e) == d
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
@@ -213,15 +224,15 @@ def test_data_dependency_nested_call():
         a_view2, mul, set_a2, output \
         = graph.nodes
 
-    assert _get_viewsrc(get_attr) == get_attr
-    assert _get_viewsrc(a) == get_attr
-    assert _get_viewsrc(a_view) == get_attr
-    assert _get_viewsrc(add) == add  # view=a[:]; add=view+1; set(a,add)
-    assert _get_viewsrc(set_a) == get_attr
-    assert _get_viewsrc(call_intermediate) == None
-    assert _get_viewsrc(a_view2) == get_attr
-    assert _get_viewsrc(mul) == mul
-    assert _get_viewsrc(set_a2) == get_attr
+    assert _get_viewsrc_node(get_attr) == get_attr
+    assert _get_viewsrc_node(a) == get_attr
+    assert _get_viewsrc_node(a_view) == get_attr
+    assert _get_viewsrc_node(add) == add  # view=a[:]; add=view+1; set(a,add)
+    assert _get_viewsrc_node(set_a) == get_attr
+    assert _get_viewsrc_node(call_intermediate) == None
+    assert _get_viewsrc_node(a_view2) == get_attr
+    assert _get_viewsrc_node(mul) == mul
+    assert _get_viewsrc_node(set_a2) == get_attr
 
     _assert_deps({
         set_a: [a_view],
