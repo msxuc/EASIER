@@ -116,6 +116,20 @@ class ViewSrc:
     index: Optional[int]
 
 
+# TODO we might not define StructuredViewSrc in this recursive way,
+# and it is also not well supported by Python type checkers.
+# A more intuitive alternative is:
+#       StructuredViewSrc = ViewSrc | Dict[int, ViewSrc]
+#
+# or even simplier: Dict[int|None, ViewSrc]
+# (when deeper nested-ness is allowed, keys become List[int])
+#
+# - With this definition we can "collect" by simply dict.values()
+# - Perhaps suitable for TensorMeta too, but we may want to reconstruct the
+#   Tuple[TensorMeta,...] in log, since it reflects the nested nature of
+#   runtime value tuple better.
+
+
 StructuredViewSrc: TypeAlias = Union[
     ViewSrc,
     Sequence['StructuredViewSrc'],
@@ -142,11 +156,18 @@ def get_node_view_src(node: Node) -> StructuredViewSrc:
 @dataclasses.dataclass(frozen=True, eq=True)
 class IndexedAddr:
     """
+    IndexedAddr captures the memory address of the runtime value of a Node,
+    with an extra index to indicate if the Node is multi-result.
+
     ViewSrc is calculated from the memory address of the tensor. I.e. if two
     tensors have the same memory address, they share the same ViewSrc.
+    When the current_node is the allocator of the memory, we can 1:1 map:
 
-    Both a single IndexedAddr or the nested StructuredIndexedAddr
-    can be 1:1 mapped to ViewSrc and StructureViewSrc.
+        IndexedAddr(addr, index:int|None) |-> ViewSrc(current_node, index)
+
+    If current_node is not the allocator, it means the addr was allocated
+    earlier, the true ViewSrc was already stored in the stackframe.
+    In such cases, IndexedAddr.index can be ignored.
     """
     addr: int
     index: Optional[int]

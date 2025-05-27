@@ -204,6 +204,23 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
 
 
 class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
+    """
+    Maintain the ref count on the memory address.
+    During the period that memory address is still referenced, we know the
+    determined ViewSrc/allocator of it is still valid.
+
+    When the ref count is decreased to 0, we reset the ViewSrc relationship.
+    Namely, if PyTorch decides to reuse that memory address, another ViewSrc
+    will be related.
+
+    P.S. In the worst case that we maintained ref count wrongly
+    (for example, some Handler happens to leak the tensor instance),
+    ref count here still aligns with the most fundamental expectation
+    of memory lifetime, at the price of memory not reusable,
+    but not wrong read/write.
+    )
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.addr2refcount: Dict[int, int]
@@ -226,10 +243,12 @@ class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
         Each resultant item tuple is:
         an addr int with either a) None, b) an index within multi-result.
 
-        Addr int will become Node, with memory block lifetime taken into
-        consideration, which means:
-        ......
-        and these two cases are exactly the cases for ViewSrc.
+        When the ref count is increased 0 -> 1, we know the addr is allocated
+        by current_node, and we map
+        IndexedAddr(addr:int, index:int|None) |-> ViewSrc(current_node, index)
+
+        Otherwise, although we have an index, it's irrelevant, because the addr
+        with refcount > 0 indicates the memory was allocated earlier.
         """
         if isinstance(res, torch.Tensor):
             item_iaddr = res.untyped_storage().data_ptr()
@@ -321,6 +340,8 @@ class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
                 )
                 self.addr2viewsrc[res_item_addr] = res_item_view_src
             else:
+                # The addr was allocated earilier. The iaddr.index will not
+                # be considered.
                 res_item_view_src = self.addr2viewsrc[res_item_addr]
 
             return res_item_view_src
