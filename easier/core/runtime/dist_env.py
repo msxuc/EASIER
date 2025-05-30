@@ -917,6 +917,9 @@ class CommBackendConfig:
             return list(self._config.values())
 
     def backend_specific_setup(self):
+        """
+        Firstly called in esr.init()
+        """
         for backend in self.get_backends():
             if backend == 'nccl':
                 # Validate if CUDA is available and CUDA device number
@@ -955,6 +958,41 @@ class CommBackendConfig:
                         "The communication backend 'mpi' is not supported by"
                         " the PyTorch package"
                     )
+    
+    def device_specific_setup(self, device_type):
+        """
+        Firstly called in esr.compile(). Only till this point can we know
+        if specific devices exist (from users' intention: --device/--backend)
+        
+        During esr.init() and esr.compile(), if users need to do
+        device-specific operations, like explicitly use mpi4py on CUDA tensors,
+        users must ensure both PyTorch + MPI/OB1/UCX are configured correctly,
+        and tensors/DataLoaders-before-compile are on correct devices.
+        """
+        for backend in self.get_backends():
+            if backend == 'mpi':
+                if device_type == 'cuda':
+                    if not torch.cuda.is_available():
+                        raise EasierJitException(
+                            "'cuda' device is specified"
+                            " but CUDA is not available"
+                        )
+                    if self.get_local_rank() >= torch.cuda.device_count():
+                        raise EasierJitException(
+                            "To use 'cuda' device under the communication"
+                            " backend 'mpi' requires each process"
+                            " has a dedicated CUDA device."
+                            " This machine has only"
+                            f" {torch.cuda.device_count()} CUDA device(s).\n"
+                            "If CUDA devices are not the intended computing"
+                            "devices, consider explicitly specifying"
+                            " devices/backends excluding 'cuda'"
+                        )
+                    cuda_device = torch.device('cuda', self.get_local_rank())
+                    logger.info(f"Set default CUDA device: {cuda_device}")
+                    torch.cuda.set_device(cuda_device)
+
+    
 
     def _ensure_known_backend_devicetype_compatibility(
         self, comm_backend, device_type
@@ -1089,6 +1127,8 @@ def set_dist_env_runtime_device_type(
     # TODO leaving this unchecked enable multiple runs of esr.compile
     # assert _runtime_device_type is None
     _runtime_device_type = comm_device_type
+
+    _comm_backend_config.device_specific_setup(comm_device_type)
 
 
 def _get_or_init_dist_env(device_type: str) -> DistEnv:
