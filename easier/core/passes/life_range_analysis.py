@@ -41,12 +41,12 @@ class LifeRangeAnalyzer(EasierInterpreter):
 
         self.node2offset: Dict[Node, int] = {}
 
-        assert len(graphs) == 1, \
-            "Avoid mixing 0-based Node offsets from multiple Graphs"
-        g = graphs[0]
+        for g in graphs:
+            for i, n in enumerate(g.nodes):
+                assert n not in self.node2offset, \
+                    "Nodes won't be shared by multiple Graphs"
 
-        for i, n in enumerate(g.nodes):
-            self.node2offset[n] = i
+                self.node2offset[n] = i
 
     def for_each_node(self):
         # If no previous for_each_node added LAST_USES, still add a [].

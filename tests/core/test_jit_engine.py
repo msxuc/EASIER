@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 import operator
-from typing import List, cast
+from typing import Dict, List, cast
 import pytest
 import torch
 
@@ -376,28 +376,36 @@ class TestViewSrc:
         called_watcher = []
 
         class _ValueStubHandler(NodeHandlerBase):
-            def preprocess(self, args, kwargs):
-                if self.current_node.target in [
+            def preprocess(self,         current_node: Node, args, kwargs):
+                if current_node.target in [
                     torch.cholesky_inverse, torch.cholesky
                 ]:
                     return PreprocessDecision.SKIP_EVAL
                 else:
                     return PreprocessDecision.CONTINUE
 
-            def postprocess(self, res, args, kwargs):
+            def postprocess(self,        current_node: Node, res, args, kwargs):
                 if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
                     called_watcher.append(1)
                     return same_memory
                 else:
                     return res
 
+        class _TestCaseJitEngine(JitEngine):
+            def create_first_run_handlers(self, stackframe):
+                handlers = super().create_first_run_handlers(stackframe)
+                handlers.append(_ValueStubHandler(self.module, stackframe))
+                return handlers
+
+            def compile_after_first_run(self):
+                pass
+
         m = M()
         graph = EasierTracer().trace(m)
 
         _fully_load_data_backend_none([m], 'cpu')
-        engine = JitEngine(m, graph)
-        engine.first_run_handlers.append(_ValueStubHandler())
-        engine.compile_after_first_run = lambda: None
+
+        engine = _TestCaseJitEngine(m, graph)
         engine.forward()
 
         assert called_watcher == [1, 1]  # called twice
@@ -437,13 +445,13 @@ class TestViewSrc:
         called_watcher = []
 
         class _ValueStubHandler(NodeHandlerBase):
-            def preprocess(self, args, kwargs):
-                if self.current_node.target is torch.svd:
+            def preprocess(self,        current_node: Node, args, kwargs):
+                if current_node.target is torch.svd:
                     return PreprocessDecision.SKIP_EVAL
                 else:
                     return PreprocessDecision.CONTINUE
 
-            def postprocess(self, res, args, kwargs):
+            def postprocess(self,        current_node: Node, res, args, kwargs):
                 if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
 
                     called_watcher.append(1)
@@ -453,13 +461,21 @@ class TestViewSrc:
                 else:
                     return res
 
+        class _TestCaseJitEngine(JitEngine):
+            def create_first_run_handlers(self, stackframe):
+                handlers = super().create_first_run_handlers(stackframe)
+                handlers.append(_ValueStubHandler(self.module, stackframe))
+                return handlers
+
+            def compile_after_first_run(self):
+                pass
+
         m = M()
         graph = EasierTracer().trace(m)
 
         _fully_load_data_backend_none([m], 'cpu')
-        engine = JitEngine(m, graph)
-        engine.first_run_handlers.append(_ValueStubHandler())
-        engine.compile_after_first_run = lambda: None
+
+        engine = _TestCaseJitEngine(m, graph)
         engine.forward()
 
         assert called_watcher == [1]

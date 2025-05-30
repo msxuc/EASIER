@@ -402,16 +402,13 @@ def compile(
         modules, graphs = passes.bind_reducer(modules, graphs)
         modules, graphs = passes.group_tensors(modules, graphs)
 
-        # modules, graphs = passes.analyze_data_dependency(modules, graphs)
-
         modules, graphs = passes.partition_tensor_groups(modules, graphs)
         modules, graphs = passes.encode_sparsity(modules, graphs)
 
         modules, graphs = passes.distribute_dataflow(modules, graphs)
+    # endif of loaeded_graphs
 
-        # modules, graphs = passes.fuse_dataflow(modules, graphs)
-
-        # modules, graphs = passes.generate_code(modules, backend, graphs)
+    modules, graphs = passes.analyze_life_range(modules, graphs)
 
     for m, g in zip(modules, graphs):
         jit_engine = JitEngine(m, g)

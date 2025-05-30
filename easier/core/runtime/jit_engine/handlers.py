@@ -36,40 +36,27 @@ class PreprocessDecision(enum.Enum):
 
 
 class NodeHandlerBase:
-    def __init__(self):
+    def __init__(
+        self, module: esr.Module, stackframe: Dict[Node, RuntimeValue]
+    ):
         #
         # Context variables, the lifetime is the scope of `Module.forward()`
         #
         # Because JIT time passes may change the module and the graph, we don't
         # use Handler.__init__() to bind them. JitEngine will bind them.
         # =================
-        self.current_module: esr.Module
-        self.current_graph: Graph
-        self.stackframe: Dict[Node, RuntimeValue]
-
-        #
-        # Context variables, the lifetime is the execution period of a Node.
-        # =================
-        self.current_node: Node
+        self.current_module = module
+        self.stackframe = stackframe
 
         # When postprocess() gets run, the implementation could access the
         # resultant decision of its preprocess() subprocedure.
         self.preprocess_decision: PreprocessDecision
 
-    def enter_forward(self) -> None:
-        """
-        Graph-level states of derived Handlers should be initialized here.
-        """
-        pass
-
-    def exit_forward(self) -> None:
-        """
-        Graph-level states of derived Handlers should be cleaned up here.
-        """
-        pass
-
     def preprocess(
-        self, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+        self,
+        current_node: Node,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
         """
         A registered derived Handler can inspect and modify `args/kwargs`
@@ -86,10 +73,9 @@ class NodeHandlerBase:
             The mutable argument collection to inspect and modify.
         """
         root = self.current_module
-        node = self.current_node
 
-        if node.op == FX.GET_ATTR:
-            path = cast(str, node.target)
+        if current_node.op == FX.GET_ATTR:
+            path = cast(str, current_node.target)
             submod_path, _sep, attr_name = path.rpartition(".")
             submod = root.get_submodule(submod_path)
             obj = getattr(submod, attr_name)
@@ -101,36 +87,45 @@ class NodeHandlerBase:
                 )
 
             assert len(args) == len(kwargs) == 0
-            decision = self.preprocess_get_attr(submod_path, attr_name, obj)
+            decision = self.preprocess_get_attr(
+                current_node, submod_path, attr_name, obj
+            )
 
-        elif node.op == FX.CALL_FUNCTION:
-            assert callable(node.target)
-            decision = self.preprocess_call_function(node.target, args, kwargs)
+        elif current_node.op == FX.CALL_FUNCTION:
+            assert callable(current_node.target)
+            decision = self.preprocess_call_function(
+                current_node, current_node.target, args, kwargs
+            )
 
-        elif node.op == FX.CALL_METHOD:
-            assert isinstance(node.target, str)
-            decision = self.preprocess_call_method(node.target, args, kwargs)
+        elif current_node.op == FX.CALL_METHOD:
+            assert isinstance(current_node.target, str)
+            decision = self.preprocess_call_method(
+                current_node, current_node.target, args, kwargs
+            )
 
-        elif node.op == FX.CALL_MODULE:
-            submod_path = cast(str, node.target)
+        elif current_node.op == FX.CALL_MODULE:
+            submod_path = cast(str, current_node.target)
             callee = root.get_submodule(submod_path)
-            decision = self.preprocess_call_module(callee, args, kwargs)
+            decision = self.preprocess_call_module(
+                current_node, callee, args, kwargs
+            )
 
-        elif node.op == FX.OUTPUT:
+        elif current_node.op == FX.OUTPUT:
             decision = self.preprocess_output()
 
         else:
-            assert False, f"Unexpected FX Node op {node.op}"
+            assert False, f"Unexpected FX Node op {current_node.op}"
 
         return decision
 
     def preprocess_get_attr(
-        self, submod_path: str, attr_name: str, attr_val
+        self,        current_node: Node, submod_path: str, attr_name: str, attr_val
     ) -> PreprocessDecision:
         return PreprocessDecision.CONTINUE
 
     def preprocess_call_function(
         self,
+        current_node: Node,
         function: Callable,
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
@@ -139,6 +134,7 @@ class NodeHandlerBase:
 
     def preprocess_call_method(
         self,
+        current_node: Node,
         method_name: str,
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
@@ -147,6 +143,7 @@ class NodeHandlerBase:
 
     def preprocess_function_or_method(
         self,
+        current_node: Node,
         function_or_method_name: Union[Callable, str],
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
@@ -155,6 +152,7 @@ class NodeHandlerBase:
 
     def preprocess_call_module(
         self,
+        current_node: Node,
         submod: torch.nn.Module,
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
@@ -166,6 +164,7 @@ class NodeHandlerBase:
 
     def postprocess(
         self,
+        current_node: Node,
         res: RuntimeValue,
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
