@@ -119,7 +119,7 @@ class NodeHandlerBase:
         return decision
 
     def preprocess_get_attr(
-        self,        current_node: Node, submod_path: str, attr_name: str, attr_val
+        self, current_node: Node, submod_path: str, attr_name: str, attr_val
     ) -> PreprocessDecision:
         return PreprocessDecision.CONTINUE
 
@@ -130,7 +130,9 @@ class NodeHandlerBase:
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
-        return self.preprocess_function_or_method(function, args, kwargs)
+        return self.preprocess_function_or_method(
+            current_node, function, args, kwargs
+        )
 
     def preprocess_call_method(
         self,
@@ -139,7 +141,9 @@ class NodeHandlerBase:
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
-        return self.preprocess_function_or_method(method_name, args, kwargs)
+        return self.preprocess_function_or_method(
+            current_node, method_name, args, kwargs
+        )
 
     def preprocess_function_or_method(
         self,

@@ -81,6 +81,7 @@ def test_data_dependency__none():
     m = M()
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
+    passes.analyze_life_range([m], [graph])
 
     JitEngine(m, graph).forward()
 
@@ -116,6 +117,7 @@ def test_data_dependency__two_path_inplace():
     from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
+    passes.analyze_life_range([m], [graph])
     JitEngine(m, graph).forward()
 
     v22, view22, v55, r55_22_v22, a22_add, set1, \
@@ -160,6 +162,7 @@ def test_data_dependency__undetermined():
     from easier.core.jit import _fully_load_data_backend_none
     _fully_load_data_backend_none([m], 'cpu')
     graph = EasierTracer().trace(m)
+    passes.analyze_life_range([m], [graph])
     JitEngine(m, graph).forward()
 
     v, a, b, c, d, e, output = graph.nodes
@@ -268,13 +271,13 @@ def test_multi_res_separated_dep_subgraphs():
     called_watcher = []
 
     class _ValueStubHandler(NodeHandlerBase):
-        def preprocess(self, args, kwargs):
-            if self.current_node.target is torch.svd:
+        def preprocess(self, current_node: Node, args, kwargs):
+            if current_node.target is torch.svd:
                 return PreprocessDecision.SKIP_EVAL
             else:
                 return PreprocessDecision.CONTINUE
 
-        def postprocess(self, res, args, kwargs):
+        def postprocess(self, current_node, res, args, kwargs):
             if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
 
                 called_watcher.append(1)
@@ -283,13 +286,19 @@ def test_multi_res_separated_dep_subgraphs():
                 return neg, torch.zeros_like(neg), torch.ones_like(neg)
             else:
                 return res
+                
+    class _TestCaseJitEngine(JitEngine):
+        def create_first_run_handlers(self, stackframe):
+            handlers = super().create_first_run_handlers(stackframe)
+            handlers.append(_ValueStubHandler(self.module, stackframe))
+            return handlers
 
     m = M()
     graph = EasierTracer().trace(m)
+    passes.analyze_life_range([m], [graph])
 
     _fully_load_data_backend_none([m], 'cpu')
-    engine = JitEngine(m, graph)
-    engine.first_run_handlers.append(_ValueStubHandler())
+    engine = _TestCaseJitEngine(m, graph)
     engine.forward()
 
     assert called_watcher == [1]

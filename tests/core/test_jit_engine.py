@@ -17,6 +17,8 @@ from easier.core.runtime.jit_engine.jit_engine import JitEngine
 from easier.core.runtime.metadata import \
     Role, ViewSrc, get_node_meta, RuntimeTensorMeta, get_node_view_src
 from easier.core.passes.utils import FX
+from easier.core import passes
+
 import easier as esr
 
 
@@ -67,6 +69,7 @@ class TestMetadataPropagation:
 
         m = M()
         graph = EasierTracer().trace(m)
+        passes.analyze_life_range([m], [graph])
 
         _fully_load_data_backend_none([m], 'cpu')
         engine = JitEngine(m, graph)
@@ -95,6 +98,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -145,6 +149,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -174,6 +179,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -206,6 +212,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -255,6 +262,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -294,6 +302,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -330,6 +339,7 @@ class TestMetadataPropagation:
 
             m = M()
             graph = EasierTracer().trace(m)
+            passes.analyze_life_range([m], [graph])
 
             _fully_load_data_backend_none([m], 'cpu')
             engine = JitEngine(m, graph)
@@ -376,7 +386,7 @@ class TestViewSrc:
         called_watcher = []
 
         class _ValueStubHandler(NodeHandlerBase):
-            def preprocess(self,         current_node: Node, args, kwargs):
+            def preprocess(self, current_node: Node, args, kwargs):
                 if current_node.target in [
                     torch.cholesky_inverse, torch.cholesky
                 ]:
@@ -384,7 +394,7 @@ class TestViewSrc:
                 else:
                     return PreprocessDecision.CONTINUE
 
-            def postprocess(self,        current_node: Node, res, args, kwargs):
+            def postprocess(self, current_node: Node, res, args, kwargs):
                 if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
                     called_watcher.append(1)
                     return same_memory
@@ -402,6 +412,7 @@ class TestViewSrc:
 
         m = M()
         graph = EasierTracer().trace(m)
+        passes.analyze_life_range([m], [graph])
 
         _fully_load_data_backend_none([m], 'cpu')
 
@@ -445,13 +456,13 @@ class TestViewSrc:
         called_watcher = []
 
         class _ValueStubHandler(NodeHandlerBase):
-            def preprocess(self,        current_node: Node, args, kwargs):
+            def preprocess(self, current_node: Node, args, kwargs):
                 if current_node.target is torch.svd:
                     return PreprocessDecision.SKIP_EVAL
                 else:
                     return PreprocessDecision.CONTINUE
 
-            def postprocess(self,        current_node: Node, res, args, kwargs):
+            def postprocess(self, current_node: Node, res, args, kwargs):
                 if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
 
                     called_watcher.append(1)
@@ -472,6 +483,7 @@ class TestViewSrc:
 
         m = M()
         graph = EasierTracer().trace(m)
+        passes.analyze_life_range([m], [graph])
 
         _fully_load_data_backend_none([m], 'cpu')
 
@@ -522,6 +534,7 @@ class TestViewSrc:
 
         m = M()
         graph = EasierTracer().trace(m)
+        passes.analyze_life_range([m], [graph])
 
         _fully_load_data_backend_none([m], 'cpu')
         engine = JitEngine(m, graph)
