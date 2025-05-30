@@ -254,7 +254,7 @@ class ViewSrcTrackerBase(NodeHandlerBase):
         self.addr2viewsrc: Dict[int, ViewSrc] = {}
 
     def _get_indexed_addr(
-        self, node: Node, res,
+        self, iaddr_node: Node, val: RuntimeValue,
         *,
         _rec_depth=0  # debug-only
     ) -> StructuredIndexedAddr:
@@ -268,22 +268,28 @@ class ViewSrcTrackerBase(NodeHandlerBase):
 
         Otherwise, although we have an index, it's irrelevant, because the addr
         with refcount > 0 indicates the memory was allocated earlier.
+
+        Args:
+        -   iaddr_node: The Node whose items' addresses will be checked,
+                not necessary to be `current_node`
+        -   val: The RuntimeValue bound to `iaddr_node`,
+                not necessary to be `res` arg of `postprocess()`
         """
-        if isinstance(res, torch.Tensor):
-            item_iaddr = res.untyped_storage().data_ptr()
+        if isinstance(val, torch.Tensor):
+            item_iaddr = val.untyped_storage().data_ptr()
             return IndexedAddr(item_iaddr, None)
 
-        elif isinstance(res, (tuple, list)):
+        elif isinstance(val, (tuple, list)):
             if _rec_depth > 0:
                 raise EasierJitException(
                     "Unexpected nested result with nested depth > 1 from"
-                    f" {node.format_node()}"
+                    f" {iaddr_node.format_node()}"
                 )
 
             indexed_addrs = []
-            for i, item in enumerate(res):
+            for i, item in enumerate(val):
                 item_iaddr = self._get_indexed_addr(
-                    node, item,
+                    iaddr_node, item,
                     _rec_depth=_rec_depth+1
                 )
 
@@ -299,18 +305,18 @@ class ViewSrcTrackerBase(NodeHandlerBase):
 
             return indexed_addrs
 
-        elif res is None:
+        elif val is None:
             # TODO assert _rec_depth == 0  # possible?
             return None
 
-        elif res is jit_skipped or isinstance(res, (int, float, bool)):
+        elif val is jit_skipped or isinstance(val, (int, float, bool)):
             assert _rec_depth == 0, \
                 "Scalars and jit_skipped are always not nested"
             return None
 
         else:
             raise EasierJitException(
-                f"Unexpected runtime value {res} or nested structure"
+                f"Unexpected runtime value {val} or nested structure"
             )
 
     def postprocess(
