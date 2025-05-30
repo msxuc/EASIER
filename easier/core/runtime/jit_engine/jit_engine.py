@@ -147,7 +147,23 @@ def get_meta_role_size(meta: StructuredTensorMeta) -> Tuple[Role, int]:
         return replica
 
 
-class StackframeLoadStoreRelease(NodeHandlerBase):
+class StackframeManager(NodeHandlerBase):
+    """
+    StackframeManager essentially plays the role like how Python interpreter,
+    it loads argument values from the stackframe for evaluating a callable,
+    and stores the result back to the stackframe.
+
+    Also, StackframeManager garbage-collects unused values (Python objects),
+    but differs from standard Python scenarios:
+
+    -   Original function scopes of users' EASIER Python programs are totally
+        inlined, due to FX tracing mechanism.
+        Function-scope GC is no longer achievable.
+    
+    -   The timing when to release a value relies on the calculation of
+        life_range_analysis AOT pass, which would be more aggressive than
+        Python-built-in function-scope GC.
+    """
     def preprocess(
         self,
         current_node: Node,
@@ -207,7 +223,7 @@ class StackframeLoadStoreRelease(NodeHandlerBase):
         return res
 
 
-class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
+class ViewSrcTrackerBase(NodeHandlerBase):
     """
     Maintain the ref count on the memory address.
     During the period that memory address is still referenced, we know the
@@ -222,7 +238,11 @@ class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
     ref count here still aligns with the most fundamental expectation
     of memory lifetime, at the price of memory not reusable,
     but not wrong read/write.
-    )
+
+    NOTE What tensor.untyped_storage() returns is a Python-world lightweight
+    wrapper over the native-world PyTorch memory, it's hard to answer if
+    the lifetime of the wrapper Pyobj reflects the real lifetime of the memory.
+    So currently we need to maintain the ref count manually.
     """
 
     def __init__(
@@ -399,14 +419,14 @@ class RefCountBasedViewSrcHandlerBase(NodeHandlerBase):
         pass
 
 
-class FirstRunRefCountBasedViewSrcTracker(RefCountBasedViewSrcHandlerBase):
+class ViewSrcTracker(ViewSrcTrackerBase):
     def handle_view_src(
         self, current_node: Node, view_src: StructuredViewSrc
     ) -> None:
         set_node_view_src(current_node, view_src)
 
 
-class RefCountBasedViewSrcValidation(RefCountBasedViewSrcHandlerBase):
+class ViewSrcValidation(ViewSrcTrackerBase):
     def handle_view_src(
         self, current_node: Node, view_src: StructuredViewSrc
     ) -> None:
@@ -510,7 +530,7 @@ class SkipZeroLengthNonHalo(NodeHandlerBase):
         return PreprocessDecision.CONTINUE
 
 
-class FirstRunMetadataPropagation(NodeHandlerBase):
+class MetadataPropagation(NodeHandlerBase):
     """
     Inspect, propagate and validate metadata in the first run of a forward().
 
@@ -718,7 +738,7 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         return res
 
 
-class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
+class AggregatorMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of EASIER aggregators
     in addition to the general FirstRunMetadataPropagation.
@@ -772,7 +792,7 @@ class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
         return res
 
 
-class FirstRunHaloExchangerMetadataPropagation(NodeHandlerBase):
+class HaloExchangerMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of HaloExchanger
     in addition to the general FirstRunMetadataPropagation.
@@ -791,7 +811,7 @@ class FirstRunHaloExchangerMetadataPropagation(NodeHandlerBase):
         return PreprocessDecision.CONTINUE
 
 
-class FirstRunReducerMetadataPropagation(NodeHandlerBase):
+class ReducerMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of Reducer
     in addition to the general FirstRunMetadataPropagation.
@@ -1000,26 +1020,26 @@ class JitEngine:
         first_run_handlers: List[NodeHandlerBase] = [
             # -> Load values from stackframe
             # <- Store result into stackframe, release unused tensors
-            StackframeLoadStoreRelease(self.module, stackframe),
+            StackframeManager(self.module, stackframe),
 
             # ->
             # <- Updates refcount and sets view_src
-            FirstRunRefCountBasedViewSrcTracker(self.module, stackframe),
+            ViewSrcTracker(self.module, stackframe),
 
             # -> Calculates expected role and batchsize --/
             # -> if to skip and not sum/halo etc.: SKIP_EVAL --\--------
             # <- Calculates and sets metadata _________________/________
-            FirstRunMetadataPropagation(self.module, stackframe),
+            MetadataPropagation(self.module, stackframe),
 
             # -> Allgathers metadata for aggreagators and sets Node metadata
             # <- Updates metadata dtype (e.g. int32 -> int64)
-            FirstRunAggregatorMetadataPropagation(self.module, stackframe),
+            AggregatorMetadataPropagation(self.module, stackframe),
             # -> Exchanges metadata for Halos and sets Node metadata
             # <-
-            FirstRunHaloExchangerMetadataPropagation(self.module, stackframe),
+            HaloExchangerMetadataPropagation(self.module, stackframe),
             # -> Allgathers metadata for Reducers and sets Node metadata
             # <-
-            FirstRunReducerMetadataPropagation(self.module, stackframe),
+            ReducerMetadataPropagation(self.module, stackframe),
 
             # -> Prepares neutral input to esr.sum etc. and GOTO_EVAL
             # <-
@@ -1038,11 +1058,11 @@ class JitEngine:
         runtime_handlers: List[NodeHandlerBase] = [
             # -> Loads arguments from stackframe
             # <- Stores result into stackframe, releases unused tensors
-            StackframeLoadStoreRelease(self.module, stackframe),
+            StackframeManager(self.module, stackframe),
 
             # ->
             # <- Updates refcount and asserts view_src no changes
-            RefCountBasedViewSrcValidation(self.module, stackframe),
+            ViewSrcValidation(self.module, stackframe),
 
             # ->
             # <- Validates metadata and asserts no changes
