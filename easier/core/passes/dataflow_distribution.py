@@ -1,10 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import dis
 from types import FunctionType
 from typing import Dict, List
-from sympy import im
 import torch
 from torch.fx.graph import Graph
 from torch.fx.node import Node
@@ -196,8 +194,6 @@ class ReorderingSelectorInserter(EasierInterpreter):
             )
 
 
-
-
 class AllReducePrimitivesRewriter(EasierInterpreter):
     """
     TODO we shouldn't just simply choose to rewrite aggregators to all_gather,
@@ -272,20 +268,25 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
                 replica_allreduce_kwargs
             )
 
-            replica_reduce = node.graph.call_function(
-                easier_all_reduce_sum, (worker_local_reduce,)
+            allgather = node.graph.call_function(
+                all_gather_into_tensor, (worker_local_reduce,)
             )
 
+            prim_name = dist_reduce_prim.__name__
+            replica_reduce_op: FunctionType = getattr(
+                torch,
+                'a' + prim_name if prim_name in ['max', 'min'] else prim_name
+            )
+            replica_allreduce_kwargs['keepdim'] = True
+            replica_allreduce_kwargs['dim'] = 0
+            replica_reduce = node.graph.call_function(
+                replica_reduce_op,
+                (allgather,) + replica_allreduce_args,
+                replica_allreduce_kwargs
+            )
 
         node.replace_all_uses_with(replica_reduce)
         node.graph.erase_node(node)
-def easier_all_reduce_sum(
-    send_tensor: torch.Tensor
-) -> torch.Tensor:
-    import torch.distributed as dist
-    buffer = torch.empty_like(send_tensor)
-    dist.all_reduce(buffer, dist.ReduceOp.SUM)
-    return buffer
 
 
 def bind_tensor_elempart(elemparts: Dict[EasierTensorGroup, ElemPart]):
