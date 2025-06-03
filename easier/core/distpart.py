@@ -1,25 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
-import torch.utils
-from typing_extensions import Literal, OrderedDict, TypeAlias
-import functools
-import more_itertools
 import time
 
 import torch
-from torch.fx.graph import Graph
-from torch.fx.node import Node
 
-import numpy as np
 import scipy.sparse
-from torch.nn.modules import Module
 
-import easier.core.module as esr
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import EasierJitException, logger
+from easier.core.utils import logger
 import easier.cpp_extension as _C
 
 
@@ -69,6 +60,32 @@ class CoarseningLevel:
     rowptr: torch.Tensor
     colidx: torch.Tensor
     adjwgt: torch.Tensor
+
+    def remove_self_edges(self) -> 'CoarseningLevel':
+        """
+        Remove self edges in the CSR data of the local CSR part of
+        this CoarseningLevel.
+        """
+        dist_env = get_runtime_dist_env()
+        start = sum(self.dist_config.local_nvs[:dist_env.rank])
+        local_nv = self.dist_config.local_nvs[dist_env.rank]
+
+        csr = scipy.sparse.csr_matrix(
+            (self.adjwgt, self.colidx, self.rowptr),
+            shape=(local_nv, self.dist_config.nv)
+        )
+
+        # csr.setdiag() explicitly stores zero entries,
+        # we need eliminate_zeros() to adjust the CSR sparsity structure.
+        csr.setdiag(0, start)
+        csr.eliminate_zeros()
+
+        rowptr = torch.from_numpy(csr.indptr).to(torch.int64)
+        colidx = torch.from_numpy(csr.indices).to(torch.int64)
+        adjwgt = torch.from_numpy(csr.data).to(torch.int64)
+        return CoarseningLevel(
+            self.dist_config, self.vertex_weights, rowptr, colidx, adjwgt
+        )
 
 
 def _assert_local_map_no_overlap(local_map, new_range):
@@ -332,10 +349,6 @@ def merge_cadj_adjw(
         shape=(row_xchg.local_cnv, row_xchg.c_dist_config.nv)
     )
 
-    lil = coarser_graph.tolil()
-    lil.setdiag(0, row_xchg.c_start)  # remove self edge and weight
-    coarser_graph = lil.tocsr()
-
     return torch.from_numpy(coarser_graph.indptr).to(torch.int64), \
         torch.from_numpy(coarser_graph.indices).to(torch.int64), \
         torch.from_numpy(coarser_graph.data).to(torch.int64)
@@ -453,9 +466,9 @@ def merge_vertexes(
         (A, c5),
     ]
 
-    Then construct csr_matrix with the COO data, and remove self-edges:
+    Then construct csr_matrix with the COO data, and sum up duplicates:
 
-    | A |  B c8 c9 c5
+    | A |  B A c8 c9 c5
 
     Args:
     - cnv: the number of vertexes in the coarser graph, coarser vertexes
@@ -701,6 +714,12 @@ def distpart_kway(
     )
 
     # Gather to worker-0 and call METIS
+    #
+    # NOTE METIS asserts, although not reflected in release, that the CSR data
+    # should not have self edges. Let's remove them. This essentially
+    # discards all adj weights within the (most) coarsened vertex.
+    new_lv = new_lv.remove_self_edges()
+
     cgraph = gather_csr_graph(0, new_lv)
     if dist_env.rank == 0:
         assert cgraph is not None
@@ -767,12 +786,17 @@ def log_metis_input_statistics(
         return
 
     def _debug(category, ints: torch.Tensor):
-        amin, amax = torch.aminmax(ints)
-        std, mean = torch.std_mean(ints.to(torch.float32))
+        # If all vertexes are isolated, adjw is zero-length.
+        if ints.nelement() == 0:
+            amin, amax, median, std, mean = 0, 0, 0, 0, 0
+        else:
+            amin, amax = torch.aminmax(ints)
+            median = ints.median()
+            std, mean = torch.std_mean(ints.to(torch.float32))
         logger.debug(
             f"METIS input of EASIER-coarsened {category}"
             f": max={int(amax)}, min={int(amin)}"
-            f", median={int(ints.median())}"
+            f", median={int(median)}"
             f", mean={float(mean)}, std={float(std)}"
         )
 

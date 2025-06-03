@@ -1,16 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Union
-from types import MethodType
-import pytest
-from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from easier.core.passes.tensor_grouping import EasierTensorGroup
-from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
-import easier.core.runtime.dist_env as _JitRuntimeDistEnv
-from easier.core.runtime.dist_env import DistEnv
+from easier.core.passes.tensor_group_partition import \
+    ElemPart as _EP_raw, ElemPartReorderedArangeIdx
 from easier.core.module import Selector, Reducer
 from easier.core.passes.utils import OrderedSet
 from easier.core.passes.sparse_encoding.reorder_plan import \
@@ -19,6 +14,8 @@ from easier.core.passes.sparse_encoding.reorder_plan import \
 from easier.core.passes.sparse_encoding.sparse_encoding import \
     reorder_output_by_selector, rewrite_selector_instance, \
     reorder_input_by_reducer, rewrite_reducer_instance
+from easier.core.passes.sparse_encoding.utils import \
+    elempart_isin
 from tests.utils import assert_tensor_list_equal, torchrun_singlenode
 
 
@@ -27,7 +24,7 @@ def vec(*longs):
 
 
 def ElemPart(idx, lengths):
-    return _EP_raw(idx, lengths, 'NOHINT')
+    return _EP_raw(None, idx, lengths, 'NOHINT')
 
 
 def test_break_reducer_cycle():
@@ -37,6 +34,9 @@ def test_break_reducer_cycle():
     r5 = Reducer(torch.arange(5), 99)
     r6 = Reducer(torch.arange(6), 99)
     r4 = Reducer(torch.arange(4), 99)
+    r5.easier_hint_name = 'r5'
+    r6.easier_hint_name = 'r6'
+    r4.easier_hint_name = 'r4'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_nnodes = {
         r5: 1,
@@ -67,6 +67,10 @@ def test_break_selector_reducer_cycle():
     s9 = Selector(torch.arange(9))
     s8 = Selector(torch.arange(8))
     s7 = Selector(torch.arange(7))
+    r5.easier_hint_name = 'r5'
+    s9.easier_hint_name = 's9'
+    s8.easier_hint_name = 's8'
+    s7.easier_hint_name = 's7'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_edges = {
         # Reducer.n does not matter as we are not running metadata propagation
@@ -107,6 +111,10 @@ def test_resolve_conflict():
     s22 = Selector(torch.arange(22))
     s33A = Selector(torch.arange(33))
     s33B = Selector(torch.arange(33))
+    r5.easier_hint_name = 'r5'
+    s22.easier_hint_name = 's22'
+    s33A.easier_hint_name = 's33A'
+    s33B.easier_hint_name = 's33B'
     builder = ReorderGraphBuilder([], [])
     builder.reducer_edges = {
         # Reducer.n does not matter as we are not running metadata propagation
@@ -298,3 +306,34 @@ def worker__test_reroder_rewrite_reducer(
 
 def test_reroder_rewrite_reducer():
     torchrun_singlenode(3, worker__test_reroder_rewrite_reducer)
+
+
+def test_elempart_isin_reordered():
+    reordered_elempart = _EP_raw(
+        ElemPartReorderedArangeIdx(10, 15), vec(13, 10, 14, 12, 11), [5], ""
+    )
+
+    assert torch.equal(
+        vec(0, 1, 0, 0, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(8, 12))
+    )
+
+    assert torch.equal(
+        vec(0, 0, 0, 1, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(11, 13))
+    )
+
+    assert torch.equal(
+        vec(1, 0, 1, 0, 0).bool(),
+        elempart_isin(reordered_elempart, torch.arange(13, 15))
+    )
+
+    assert torch.equal(
+        vec(1, 1, 1, 1, 1).bool(),
+        elempart_isin(reordered_elempart, torch.arange(8, 15))
+    )
+
+    assert torch.equal(
+        vec(0, 0, 0, 0, 0).bool(),
+        elempart_isin(reordered_elempart, torch.arange(20, 30))
+    )

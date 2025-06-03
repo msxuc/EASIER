@@ -1,25 +1,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Union
-from types import MethodType
-import pytest
-from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch.fx.node import Node
 
 from easier.core import passes
 from easier.core.jit import EasierTracer
-from easier.core.passes.tensor_grouping import EasierTensorGroup
 from easier.core.passes.tensor_group_partition import ElemPart as _EP_raw
-import easier.core.runtime.dist_env as _JitRuntimeDistEnv
-from easier.core.runtime.dist_env import DistEnv
 from easier.core.module import Selector, Reducer
-from easier.core.passes.utils import FX, OrderedSet
+from easier.core.passes.utils import FX
 from easier.core.passes.sparse_encoding.sparse_encoding import \
-    reorder_output_by_selector, rewrite_selector_instance, \
-    reorder_input_by_reducer, rewrite_reducer_instance
+    rewrite_selector_instance, \
+    rewrite_reducer_instance
 from easier.core.passes.dataflow_distribution import \
     HaloExchangerInserter, ReorderingSelectorInserter, HaloExchanger
 from tests.utils import assert_tensor_list_equal, torchrun_singlenode
@@ -31,7 +24,7 @@ def vec(*longs):
 
 
 def ElemPart(idx, lengths):
-    return _EP_raw(idx, lengths, 'NOHINT')
+    return _EP_raw(None, idx, lengths, 'NOHINT')
 
 
 def worker__test_halo_exchanger_insertion_for_selector(

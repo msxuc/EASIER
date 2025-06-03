@@ -2,22 +2,16 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
-from typing_extensions import TypeAlias
+from typing import Dict, List, Optional, Sequence, Tuple, Union, cast
 import networkx
 import more_itertools
 
 
-import torch
-import torch.overrides
 from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
 
 from easier.core.runtime.dist_env import get_runtime_dist_env
-from easier.core.utils import \
-    logger, EasierJitException
+from easier.core.utils import logger
 import easier.core.module as esr
 
 from easier.core.passes.tensor_grouping import \
@@ -354,9 +348,9 @@ def build_cascade_reorder_plan_on_rank0(graph_builder: ReorderGraphBuilder):
             reorder_graph[hintsrc][hintdst].items()
         )
         pattern = edge_data['pattern']
-        cascade_hints.append(f"{hintsrc.hint} -" + (
-            "R" if isinstance(pattern, esr.Reducer) else "S"
-        ) + f"-> {hintdst.hint}")
+        cascade_hints.append(
+            f"{hintsrc.hint} -{pattern.easier_hint_name}-> {hintdst.hint}"
+        )
     logger.debug(
         "Cascade-reordering tree:\n\t" + '\n\t'.join(cascade_hints)
     )

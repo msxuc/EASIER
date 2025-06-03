@@ -6,6 +6,7 @@ import os
 from typing import Iterator, Optional, Tuple, TypeAlias, Union, cast
 import h5py
 import functools
+import copy
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ import torch
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
+from easier.core.utils import EasierJitException
 
 
 ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
@@ -130,15 +132,21 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    # TODO now we accept keyword parameters only, we may make it do
-    # overloading resolution like Selector(idx=)
     def to(
         self,
         *,
         dtype: Optional[torch.dtype] = None,
         device: Optional[Union[torch.device, str]] = None
     ) -> 'DataLoaderBase':
-        raise NotImplementedError()
+        """
+        Return a cloned DataLoader with the specified properties changed.
+        """
+        clone = copy.deepcopy(self)
+        if dtype is not None:
+            clone.dtype = dtype
+        if device is not None:
+            clone.device = torch.device(device)
+        return clone
 
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:
@@ -208,22 +216,37 @@ class DataLoaderBase:
         assert res.device.type == 'cpu'
         return res
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
         """
-        Fully load the dataset, typically for compile backend=='none' case.
-
-        Can be called even without dist env set up -- but if not called on
-        rank-0, the result may be corrupted.
+        Collectively and fully load the dataset on all ranks,
+        typically for compile backend=='none' case.
 
         Args:
         - device: the device to load data to. (self.device will not be used.)
+
+            NOTE
+            Unlike other load methods where data is always loaded to
+            CPU for JIT-internal use, after full load the data is expected
+            to be ready on user-specified device, immediately.
+            So instead of going via CPU, fully_load() accepts the argument
+            for the fianl device.
+
+        - replicated: if True, load the same, full data to all ranks,
+            otherwise only load to rank-0, other ranks will have the
+            placeholder tensor and should not do calculation with it.
+
+            NOTE
+            With placeholder tensors, other ranks can still get proper
+            shapes/dtypes.
 
         Returns:
         - torch.Tensor: the full tensor, on the specified device.
         """
         raise NotImplementedError()
 
-    def get_placeholder(self) -> torch.Tensor:
+    def get_placeholder(self, device=None) -> torch.Tensor:
         """
         Allocate a new placeholder torch.Tensor of the same dtype/shape/device
         but generally consuming no memory to be compatible with cases where
@@ -237,15 +260,41 @@ class DataLoaderBase:
             especially for the metadata pass.
         2.  fulfil `esr.Tensor.__new__(cls, data)` where the underlying data
             tensor should be set.
+        3.  when backend=='none', distributed data is only loaded on rank-0,
+            create placeholders on other ranks to ease retrival shape/dtype
+            especially to create receiving buffers in communication.
         """
+        if device is None:
+            device = self.device
+
         # torch.Tensor.expand can expand shape-(1,) to e.g. shape-(0,0,0),
         # but not to ndim=0 shape ().
         if len(self.shape) == 0:
-            ph = torch.zeros((), dtype=self.dtype, device=self.device)
+            ph = torch.zeros((), dtype=self.dtype, device=device)
         else:
+            # TODO using `.expand()` is compatible (i.e. works with
+            # `Tensor.data=ph` and propagates shape/dtype) and simple.
+            #
+            # However, `torch.nn.Parameter.__new__` and
+            # `torch.nn._ParameterMeta(torch._C._TensorMeta)`
+            # may have indicated the protocol to make a very customized object
+            # to be compatible.
+            #
+            # That would be good because we can get totally ride of OOM,
+            # not only by `.to()`, and also prevent `esr.Tensor` from e.g.
+            # `torch.ones_like()`.
             ph = torch.zeros(
-                (1,), dtype=self.dtype, device=self.device
+                (1,), dtype=self.dtype, device=device
             ).expand(self.shape)  # can even expand to (0,0,0)
+
+        ########################################
+        #              WARNING
+        ########################################
+        # .to() method on placeholder tensors must be strictly disabled,
+        # otherwise it might materialize the memory and cause OOM!
+        def _to_forbidden(self, *args, **kwargs):
+            raise EasierJitException("Cannot can .to() on placeholders!")
+        ph.to = _to_forbidden.__get__(ph)
 
         setattr(ph, ATTRIBUTE_PLACEHOLDER, True)
         return ph
@@ -340,8 +389,15 @@ class InMemoryTensorLoader(DataLoaderBase):
     ) -> torch.Tensor:
         return self.tensor[index]
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
-        return self.tensor.to(device, copy=True)
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return self.tensor.to(device, copy=True)
+        else:
+            return self.get_placeholder(device)
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(tensor={self.tensor})'
@@ -654,15 +710,35 @@ class H5DataLoader(DataLoaderBase):
         else:
             return _run(None)
 
-    def fully_load(self, device: Union[torch.device, str]) -> torch.Tensor:
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
         """
-        Called by backend=='none' case, EASIER does not initialize DistEnv.
-        EASIER requires there is only one process.
-        # dist_env = get_runtime_dist_env()
+        Called by backend=='none' case, only default_dist_env is available.
         """
-        with self._dataset_as_dtype() as d:
-            t = torch.from_numpy(d[...]).to(device)
-            return t
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+
+        if replicated:
+            if rank == 0:
+                with self._dataset_as_dtype() as d:
+                    t = torch.from_numpy(d[...]).to(dist_env.comm_device)
+                    dist_env.broadcast(0, t)
+            else:
+                t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            return t.to(device)
+
+        else:
+            if rank == 0:
+                with self._dataset_as_dtype() as d:
+                    t = torch.from_numpy(d[...])
+                return t.to(device)
+
+            else:
+                # We cannot call .to(device) on the placeholder
+                # (therefore we have to calls .to(device) many times above)
+                ph = self.get_placeholder(device)
+                return ph
 
     def __repr__(self) -> str:
         return ''.join([
@@ -734,9 +810,15 @@ class FulledTensorLoader(DataLoaderBase):
                                 **kwargs) -> torch.Tensor:
         return self._full(index.shape[0], 'cpu')
 
-    def fully_load(self, device: Union[torch.device, str]
-                   ) -> torch.Tensor:
-        return self._full(None, device)
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return self._full(None, device)
+        else:
+            return self.get_placeholder(device)
 
     def __repr__(self) -> str:
         return ''.join([
@@ -825,12 +907,18 @@ class ArangeTensorLoader(DataLoaderBase):
                                 **kwargs) -> torch.Tensor:
         return (index * self._step + self._start).to(dtype=self.dtype)
 
-    def fully_load(self, device: Union[torch.device, str]
-                   ) -> torch.Tensor:
-        return torch.arange(
-            self._start, self._end, self._step,
-            dtype=self.dtype, device=device
-        )
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return torch.arange(
+                self._start, self._end, self._step,
+                dtype=self.dtype, device=device
+            )
+        else:
+            return self.get_placeholder(device)
 
     def __repr__(self) -> str:
         return ''.join([

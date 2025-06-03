@@ -2,9 +2,7 @@
 # Licensed under the MIT License.
 
 from typing_extensions import Literal
-from unittest.mock import patch
 import torch
-from torch.fx import GraphModule
 import pytest
 
 import h5py
@@ -15,7 +13,8 @@ from easier.core.runtime.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 
-from ..utils import torchrun_singlenode, get_random_str
+from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2
+from easier.core.utils import get_random_str
 
 
 def get_in_memory_tensor_loader(
@@ -69,17 +68,52 @@ def worker__test_load_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx, chunk_size=3)
+    v = torch.arange(17) * 3 + 1
+
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
 
-    assert torch.equal(torch.arange(5, dtype=dtype) *
-                       6 + 1 + local_rank * 3, tensor)
+    assert torch.equal(v[idx], tensor)
 
 
-have_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def worker__test_fully_load(
+    local_rank: int, world_size: int,
+    data_loader_ctor, dtype: torch.dtype,
+    device_type: str, final_device_type: str
+):
+    dl: DataLoaderBase = data_loader_ctor(dtype, device_type)
+    assert dl.dtype == dtype
+    assert dl.device.type == device_type
+    assert dl.shape == (17,)
+
+    final_device = torch.device(final_device_type, local_rank)
+
+    v = torch.arange(17) * 3 + 1
+    v = v.to(final_device)
+
+    tensor = dl.fully_load(final_device, replicated=False)
+    assert tensor.dtype == dtype
+    if final_device_type == 'cpu':
+        assert tensor.device.type == 'cpu'
+    else:
+        assert tensor.device == final_device
+
+    if local_rank == 0:
+        assert torch.equal(v, tensor)
+    else:
+        assert not torch.equal(v, tensor)
+
+    tensor = dl.fully_load(final_device, replicated=True)
+    assert tensor.dtype == dtype
+    if final_device_type == 'cpu':
+        assert tensor.device.type == 'cpu'
+    else:
+        assert tensor.device == final_device
+    assert torch.equal(v, tensor)
 
 
 @pytest.mark.parametrize('data_loader_ctor',
@@ -124,24 +158,36 @@ class TestDataLoader:
         torchrun_singlenode(2, worker__test_load_by_index,
                             (data_loader_ctor, dtype, device_type))
 
-    @pytest.mark.usefixtures('dummy_dist_env')
-    @pytest.mark.parametrize('target_device_type', [
+    @pytest.mark.parametrize('final_device_type', [
         'cpu',
-        pytest.param('cuda', marks=have_cuda)
+        pytest.param('cuda', marks=when_ngpus_ge_2)
     ])
     def test_fully_load(self, data_loader_ctor, dtype: torch.dtype,
-                        device_type: str, target_device_type: str):
-        dl: DataLoaderBase = data_loader_ctor(dtype, device_type)
-        assert dl.dtype == dtype
-        assert dl.device.type == device_type
-        assert dl.shape == (17,)
+                        device_type: str, final_device_type: str):
+        torchrun_singlenode(
+            2, worker__test_fully_load,
+            (data_loader_ctor, dtype, device_type, final_device_type)
+        )
 
-        tensor = dl.fully_load(target_device_type)
-        assert tensor.dtype == dtype
-        if target_device_type is None:
-            assert tensor.device.type == device_type
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_to(self, data_loader_ctor, dtype: torch.dtype, device_type: str):
+        dl: DataLoaderBase = data_loader_ctor(dtype, 'cpu')
+
+        if dtype.is_floating_point:
+            dl_f16 = dl.to(dtype=torch.float16)
+            assert dl is not dl_f16
+            assert dl_f16.device.type == 'cpu'
+            assert dl_f16.dtype == torch.float16
         else:
-            assert tensor.device.type == target_device_type
+            dl_i8 = dl.to(dtype=torch.int8)
+            assert dl is not dl_i8
+            assert dl_i8.device.type == 'cpu'
+            assert dl_i8.dtype == torch.int8  # not changed
+
+        dl_device = dl.to(device=device_type)
+        assert dl is not dl_device
+        assert dl_device.device.type == device_type
+        assert dl_device.dtype == dtype
 
 
 def worker__test_load_full_by_rank(local_rank: int, world_size: int,
@@ -172,13 +218,14 @@ def worker__test_load_full_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17, 2)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx)
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
 
-    assert torch.equal(torch.full([5, 2], 42, dtype=dtype), tensor)
+    assert torch.equal(torch.full([20, 2], 42, dtype=dtype), tensor)
 
 
 @pytest.mark.parametrize('dtype',
@@ -246,8 +293,9 @@ def worker__test_load_arange_by_index(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    idx = torch.arange(5) * 2 + local_rank
-    tensor = dl.partially_load_by_index(idx)
+    torch.manual_seed(2345 + local_rank)
+    idx = torch.randint(0, 17, (20,))
+    tensor = dl.partially_load_by_index(idx, chunk_size=7)
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU

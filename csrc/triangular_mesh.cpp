@@ -7,8 +7,8 @@
 #include <iostream>
 #include <math.h>
 
-py::tuple get_mesh(torch::Tensor mesh_size) {
-  long n = mesh_size.item<long>();
+py::tuple get_mesh(long mesh_size) {
+  long n = mesh_size;
   double delta = 1. / n;
   double area = delta * delta / 4.;
   long nv = n * n * 4;
@@ -140,7 +140,6 @@ py::tuple get_mesh(torch::Tensor mesh_size) {
   torch::Tensor POINTS = torch::tensor(at::ArrayRef<double>(points), opt_double);
 
   return py::make_tuple(SRC, DST, CELLS, BCELLS, BPOINTS, POINTS);
-  // return py::make_tuple(src_t, dst_t, A_t, b_t);
 }
 
 void pybind_triangular_mesh(pybind11::module_ m) {

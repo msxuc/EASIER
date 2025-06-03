@@ -1,18 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import itertools
 from types import FunctionType
-from typing import Dict, Iterable, List, Optional, Sequence, Set, \
-    Tuple, Union, cast
-from typing_extensions import Literal, TypeVar, assert_never
+from typing import Dict, List
 import torch
-from torch import LongTensor
 from torch.fx.graph import Graph
 from torch.fx.node import Node
-from torch.nn.modules import Module
 from easier.core.passes.tensor_grouping import \
-    EasierTensorDef, EasierTensorGroup, get_node_tensor_group
+    EasierTensorGroup, get_node_tensor_group
 from easier.core.passes.utils import EasierInterpreter, SubmodNameAllocator, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     get_easier_tensors
@@ -21,10 +16,9 @@ from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.runtime.modules import HaloExchanger, all_gather_into_tensor
 
 import easier.core.module as esr
-from easier.core.module import Module, Selector, Reducer
+from easier.core.module import Selector
 from easier.core.passes.sparse_encoding.sparse_encoding import IdxMover
-from easier.core.passes.tensor_group_partition import \
-    ElemPart
+from easier.core.passes.tensor_group_partition import ElemPart
 
 
 class ConstantTensorMover(EasierInterpreter):
@@ -249,11 +243,8 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             replica_allreduce_args = node.args[1:]
             replica_allreduce_kwargs = node.kwargs.copy()
         else:
-            # param `vertex_tensor` is a keyword arg
-            replica_allreduce_args = ()
-            # If the 1st param `vertex_tensor` is passed as a keyword arg,
-            # generally there will be no positional args.
-            assert len(node.args) == 0
+            # param `tensor` is a keyword arg
+            replica_allreduce_args = node.args  # should be ()
             replica_allreduce_kwargs = node.kwargs.copy()
             replica_allreduce_kwargs.pop('tensor')
 
@@ -272,15 +263,19 @@ class AllReducePrimitivesRewriter(EasierInterpreter):
             # EASIER reduce primitives are equivalent to
             # `torch.reduce(..., keepdim=True, dim=0)`
             worker_local_reduce = node.graph.call_function(
-                dist_reduce_prim, tuple(node.args), dict(node.kwargs)
+                dist_reduce_prim,
+                (input_tensor,) + replica_allreduce_args,
+                replica_allreduce_kwargs
             )
 
             allgather = node.graph.call_function(
                 all_gather_into_tensor, (worker_local_reduce,)
             )
 
+            prim_name = dist_reduce_prim.__name__
             replica_reduce_op: FunctionType = getattr(
-                torch, dist_reduce_prim.__name__
+                torch,
+                'a' + prim_name if prim_name in ['max', 'min'] else prim_name
             )
             replica_allreduce_kwargs['keepdim'] = True
             replica_allreduce_kwargs['dim'] = 0
@@ -332,7 +327,9 @@ def load_replicated_tensors_from_source(modules: List[esr.Module]):
     # may be accessed outside the JIT scope.
     for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_replica:
-            p.data = p.easier_data_loader.fully_load(runtime_device)
+            p.data = p.easier_data_loader.fully_load(
+                runtime_device, replicated=True
+            )
             p.easier_data_ready = True
 
 

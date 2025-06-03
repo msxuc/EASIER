@@ -1,9 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List
 
-import torch
 from torch import nn
 
 import easier as esr

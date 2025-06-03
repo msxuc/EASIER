@@ -2,24 +2,20 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple, \
-    Type, Union, Callable, cast
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from typing_extensions import TypeAlias
 
 import torch
-import torch.overrides
-from torch import nn
 from torch.fx.graph import Graph
-from torch.fx.node import Node, Argument, map_arg
+from torch.fx.node import Node
 
-from easier.core.utils import \
-    logger, EasierJitException
+from easier.core.utils import logger, EasierJitException
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
     EasierInterpreter, OrderedSet, get_easier_tensors, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
-    FX, DisjointSet, tree_map
+    DisjointSet
 
 
 KEY__TENSORGROUPING_GROUP = "easier_tensorGrouping_group"
@@ -158,7 +154,9 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         else:
             return None
 
-    def if_function_or_method(self, op_callable) -> Optional[EasierTensorDef]:
+    def if_function_or_method(
+        self, function_or_method_name
+    ) -> Optional[EasierTensorDef]:
         input_defs = [
             self.node2def[arg] for arg in self.current_node.all_input_nodes
         ]
@@ -167,10 +165,11 @@ class TensorGrouper(EasierInterpreter[Optional[EasierTensorDef]]):
         # is distributed. Otherwise it's None, meaning inputs are replica.
         rep_input_def = self.set_equivalent(input_defs)
 
-        if op_callable in esr.easier_aggregators:
+        if function_or_method_name in esr.easier_aggregators:
             if rep_input_def is None:
                 raise EasierJitException(
-                    f"{op_callable} cannot be called on replicated tensors"
+                    f"{function_or_method_name} cannot be called"
+                    " on replicated tensors"
                 )
             # esr.sum etc. results are always replica, no TensorDef.
             return None
@@ -300,9 +299,15 @@ def group_tensors(modules: List[esr.Module], graphs: List[Graph]):
         root = modules[rooti]
 
         if not hasattr(p, 'easier_tensor_group'):
+            # NOTE
+            # the assignment to never-used tensors will only happened in the
+            # first run of tensor_grouping pass, even tensor_grouping will be
+            # run multiple times.
+            # After the 1st run `p.easier_tensor_group` will be bound, and
+            # those EasierTensorGroup objects are inherited.
 
             logger.warning(
-                "Distributed easierr.Tensor "
+                "Distributed easier.Tensor "
                 f"{p.easier_hint_name} is never used in easier.Module"
             )
             tensor_group = EasierTensorGroup(

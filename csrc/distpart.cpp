@@ -14,7 +14,7 @@ void locally_match_heavy_edge(
     torch::Tensor colidx,
     torch::Tensor adjwgt
 ) {
-    // As we are using a "merge-all-merged" policy, without resolving
+    // As we are using a "merge-all-matched" policy, without resolving
     // distributed matching conflicts,
     // we don't deal with the constraint of the max vertex weights
     // in the coarser graphs.
@@ -58,9 +58,11 @@ void locally_match_heavy_edge(
                         // subsequent workers
                         continue;
                     }
-                    TORCH_CHECK(
-                        row + start != adjvid, "CSR cannot have diagonal line"
-                    );
+                    if (row + start == adjvid) {
+                        // leave diagonal vertexes unmatched
+                        // (and do not match it with itself)
+                        continue;
+                    }
                     bool is_adj_matched =
                         adjvid < end
                         ? matched_data[adjvid - start] != -1

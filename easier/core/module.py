@@ -2,12 +2,9 @@
 # Licensed under the MIT License.
 
 from typing import \
-    Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, cast, \
-    overload, TYPE_CHECKING
-import torch.types
-from typing_extensions import TypeAlias
+    Dict, List, Optional, Sequence, Tuple, Union, overload, TYPE_CHECKING
+from typing_extensions import TypeAlias, Self
 import os
-import dataclasses
 
 # REMARK
 # Because of our custom definition of `easier.sum` function,
@@ -23,11 +20,11 @@ from torch import fx
 
 import h5py
 
-from easier.core.runtime.dist_env import get_runtime_dist_env
+from easier.core.runtime.dist_env import \
+    get_runtime_dist_env, get_default_dist_env
 from easier.core.runtime.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
     FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
-from easier.core.utils import logger, get_random_str
 
 
 if TYPE_CHECKING:
@@ -299,6 +296,43 @@ def _dist_collect(tensor: 'Tensor') -> torch.Tensor:
     return synced.to(device=tensor.easier_data_loader.device)
 
 
+def _resolve_to_args(
+    cls_name: Literal['Module', 'Selector', 'Reducer', 'Tensor'],
+    args: tuple,
+    kwargs: dict
+) -> Tuple[Optional[torch.device], Optional[torch.dtype]]:
+    """
+    PyTorch nn.Module.to() or torch.Tensor.to() have multiple overloadings:
+    - to(device)
+    - to(dtype)
+    - to(device, dtype)
+    These overloadings are differentiated by parameter types rather than
+    the number of parameters.
+
+    TODO for the sake of simplicity, we take only one argument for now.
+    To change both dtype and device, users could use a chain of calls
+    `mod.to(dtype).to(device)` for now.
+    """
+    # TODO validate kwargs.values() are well typed, e.g. avoid device=int64
+    _args = set(args).union(kwargs.values())
+    if len(_args) != 1:
+        raise NotImplementedError(
+            f'Currently easier.{cls_name}.to() only supports one argument,'
+            ' consider using method chaining `.to(dtype).to(device)`'
+        )
+    arg, = _args
+
+    if isinstance(arg, torch.dtype):
+        return None, arg
+    elif isinstance(arg, (str, torch.device)):
+        return torch.device(arg), None
+    else:
+        raise TypeError(
+            f"easier.{cls_name}.to() does not accept the argument"
+            f" of type {type(arg)}"
+        )
+
+
 IdxStatus: TypeAlias = Literal['placeholder', 'partially_loaded', 'rewritten']
 
 
@@ -336,10 +370,17 @@ class Selector(nn.Module):
         # thrown and reported by the tensor indexing operation.
         return tensor[self.idx]
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Selector does not support .to() method,"
-            " consider defining a new easier.Selector instance.")
+    def to(self, device: Union[str, torch.device]) -> Self:
+        # easier.Module/Selector/Reducer cannot take dtype. See Reducer.to()
+        if self.easier_index_status != 'placeholder':
+            raise RuntimeError(
+                "The properties of easier.Selector can only be modified"
+                " before easier.compile()"
+            )
+
+        self.easier_data_loader = self.easier_data_loader.to(device=device)
+        self.idx = self.easier_data_loader.get_placeholder()
+        return self
 
 
 ReduceOp: TypeAlias = Literal['sum', 'prod', 'mean', 'amax', 'amin']
@@ -419,10 +460,21 @@ class Reducer(nn.Module):
         return out.scatter_reduce_(0, idx, tensor, self.reduce,
                                    include_self=False)
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Reducer does not support .to() method,"
-            " consider defining a new easier.Reducer instance.")
+    def to(self, device: Union[str, torch.device]) -> Self:
+        # easier.Module/Selector/Reducer cannot take int dtype.
+        # While Selector (essentially doing a[b]) can have int32/int16
+        # as idx dtype, Reducer (torch.scatter_reduce_) can only take int64,
+        # otherwise 'torch' JIT backend won't work.
+        # TODO we'd better either enforce int64 in ctors or do cast accordingly
+        if self.easier_index_status != 'placeholder':
+            raise RuntimeError(
+                "The properties of easier.Reducer can only be modified"
+                " before easier.compile()"
+            )
+
+        self.easier_data_loader = self.easier_data_loader.to(device=device)
+        self.idx = self.easier_data_loader.get_placeholder()
+        return self
 
 
 class Tensor(nn.Parameter):
@@ -449,7 +501,15 @@ class Tensor(nn.Parameter):
 
         self.easier_data_loader: DataLoaderBase
 
-        self.easier_data_ready: bool = False
+        # The value for this field is collectively same:
+        # - False: esr.compile() not run for any modules containing this tensor
+        # - True: data loaded and non-empty on all ranks, including:
+        #    -- dist tensors in backend='torch/cpu/cuda',
+        #       and these are cases where `elempart != None`
+        #    -- replicated tensors in all backends.
+        # - rank0_only: generally, dist tensors in backend='none' have this,
+        #       meaning that all data is on rank-0, other ranks have empty.
+        self.easier_data_ready: Literal[False, True, 'rank0_only'] = False
 
         # TODO names like `is_partition` are potentially conflict to pytorch,
         # will `easier_is_partition` with namespace be better?
@@ -464,7 +524,8 @@ class Tensor(nn.Parameter):
         # (no matter if they are referenced by `get_attr` Nodes),
         self.easier_tensor_group: 'EasierTensorGroup'
 
-        # Only tensors that are distributed and used has this field set.
+        # Only tensors that are distributed and in `torch` etc. backends
+        # have this field set.
         self.elempart: 'Optional[ElemPart]' = None
 
     def __repr__(self) -> str:
@@ -481,7 +542,7 @@ class Tensor(nn.Parameter):
                 repr_str = ''
             return 'Managed partitioned easier.Tensor' + repr_str
 
-    def __setitem__(self, indices, val) -> 'Tensor':
+    def __setitem__(self, indices, val) -> Self:
         """
         This __setitem__ generally runs for setting replicated easier.Tensor
         content, outside the scope for compiled easier.Module.forward().
@@ -491,35 +552,72 @@ class Tensor(nn.Parameter):
         self.data.__setitem__(indices, val)
         return self
 
-    def to(self, *args, **kwargs):
-        """
-        `torch.Tensor.to()` returns self if the specified dtype/device is
-        compatible with the old properties.
-        Following this style implies that any in-place modification might be
-        unconsciously reflected through on both `easier.Tensor` references.
+    @overload
+    def to(self, dtype: torch.dtype) -> Self: ...
+    @overload
+    def to(self, device: Union[str, torch.device]) -> Self: ...
+    # TODO support this overload like torch.nn.Module.to()
+    # @overload
+    # def to(self, device: Union[str, torch.device], dtype: torch.dtype): ...
 
-        EASIER users might consider defining a new `easier.Tensor` instance
-        with proper dtype settings.
+    def to(self, *args, **kwargs) -> Self:
         """
-        raise TypeError(
-            "easier.Tensor does not support .to() method,"
-            " consider defining a new easier.Tensor instance.")
+        Before easier.compile(), users can call easier.Tensor.to() to modify:
+        -   the target dtype,
+        -   the target device.
+
+        And unlike torch.Tensor.to(), easier.Tensor.to() always return the
+        easier.Tensor instance itself
+        (since before easier.compile(), an easier.Tensor is only a descriptor
+        of the distributed data).
+        """
+        if self.easier_data_ready != False:
+            raise RuntimeError(
+                "The properties of easier.Tensor can only be modified"
+                " before easier.compile()"
+            )
+
+        device, dtype = _resolve_to_args('Tensor', args, kwargs)
+
+        self.easier_data_loader = self.easier_data_loader.to(
+            device=device, dtype=dtype
+        )
+        self.data = self.easier_data_loader.get_placeholder()
+        return self
 
     def collect(self) -> torch.Tensor:
+        """
+        `easier.Tensor.collect()` collectively returns the full tensor
+        on all ranks.
+
+        The resultant torch.Tensor will be on the device originally specified
+        by the user program before entering `easier.compile()`.
+        """
         if not self.easier_data_ready:
             raise RuntimeError("Tensor data is not ready, run compile() first")
 
-        if self.elempart is not None:
-            return _dist_collect(self)
+        elif self.easier_data_ready == 'rank0_only':
+            dist_env = get_default_dist_env()
+            if dist_env.rank == 0:
+                t = dist_env.broadcast(0, self.data.to(dist_env.comm_device))
+            else:
+                t = dist_env.broadcast(0, shape=self.shape, dtype=self.dtype)
+            return t.to(self.easier_data_loader.device, copy=True)
+
         else:
-            return self.data.to(self.easier_data_loader.device, copy=True)
+            assert self.easier_data_ready == True
+            if self.elempart is not None:
+                return _dist_collect(self)
+            else:
+                return self.data.to(self.easier_data_loader.device, copy=True)
 
     def save(self, h5_file_path, h5_dataset_path, **h5_file_kwargs) -> None:
         if not self.easier_data_ready:
             raise RuntimeError("Tensor data is not ready, run compile() first")
 
-        dist_env = get_runtime_dist_env()
-        if dist_env.rank == 0:
+        # with 'none' backend we don't have runtime_dist_env configured.
+        rank = get_default_dist_env().rank
+        if rank == 0:
 
             h5_file_path = os.path.expanduser(h5_file_path)
 
@@ -538,14 +636,19 @@ class Tensor(nn.Parameter):
                 if self.elempart is not None:
                     _dist_save(self, h5d)  # collectively save dist tensor
                 else:
-                    h5d[...] = self.data.cpu()  # replica
+                    h5d[...] = self.data.cpu()  # replica or 'none' backend
 
         else:
             if self.elempart is not None:
                 _dist_save(self, None)  # collectively save dist tensor
 
 
-def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
+def _dist_save(
+    tensor: 'Tensor',
+    h5d: Optional[h5py.Dataset],
+    *,
+    chunk_size: Optional[int] = None
+) -> None:
     """
     Save all distributed part of an `esr.Tensor` into a HDF5 dataset.
 
@@ -559,7 +662,7 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
     assert tensor.elempart is not None
 
     dist_env = get_runtime_dist_env()
-    chunk_size = 1024 * 1024 * 128  # roughly 128M elements
+    chunk_size = chunk_size or 1024 * 1024 * 128  # roughly 128M elements
 
     orig_len = tensor.easier_data_loader.shape[0]
     sub_shape = tensor.easier_data_loader.shape[1:]
@@ -568,52 +671,40 @@ def _dist_save(tensor: 'Tensor', h5d: Optional[h5py.Dataset]) -> None:
     if remainder > 0:
         nchunk += 1
 
-    idx = tensor.elempart.idx  # already ordered, but discrete.
-
-    # Count how many indexes each chunk has on this rank
-    chunk_counts = torch.bincount(
-        idx // chunk_size,  # determine chunk IDs of each elempart index
-        minlength=nchunk)
-
-    # TODO to bincount all chunked slices is a simple and direct approach.
-    # An alternative approach is to `torch.searchsorted` since idx is ordered,
-    # which is binary search underneath and may be more efficient (but save()
-    # is called outside of computing workflow although)
-
-    idx_start = 0
+    idx = tensor.elempart.idx
 
     for i in range(nchunk):
-        slice_len = int(chunk_counts[i])
-        idx_end = idx_start + slice_len
+        idx_start = chunk_size * i
+        idx_end = builtins.min(orig_len, chunk_size * (i + 1))
 
-        idx_slice = idx[idx_start:idx_end].to(dist_env.comm_device)
-        data_slice = tensor[idx_start:idx_end].to(dist_env.comm_device)
+        # TODO O(orig_len * nchunk) complexity, maybe sorting elempart.idx
+        # first could make it faster.
+        idx_region = torch.logical_and(idx >= idx_start, idx < idx_end)
+        chunk_idx = idx[idx_region].to(dist_env.comm_device) - idx_start
+        chunk_data = tensor[idx_region].to(dist_env.comm_device)
 
-        idx_slices = dist_env.gather(0, idx_slice)
-        data_slices = dist_env.gather(0, data_slice)
-
-        idx_start = idx_end  # for next step
+        idx_chunks = dist_env.gather(0, chunk_idx)
+        data_chunks = dist_env.gather(0, chunk_data)
 
         if dist_env.rank == 0:
-            assert isinstance(idx_slices, list)
-            assert isinstance(data_slices, list)
-            assert len(idx_slices) == len(data_slices)
+            assert isinstance(idx_chunks, list)
+            assert isinstance(data_chunks, list)
+            assert len(idx_chunks) == len(data_chunks)
 
-            chuck_size_i = builtins.min(
-                orig_len, chunk_size * (i+1)) - chunk_size * i
-            assert builtins.sum(s.shape[0] for s in idx_slices) == chuck_size_i
+            chuck_size_i = idx_end - idx_start
+            assert builtins.sum(s.shape[0] for s in idx_chunks) == chuck_size_i
 
-            h5d_slice = torch.empty(
+            h5d_chunk = torch.empty(
                 (chuck_size_i,) + sub_shape,
                 dtype=tensor.dtype,
                 device=dist_env.comm_device
             )
-            for idx_slice, data_slice in zip(idx_slices, data_slices):
-                assert idx_slice.shape[0] == data_slice.shape[0]
-                h5d_slice[idx_slice] = data_slice
+            for chunk_idx, chunk_data in zip(idx_chunks, data_chunks):
+                assert chunk_idx.shape[0] == chunk_data.shape[0]
+                h5d_chunk[chunk_idx] = chunk_data
 
             assert h5d is not None
-            h5d[(chunk_size*i):(chunk_size*i+chuck_size_i)] = h5d_slice.cpu()
+            h5d[idx_start:idx_end] = h5d_chunk.cpu()
 
 
 class Module(nn.Module):
@@ -641,10 +732,94 @@ class Module(nn.Module):
     def forward(self):
         pass
 
-    def to(self, *args, **kwargs):
-        raise TypeError(
-            "easier.Module does not support .to() method,"
-            " consider defining a new easier.Module instance.")
+    @overload
+    def to(self, dtype: torch.dtype) -> Self: ...
+    @overload
+    def to(self, device: Union[str, torch.device]) -> Self: ...
+    # TODO support this overload like torch.nn.Module.to()
+    # @overload
+    # def to(self, device: Union[str, torch.device], dtype: torch.dtype): ...
+
+    def to(self, *args, **kwargs) -> Self:
+        """
+        Before easier.compile(), users can call easier.Module.to() to modify:
+        -   The target dtype of all nested easier.Tensors.
+
+            The input dtype must be floating points, and
+            the casting only take effect on easier.Tensors that are defined to
+            be floating points.
+
+        -   The target device of all nested
+            easier.Modules/Selectors/Reducers/Tensors.
+
+        easier.Module/Selector/Reducer/Tensor.to() will be called on those
+        nested objects.
+        Particularly for easier.Tensors, .to() calls won't clone the
+        easier.Tensors but merely modify their properties.
+        This is unlike torch.Tensor.to().
+        """
+        if self.easier_jit_backend is not None:
+            raise RuntimeError(
+                "The properties of easier.Module can only be modified"
+                " before easier.compile()"
+            )
+
+        device, fp_dtype = _resolve_to_args('Module', args, kwargs)
+        if fp_dtype is not None:
+            if not fp_dtype.is_floating_point:
+                # TODO check dtype.is_complex
+                raise ValueError(
+                    f"easier.Module.to() does not accept the dtype {fp_dtype},"
+                    " floating point dtypes are required"
+                )
+
+        # avoid circular import
+        from easier.core.passes.utils import get_easier_objects
+
+        # Keys are Modules/Selectors/Reducers/Tensors/DataLoaders,
+        # remarkably:
+        # - attribute DataLoaders of Modules are casted and setattr().
+        # - Selectors/Reducers that not involved in forward();
+        # - many S/R/Ts may share a DataLoader instance at the beginning,
+        #   after .to() each of them will have an individual DataLoader,
+        #   this is OK as DataLoaders are purely descriptive and lightweight,
+        #   and won't affect the collective behavior of DataLoaders.
+        objs: dict = get_easier_objects([self])
+        for obj in objs:
+            if isinstance(obj, (Selector, Reducer)):
+                if device is not None:
+                    obj.to(device)
+
+            if isinstance(obj, Tensor):
+                # TODO always `obj.to()` twice as Tensor.to() does not have
+                # good overloading resolution.
+                if device is not None:
+                    obj.to(device)
+                if fp_dtype is not None:
+                    if obj.easier_data_loader.dtype.is_floating_point:
+                        obj.to(fp_dtype)
+
+            if isinstance(obj, Module):
+                # Including self Module.
+                #
+                # Including DataLoaders that are purely bound on Modules
+                # but never used by S/R/T (and those DTs won't be covered by
+                # get_easier_objects), those DTs are casted only for
+                # easier usage for users, since users somehow stored the DTs.
+                #
+                # TODO we do not examine DTs in user-defined collections
+                # like `self.dts = (dt1, dt2)`, this behavior seems the same as
+                # users should use register_buffer() or ParameterList in torch.
+                for dt_name, dt in list(obj.__dict__.items()):
+                    if isinstance(dt, DataLoaderBase):
+                        if dt.dtype.is_floating_point:
+                            dt_fp_dtype = fp_dtype
+                        else:
+                            dt_fp_dtype = None
+                        dt = dt.to(dtype=dt_fp_dtype, device=device)
+                        setattr(obj, dt_name, dt)
+
+        return self
 
 
 def _allreduce(op, tensor: torch.Tensor, *args, **kwargs):
@@ -686,24 +861,24 @@ def norm(tensor: torch.Tensor, p: Union[int, str] = 2) -> torch.Tensor:
 
 def max(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Equivalent to `torch.max(tensor, dim=0, keepdim=True)`.
+    Equivalent to `torch.amax(tensor, dim=0, keepdim=True)`.
 
     Args:
     -   tensor:
         At JIT-time, must be a distributed tensor.
     """
-    return _allreduce(torch.max, tensor)
+    return _allreduce(torch.amax, tensor)
 
 
 def min(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Equivalent to `torch.min(tensor, dim=0, keepdim=True)`.
+    Equivalent to `torch.amin(tensor, dim=0, keepdim=True)`.
 
     Args:
     -   tensor:
         At JIT-time, must be a distributed tensor.
     """
-    return _allreduce(torch.min, tensor)
+    return _allreduce(torch.amin, tensor)
 
 
 easier_aggregators = (sum, prod, norm, max, min)

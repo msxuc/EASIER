@@ -1,12 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Dict, List, Sequence, Tuple, Union
 from dataclasses import dataclass
-from typing_extensions import Literal, OrderedDict, TypeAlias
+from typing_extensions import Literal, OrderedDict
 import functools
-import more_itertools
-import os
 
 import torch
 from torch.fx.graph import Graph
@@ -24,10 +22,9 @@ from easier.core.passes.utils import \
     get_selector_reducer_idx_partition_pair, \
     normalize_reducer_call_into_args, normalize_selector_call_into_args, \
     get_easier_tensors
-from easier.core.runtime.dist_env import \
-    get_runtime_dist_env
+from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.distpart import distpart_kway, DistConfig
-from easier.core.utils import EasierJitException, logger
+from easier.core.utils import EasierJitException
 
 # METIS adj weights are ints
 METIS_ADJWGT_REDUCER: int = 10
@@ -86,14 +83,7 @@ def parallel_partition_graph(
         else:
             selector_graph = selector_graph + commpair_graph
 
-    graph = (selector_graph.minimum(1) + reducer_graph).tolil()
-    # scipy warns against `setdiag` on CSR. LIL format is recommended instead.
-
-    # Set the diagonal (relatively to the global adjmat)
-    # zeros and excluded from sparsity.
-    off_diag: int = int(vtxdist[rank])
-    graph.setdiag(0, off_diag)
-    graph = graph.tocsr()
+    graph = selector_graph.minimum(1) + reducer_graph
 
     local_membership = distpart_kway(
         DistConfig(
@@ -340,6 +330,10 @@ def partition_tensor_groups_with_adjmat(
     # Invoke partition
     #
 
+    # TODO tensor_group_partition didn't handle the cases well
+    # where the number of vertexes is less than the world size.
+    # (although such lightweight cases do not need distribution at all)
+
     # e.g. [0, N, 2N, ..., min(accum_n, wN)]
     vtxdist = torch.arange(world_size + 1) * per_worker_n
     vtxdist[-1].clamp_(max=accum_n)
@@ -372,22 +366,52 @@ class ElemPartArangeIdx:
 
 
 @dataclass
+class ElemPartReorderedArangeIdx:
+    """
+    A shuffled ArangeIdx. Generally resulted from ElemPart reordering on
+    ArangeIdx ElemPart.
+    """
+    start: int
+    end: int
+
+
+@dataclass
+class ElemPartSortedIdx:
+    """
+    This idx_desc will appear when any general ElemPart is made, or, determined
+    to be sorted.
+    Some inspection algorithm which used to use e.g. torch.isin()
+    could benefit from the sorted-ness.
+
+    NOTE a temp sorted ElemPart could be created to locally boost analysis,
+    even the sorted ElemPart will not get stored.
+    """
+    pass
+
+
+"""
+4 idx_desc types, including None, form a partial order of "well-ordered-ness"
+
+       ___  ReorderedArangeIdx ___
+None --|                         |-- ArangeIdx
+       ---  SortedIdx  -----------
+"""
+
+
+@dataclass
 class ElemPart:
 
     # Only for this worker.
-    idx_desc: Union[torch.Tensor, ElemPartArangeIdx]
+    idx_desc: Union[
+        None, ElemPartArangeIdx, ElemPartReorderedArangeIdx, ElemPartSortedIdx
+    ]
+
+    idx: torch.Tensor
 
     # All lengths are replicated on all workers
     lengths: List[int]
 
     hint: str
-
-    @functools.cached_property
-    def idx(self) -> torch.Tensor:
-        if isinstance(self.idx_desc, ElemPartArangeIdx):
-            return torch.arange(self.idx_desc.start, self.idx_desc.end)
-        else:
-            return self.idx_desc
 
     def __hash__(self) -> int:
         return id(self)
@@ -480,7 +504,7 @@ def synchronize_partition_result(
         elempart_hint = get_elempart_hint(elempart_i, tensor_group)
 
         synced_elemparts[tensor_group] = ElemPart(
-            elempart, elempart_lengths, hint=elempart_hint
+            None, elempart, elempart_lengths, hint=elempart_hint
         )
 
     # endfor tensor_groups
@@ -578,6 +602,7 @@ def get_even_elemparts(modules, graphs):
 
         elemparts[tensor_group] = ElemPart(
             ElemPartArangeIdx(start, end),
+            torch.arange(start, end),
             lengths,
             hint=elempart_hint
         )
