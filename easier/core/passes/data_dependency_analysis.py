@@ -2,18 +2,20 @@
 # Licensed under the MIT License.
 
 import itertools
+import operator
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from torch import nn
 from torch.fx.graph import Graph
 from torch.fx.node import Node
 from easier.core.runtime.metadata import \
-    Role, RuntimeTensorMeta, ViewSrc, get_node_meta
+    Role, RuntimeTensorMeta, get_node_meta, collect_meta, \
+    ViewSrc, get_node_view_src
 
 import easier.core.module as esr
 
 from easier.core.passes.utils import \
-    FX, EasierInterpreter, OrderedSet, tree_map
+    FX, EasierInterpreter, OrderedSet
 
 
 KEY__DATA_DEPENDENCY_INPUTS = 'easier_dataDependency_inputs'
@@ -178,36 +180,47 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
         if self.is_skipped(self.current_node):
             return
 
-        class _ViewSrcCollector:
-            def __init__(self):
-                self.view_srcs: OrderedSet[ViewSrc] = OrderedSet()
+        arg_srcs = None  # type: ignore
 
-            def collect_view_src(self, x):
-                if isinstance(x, RuntimeTensorMeta):
-                    if x.view_src is not None:
-                        self.view_srcs.add(x.view_src)
+        # If getitem is for tuple indexing, which is essentially a syntactic
+        # construct of EASIER IR, R/W relations only cover that specified item.
+        if self.current_node.target == operator.getitem:
+            arg0 = self.current_node.all_input_nodes[0]
+            assert not self.is_skipped(arg0)
+            is_tuple_indexing = not isinstance(
+                get_node_meta(arg0), RuntimeTensorMeta
+            )
+            if is_tuple_indexing:
+                tuple_item_index = self.current_node.args[1]
+                assert isinstance(tuple_item_index, int)
+                arg_srcs = collect_meta(
+                    get_node_view_src(arg0)[tuple_item_index],  # type: ignore
+                    leaf_type=ViewSrc
+                )
 
-        arg_srcs_coll = _ViewSrcCollector()
-        _ = tree_map(
-            [
-                get_node_meta(arg)
-                for arg in self.current_node.all_input_nodes
-                if not self.is_skipped(arg)
-            ],
-            arg_srcs_coll.collect_view_src
-        )
-        for arg_src in arg_srcs_coll.view_srcs:
+        # For all other cases than tuple indexing:
+        if arg_srcs is None:
+            arg_srcs = collect_meta(
+                [
+                    get_node_view_src(arg)
+                    for arg in self.current_node.all_input_nodes
+                    if not self.is_skipped(arg)
+                ],
+                leaf_type=ViewSrc
+            )
+
+        arg_srcs: List[ViewSrc]
+        for arg_src in arg_srcs:
             self.add_reader_dependency(arg_src)
 
         # Generally, purely viewing operators like getitem, reshape will
         # return the argument memory addr, making themselves look like
         # writers, and leading to extra writer dep barriers and handling.
-        res_srcs_coll = _ViewSrcCollector()
-        _ = tree_map(
-            get_node_meta(self.current_node),
-            res_srcs_coll.collect_view_src
+        res_srcs = collect_meta(
+            get_node_view_src(self.current_node),
+            leaf_type=ViewSrc
         )
-        for res_src in res_srcs_coll.view_srcs:
+        for res_src in res_srcs:
             self.add_writer_dependency(res_src)
 
         # Handle more specific scenarios like nested esr.Module calls
@@ -233,18 +246,16 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
             # add read/write dependencies on ALL esr.Tensors in current_module.
             param_srcs: OrderedSet[ViewSrc] = OrderedSet()
 
-            for n in self.current_graph.nodes:
-                if n.op == FX.GET_ATTR:
-                    meta = get_node_meta(n)
-                    assert isinstance(meta, RuntimeTensorMeta)
-
-                    if meta.role == Role.DISTRIBUTED and meta.shape[0] == 0:
+            for getattr in self.current_graph.nodes:
+                if getattr.op == FX.GET_ATTR:
+                    if self.is_skipped(getattr):
                         # Even it's get_attr of an esr.Tensor, if it's skipped
                         # the Node has no view info.
                         continue
 
-                    assert meta.view_src is not None
-                    param_srcs.add(meta.view_src)
+                    attr_view_src = get_node_view_src(getattr)
+                    assert isinstance(attr_view_src, ViewSrc)
+                    param_srcs.add(attr_view_src)
 
             for param_src in param_srcs:
                 self.add_reader_dependency(param_src)

@@ -240,8 +240,13 @@ def _get_random_jitdir_name():
 
 
 def _get_temp_jitdir():
+    """
+    tempfile.gettempdir() respects TMPDIR TMP TEMP env vars.
+    But the env var paths must exist and be writable, otherwise default /tmp
+    will still be returned.
+    """
     temp_jitdir = os.path.join(
-        tempfile.gettempdir(),
+        os.path.expanduser(tempfile.gettempdir()),
         'easier',
         'local_dump',
         _get_random_jitdir_name()
@@ -382,13 +387,17 @@ def dump(
     m1.x.save('/mnt/checkpoint/data.hdf5', 'x')
     ```
 
-    Remark:
-    When only a subset of modules are dumped,
-    and if the communication pattern (in a ideal data partition)
-    on this subset of modules is dramatically different from the pattern of
-    original modules, users should consider not dumping them.
-    Instead, compile that subset of modules from scratch for better runtime
-    performance.
+    Remarks:
+    -   When only a subset of modules are dumped,
+        and if the communication pattern (in a ideal data partition)
+        on this subset of modules is dramatically different from the pattern of
+        original modules, users should consider not dumping them.
+        Instead, compile that subset of modules from scratch for better runtime
+        performance.
+    -   Each rank will firstly write to the local temporary directory
+        (e.g. `/tmp` in Linux).
+        In case of insufficient disk space, users can specify TMP environment
+        variable (on each machine) with an existing, writable directory.
     """
     # NOTE input modules may be top modules, we need to collect all nested
     # sub esr.Modules and dump all of them.

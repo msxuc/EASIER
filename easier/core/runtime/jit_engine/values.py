@@ -28,6 +28,17 @@ class JitSkipped:
 jit_skipped = JitSkipped()
 
 
+class JitReleased:
+    """
+    Represent that the reference to the runtime object,
+    i.e. an instance of _RuntimeValue, has been released.
+    """
+    pass
+
+
+jit_released = JitReleased()
+
+
 _RuntimeValue: TypeAlias = Union[
     torch.Tensor,
     Sequence['_RuntimeValue']
@@ -38,7 +49,8 @@ _RuntimeValue: TypeAlias = Union[
 RuntimeValue: TypeAlias = Union[
     _RuntimeValue,
     None,  # output Nodes, nested esr.Module calls  # TODO any nested Nones?
-    JitSkipped  # Skipped won't be nested
+    JitSkipped,  # Skipped won't be nested
+    JitReleased
 ]
 
 

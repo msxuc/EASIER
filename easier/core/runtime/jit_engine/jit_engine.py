@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Final, List, Tuple, cast
+from typing import Dict, Final, List, Tuple, cast, Optional
 
 import torch
 from torch.fx.node import Node
@@ -10,6 +10,7 @@ from torch.fx.graph import Graph
 import easier as esr
 from easier.core import passes
 from easier.core import module as _EsrMod
+from easier.core.passes.life_range_analysis import get_nodes_end_at
 from easier.core.passes.utils import \
     FX, tree_map, normalize_reducer_call_into_args, \
     get_called_module, get_attr_value, get_easier_tensors
@@ -19,18 +20,19 @@ from easier.core.runtime.dist_env import \
 from easier.core.runtime.modules import HaloExchanger
 from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
-    get_node_meta, set_node_meta, \
-    get_runtime_metadata_from_scalar, collect_meta
+    get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, \
+    StructuredViewSrc, set_node_view_src, get_node_view_src, \
+    IndexedAddr, StructuredIndexedAddr, collect_meta
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
-    JitSkipped, jit_skipped, evaluate_node, RuntimeValue, \
+    JitSkipped, jit_skipped, jit_released, evaluate_node, RuntimeValue, \
     allgather_meta_for_collective_input, exchange_meta_for_halo_exchanger, \
     get_aggregator_neutral_value
 
 
 replica_none_meta = RuntimeTensorMeta(
-    Role.REPLICATED, (), torch.int32, view_src=None
+    Role.REPLICATED, (), torch.int32
 )
 
 jit_skipped_meta = RuntimeTensorMeta(
@@ -39,12 +41,12 @@ jit_skipped_meta = RuntimeTensorMeta(
     # no matter what shape[1:] will be in the runtime.
     #
     # The '0' here should be interpreted as the batch size.
-    Role.DISTRIBUTED, (0,), torch.int32, view_src=None
+    Role.DISTRIBUTED, (0,), torch.int32
 )
 
 
 def get_value_runtime_metadata(
-    addr2viewsrc: Dict[int, Node], node: Node, role: Role, val,
+    node: Node, role: Role, val,
     *,
     _rec_depth=0  # debug-only
 ) -> StructuredTensorMeta:
@@ -52,15 +54,10 @@ def get_value_runtime_metadata(
     Recursive call.
 
     Get a probably nested RuntimeTensorMeta structure for some runtime value.
-    Such a value is normally the result of evaluating `self.current_node`
+    Such a value is normally the result of evaluating `current_node`
     or jit_skipped.
 
-    If a newly allocated tensor is visited, argument `add2viewsrc` dict will
-    be updated.
-
     Args:
-    -   addr2viewsrc:
-            normally the keys are tensor.untyped_storage().data_ptr()
     -   node
     -   role:
             the statically inferred role for this Node
@@ -69,17 +66,8 @@ def get_value_runtime_metadata(
             nested structure.
     """
     if isinstance(val, torch.Tensor):
-        # Get the memory address of the underlying memory
-        # Will ignore offsets, e.g. `x[:, 2]` has offset `2 * sizeof()`
-        addr: int = val.untyped_storage().data_ptr()
-        if addr in addr2viewsrc:
-            view_src: ViewSrc = addr2viewsrc[addr]
-        else:
-            view_src: ViewSrc = node
-            addr2viewsrc[addr] = view_src
-
         tensor_runtime_meta = RuntimeTensorMeta(
-            role, tuple(val.shape), val.dtype, view_src=view_src
+            role, tuple(val.shape), val.dtype
         )
         return tensor_runtime_meta
 
@@ -109,23 +97,13 @@ def get_value_runtime_metadata(
         for i in range(n_items):
             item = val[i]
             item_meta = get_value_runtime_metadata(
-                addr2viewsrc, node, role, item,
+                node, role, item,
                 _rec_depth=_rec_depth+1
             )
 
             # assume being only one level nested.
             assert isinstance(item, torch.Tensor)
             assert isinstance(item_meta, RuntimeTensorMeta)
-
-            if item_meta.view_src is node:
-                # additionally mark it's allocated by a multi-res operation,
-                # give i:int we can only have at most 1 nested level.
-                item_meta = RuntimeTensorMeta(
-                    role=item_meta.role,
-                    shape=item_meta.shape,
-                    dtype=item_meta.dtype,
-                    view_src=(node, i)
-                )
 
             item_metas.append(item_meta)
 
@@ -169,6 +147,304 @@ def get_meta_role_size(meta: StructuredTensorMeta) -> Tuple[Role, int]:
         return replica
 
 
+class StackframeManager(NodeHandlerBase):
+    """
+    StackframeManager essentially plays the role like how Python interpreter,
+    it loads argument values from the stackframe for evaluating a callable,
+    and stores the result back to the stackframe.
+
+    Also, StackframeManager garbage-collects unused values (Python objects),
+    but differs from standard Python scenarios:
+
+    -   Original function scopes of users' EASIER Python programs are totally
+        inlined, due to FX tracing mechanism.
+        Function-scope GC is no longer achievable.
+    
+    -   The timing when to release a value relies on the calculation of
+        life_range_analysis AOT pass, which would be more aggressive than
+        Python-built-in function-scope GC.
+    """
+    def preprocess(
+        self,
+        current_node: Node,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> PreprocessDecision:
+        """
+        Load RuntimeValues from the stackframe to be arguments.
+        """
+        assert len(args) == 0
+        assert len(kwargs) == 0
+
+        def _eval(x):
+            # instead sf.get(x,x) we want to also check type consistency.
+            if isinstance(x, Node):
+                return self.stackframe[x]
+            else:
+                return x
+
+        args.clear()
+        args.extend(
+            tree_map(v, _eval) for v in current_node.args  # type: ignore
+        )
+
+        kwargs.clear()
+        kwargs.update({
+            k: tree_map(v, _eval)
+            for k, v in current_node.kwargs.items()}  # type: ignore
+        )
+
+        return PreprocessDecision.CONTINUE
+
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
+        """
+        Store the resultant RuntimeValue into the stackframe.
+
+        If any Nodes' life ranges end at this Node, release their
+        RuntimeValues.
+
+        This must be the last postprocess, as JitSkipped should also be stored.
+        """
+        self.stackframe[current_node] = res
+
+        nodes_end_here = get_nodes_end_at(current_node)
+
+        for ending_node in nodes_end_here:
+            # May release stackframe[current_node] immediately
+            # if it has no users at all.
+            self.stackframe[ending_node] = jit_released
+
+        if current_node in nodes_end_here:
+            # in case `res` get leaked
+            return jit_released
+
+        return res
+
+
+class ViewSrcTrackerBase(NodeHandlerBase):
+    """
+    Maintain the ref count on the memory address.
+    During the period that memory address is still referenced, we know the
+    determined ViewSrc/allocator of it is still valid.
+
+    When the ref count is decreased to 0, we reset the ViewSrc relationship.
+    Namely, if PyTorch decides to reuse that memory address, another ViewSrc
+    will be related.
+
+    P.S. In the worst case that we maintained ref count wrongly
+    (for example, some Handler happens to leak the tensor instance),
+    ref count here still aligns with the most fundamental expectation
+    of memory lifetime, at the price of memory not reusable,
+    but not wrong read/write.
+
+    NOTE What tensor.untyped_storage() returns is a Python-world lightweight
+    wrapper over the native-world PyTorch memory, it's hard to answer if
+    the lifetime of the wrapper Pyobj reflects the real lifetime of the memory.
+    So currently we need to maintain the ref count manually.
+    """
+
+    def __init__(
+        self, module: esr.Module, stackframe: Dict[Node, RuntimeValue]
+    ) -> None:
+        super().__init__(module, stackframe)
+
+        self.addr2refcount: Dict[int, int] = {}
+        self.addr2viewsrc: Dict[int, ViewSrc] = {}
+
+    def _get_indexed_addr(
+        self, iaddr_node: Node, val: RuntimeValue,
+        *,
+        _rec_depth=0  # debug-only
+    ) -> StructuredIndexedAddr:
+        """
+        Each resultant item tuple is:
+        an addr int with either a) None, b) an index within multi-result.
+
+        When the ref count is increased 0 -> 1, we know the addr is allocated
+        by current_node, and we map
+        IndexedAddr(addr:int, index:int|None) |-> ViewSrc(current_node, index)
+
+        Otherwise, although we have an index, it's irrelevant, because the addr
+        with refcount > 0 indicates the memory was allocated earlier.
+
+        Args:
+        -   iaddr_node: The Node whose items' addresses will be checked,
+                not necessary to be `current_node`
+        -   val: The RuntimeValue bound to `iaddr_node`,
+                not necessary to be `res` arg of `postprocess()`
+        """
+        if isinstance(val, torch.Tensor):
+            item_iaddr = val.untyped_storage().data_ptr()
+            return IndexedAddr(item_iaddr, None)
+
+        elif isinstance(val, (tuple, list)):
+            if _rec_depth > 0:
+                raise EasierJitException(
+                    "Unexpected nested result with nested depth > 1 from"
+                    f" {iaddr_node.format_node()}"
+                )
+
+            indexed_addrs = []
+            for i, item in enumerate(val):
+                item_iaddr = self._get_indexed_addr(
+                    iaddr_node, item,
+                    _rec_depth=_rec_depth+1
+                )
+
+                if isinstance(item_iaddr, IndexedAddr):
+                    # So far, if the recursive item is IndexedAddr,
+                    # it must have a single addr int.
+                    assert item_iaddr.index is None
+                    indexed_addr = IndexedAddr(item_iaddr.addr, i)
+                else:
+                    indexed_addr = None
+
+                indexed_addrs.append(indexed_addr)
+
+            return indexed_addrs
+
+        elif val is None:
+            # TODO assert _rec_depth == 0  # possible?
+            return None
+
+        elif val is jit_skipped or isinstance(val, (int, float, bool)):
+            assert _rec_depth == 0, \
+                "Scalars and jit_skipped are always not nested"
+            return None
+
+        else:
+            raise EasierJitException(
+                f"Unexpected runtime value {val} or nested structure"
+            )
+
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
+        #
+        # Increase ref count;
+        # If previous ref count is 0, set current_node as ViewSrc.
+        #
+        res_siaddr: StructuredIndexedAddr = self._get_indexed_addr(
+            current_node, res
+        )
+
+        def _to_view_src(
+            res_item_iaddr: Optional[IndexedAddr]
+        ) -> Optional[ViewSrc]:
+            if not isinstance(res_item_iaddr, IndexedAddr):
+                assert res_item_iaddr is None
+                return res_item_iaddr
+
+            res_item_addr = res_item_iaddr.addr
+
+            prev_refcount: int
+            if res_item_addr not in self.addr2refcount:
+                self.addr2refcount[res_item_addr] = 0
+                prev_refcount = 0
+            else:
+                prev_refcount = self.addr2refcount[res_item_addr]
+                # if prev_refcount == 0:
+                #     # TODO don't log, it's very frequent, almost per-node
+                #     logger.debug(f"Reuse memory addr {res_item_addr}")
+
+            if current_node.op == FX.GET_ATTR:
+                # GET_ATTR increases ref count by 2 = 1 + 1:
+                # - 1 ref count is because of the local variable of GET_ATTR
+                # - 1 extra ref count is because of everlasting esr.Tensor
+                #   instance that will never be released,
+                #   even all local variables of GET_ATTR die out.
+                #
+                # And it's OK to have multiple extra 1s for esr.Tensor aliases,
+                # as long as it remains `refcount > 0`.
+                self.addr2refcount[res_item_addr] += 2
+            else:
+                self.addr2refcount[res_item_addr] += 1
+
+            if prev_refcount == 0:
+                # Find an allocator
+                res_item_view_src = ViewSrc(
+                    current_node, res_item_iaddr.index
+                )
+                self.addr2viewsrc[res_item_addr] = res_item_view_src
+            else:
+                # The addr was allocated earilier. The iaddr.index will not
+                # be considered.
+                res_item_view_src = self.addr2viewsrc[res_item_addr]
+
+            return res_item_view_src
+        # enddef _to_view_src()
+
+        #
+        # Determine the (nested) ViewSrc and let subclasses handle it.
+        #
+        res_view_src = cast(
+            StructuredViewSrc,
+            tree_map(res_siaddr, _to_view_src)
+        )
+
+        self.handle_view_src(current_node, res_view_src)
+
+        #
+        # Decrease ref count.
+        #
+        for node_ends_here in get_nodes_end_at(current_node):
+            # If cur_node has no users, it ends at itself immediately.
+            if node_ends_here is current_node:
+                # but cur res is not in stackframe yet
+                end_val = res
+            else:
+                end_val = self.stackframe[node_ends_here]
+            # For multi-res Nodes, the stackframe[ends_here:Node] will
+            # be a nested structure -- it gets unpacked in following
+            # operator.getitem Nodes.
+
+            # NOTE currently for the sake of simplicity _get_indexed_addr()
+            # cannot handle nester layer > 1, so we cannot concat `env_val`s
+            # into a list first.
+            end_siaddr: StructuredIndexedAddr = self._get_indexed_addr(
+                node_ends_here, end_val
+            )
+            end_item_iaddrs: List[IndexedAddr] = collect_meta(
+                end_siaddr, leaf_type=IndexedAddr
+            )
+
+            for end_item_iaddr in end_item_iaddrs:
+                end_item_addr = end_item_iaddr.addr
+                self.addr2refcount[end_item_addr] -= 1
+
+                if self.addr2refcount[end_item_addr] == 0:
+                    del self.addr2viewsrc[end_item_addr]
+
+        return res
+
+    def handle_view_src(
+        self, current_node: Node, view_src: StructuredViewSrc
+    ) -> None:
+        pass
+
+
+class ViewSrcTracker(ViewSrcTrackerBase):
+    def handle_view_src(
+        self, current_node: Node, view_src: StructuredViewSrc
+    ) -> None:
+        set_node_view_src(current_node, view_src)
+
+
+class ViewSrcValidation(ViewSrcTrackerBase):
+    def handle_view_src(
+        self, current_node: Node, view_src: StructuredViewSrc
+    ) -> None:
+        prev_view_src = get_node_view_src(current_node)
+        if prev_view_src != view_src:
+            raise EasierJitException(
+                "The allocator of the result tensor of the operation"
+                f" '{current_node.target}' changes:"
+                f" {prev_view_src} => {view_src}"
+            )
+
+
 class MetadataValidation(NodeHandlerBase):
     """
     Postprocess-only.
@@ -179,18 +455,17 @@ class MetadataValidation(NodeHandlerBase):
     Generally, this should be the last postprocess in runtime.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.addr2viewsrc: Dict[int, Node]
+    def __init__(
+        self, module: esr.Module, stackframe: Dict[Node, RuntimeValue]
+    ) -> None:
+        super().__init__(module, stackframe)
 
-    def enter_forward(self):
-        self.addr2viewsrc = {}
+        self.addr2viewsrc: Dict[int, Node] = {}
 
-    def exit_forward(self):
-        self.addr2viewsrc.clear()
-
-    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
-        prev_meta = get_node_meta(self.current_node)
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
+        prev_meta = get_node_meta(current_node)
 
         def _get_dist_role(x: RuntimeTensorMeta):
             return x.role
@@ -205,7 +480,7 @@ class MetadataValidation(NodeHandlerBase):
             role = Role.REPLICATED
 
         result_meta = get_value_runtime_metadata(
-            self.addr2viewsrc, self.current_node, role, res
+            current_node, role, res
         )
 
         # TODO if we support meta changes on the fly, we can just check
@@ -217,7 +492,7 @@ class MetadataValidation(NodeHandlerBase):
         if prev_meta != result_meta:
             raise EasierJitException(
                 "The properties of the result value of the operation"
-                f" '{self.current_node.target}' changes:"
+                f" '{current_node.target}' changes:"
                 f" {prev_meta} => {result_meta}"
             )
 
@@ -233,16 +508,19 @@ class SkipZeroLengthNonHalo(NodeHandlerBase):
     -   Inspect the Node meta, if it is DIST and zero-length, skip it;
     -   By default, continue the preprocess pipeline.
 
-    Generally, this should be the first preprocess in runtime.
+    Generally, this should be the first preprocess in runtime
+    after StackframeLoadStore.
     """
 
-    def preprocess(self, args, kwargs) -> PreprocessDecision:
-        if self.current_node.op == FX.CALL_MODULE:
-            submod = get_called_module(self.current_module, self.current_node)
+    def preprocess(
+        self, current_node: Node, args, kwargs
+    ) -> PreprocessDecision:
+        if current_node.op == FX.CALL_MODULE:
+            submod = get_called_module(self.current_module, current_node)
             if isinstance(submod, HaloExchanger):
                 return PreprocessDecision.CONTINUE
 
-        meta = get_node_meta(self.current_node)
+        meta = get_node_meta(current_node)
 
         def _get_dist_bs(x: RuntimeTensorMeta):
             if x.role == Role.DISTRIBUTED:
@@ -258,7 +536,7 @@ class SkipZeroLengthNonHalo(NodeHandlerBase):
         return PreprocessDecision.CONTINUE
 
 
-class FirstRunMetadataPropagation(NodeHandlerBase):
+class MetadataPropagation(NodeHandlerBase):
     """
     Inspect, propagate and validate metadata in the first run of a forward().
 
@@ -294,8 +572,10 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
     -   Including jit_skipped cases.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self, module: esr.Module, stackframe: Dict[Node, RuntimeValue]
+    ):
+        super().__init__(module, stackframe)
 
         self._replica_role_size: Final = (Role.REPLICATED, 0)
 
@@ -307,7 +587,11 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         #
         # Context for the whole forward() session
         # =================
-        self.addr2viewsrc: Dict[int, Node]
+        # A key is a memory address, a value is the Node that allocates the
+        # memory.
+        # NOTE the memory may be freed and the next allocation reuse an
+        # invalidated address, the allocator Nodes must be differentiated.
+        self.addr2viewsrc: Dict[int, Node] = {}
 
         #
         # Context shared by pre-/post-process
@@ -317,13 +601,9 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         # - For Role.REPLICATED, batch_size is always 0.
         self.expected_role_size: Tuple[Role, int]
 
-    def enter_forward(self):
-        self.addr2viewsrc = {}
-
-    def exit_forward(self):
-        self.addr2viewsrc.clear()
-
-    def preprocess(self, args, kwargs) -> PreprocessDecision:
+    def preprocess(
+        self, current_node: Node, args, kwargs
+    ) -> PreprocessDecision:
         """
         The analysis here is essentially to do one-step, one-Node propagation
         of the (role, batch_size) pair.
@@ -340,16 +620,16 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         """
         should_continue = False
 
-        if self.current_node.op == FX.GET_ATTR:
-            tensor = get_attr_value(self.current_module, self.current_node)
+        if current_node.op == FX.GET_ATTR:
+            tensor = get_attr_value(self.current_module, current_node)
             if isinstance(tensor, _EsrMod.Tensor) and tensor.is_partition:
                 self.expected_role_size = (Role.DISTRIBUTED, tensor.shape[0])
 
             else:
                 self.expected_role_size = self._replica_role_size
 
-        elif self.current_node.op == FX.CALL_MODULE:
-            submod = get_called_module(self.current_module, self.current_node)
+        elif current_node.op == FX.CALL_MODULE:
+            submod = get_called_module(self.current_module, current_node)
             if isinstance(submod, _EsrMod.Module):
                 self.expected_role_size = self._replica_role_size
 
@@ -377,15 +657,15 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
             else:
                 assert False, 'in the first run there will be only 4 cases'
 
-        elif self.current_node.op == FX.OUTPUT:
+        elif current_node.op == FX.OUTPUT:
             self.expected_role_size = self._replica_role_size
 
-        elif self.current_node.target in _EsrMod.easier_aggregators:
+        elif current_node.target in _EsrMod.easier_aggregators:
             self.expected_role_size = self._replica_role_size
 
         else:  # call_method or call_function, mapped ops
             arg_metas = list(
-                get_node_meta(n) for n in self.current_node.all_input_nodes
+                get_node_meta(n) for n in current_node.all_input_nodes
             )
             self.expected_role_size = get_meta_role_size(arg_metas)
 
@@ -395,15 +675,24 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
         else:
             return PreprocessDecision.CONTINUE
 
-    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
         """
         Validate Role and batch size consistency between the inferred info
         and runtime, possibly nested, data.
         """
         role = self.expected_role_size[0]
         runtime_meta = get_value_runtime_metadata(
-            self.addr2viewsrc, self.current_node, role, res
+            current_node, role, res
         )
+
+        # TODO wrong! releasing Node or releasing the tensor don't mean
+        # the memory is freed!
+        # ends_here = get_args_end_at(current_node)
+        # for addr, view_src in list(self.addr2viewsrc.items()):
+        #     if view_src in ends_here:
+        #         del self.addr2viewsrc[addr]  # memory regions may be reused
 
         def _collect_dist_bs(x: RuntimeTensorMeta):
             if x.role == Role.DISTRIBUTED:
@@ -425,7 +714,7 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
             if len(dist_batch_sizes) != 1:
                 raise EasierJitException(
                     f"Distributed multiple-result operation"
-                    f" '{self.current_node.format_node()}'"
+                    f" '{current_node.format_node()}'"
                     f" does not have a unique batch size, but there are"
                     f" {list(dist_batch_sizes)}"
                 )
@@ -434,35 +723,35 @@ class FirstRunMetadataPropagation(NodeHandlerBase):
             if self.expected_role_size != (Role.DISTRIBUTED, dbs):
                 raise EasierJitException(
                     f"Distributed operation"
-                    f" '{self.current_node.format_node()}'"
+                    f" '{current_node.format_node()}'"
                     f" result has the batch size {dbs},"
                     f" but {self.expected_role_size[1]} is expected"
                 )
 
         from easier.core.runtime.metadata import KEY__METADATA_RUNTIME
-        if KEY__METADATA_RUNTIME in self.current_node.meta:
-            exist_meta = get_node_meta(self.current_node)
+        if KEY__METADATA_RUNTIME in current_node.meta:
+            exist_meta = get_node_meta(current_node)
             if exist_meta != runtime_meta:
                 assert False, \
                     "if another specified Handler has set runtime meta" \
-                    f" for Node:\n    {self.current_node.format_node()}" \
+                    f" for Node:\n    {current_node.format_node()}" \
                     "\nit should be consistent with the general MetaProp," \
                     " but get:\n" \
                     f"    {exist_meta}\n" \
                     f"==> {runtime_meta}"
 
-        set_node_meta(self.current_node, runtime_meta)
+        set_node_meta(current_node, runtime_meta)
         return res
 
 
-class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
+class AggregatorMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of EASIER aggregators
     in addition to the general FirstRunMetadataPropagation.
     """
 
     def preprocess_call_function(
-        self, function, args: List[RuntimeValue], kwargs
+        self, current_node: Node, function, args: List[RuntimeValue], kwargs
     ) -> PreprocessDecision:
         if function in _EsrMod.easier_aggregators:
             # Set resultant runtime tensor metadata in advance.
@@ -471,15 +760,17 @@ class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
             # input.
             subshape, dtype = allgather_meta_for_collective_input(args[0])
             set_node_meta(
-                self.current_node,
+                current_node,
                 RuntimeTensorMeta(
-                    Role.REPLICATED, (1,) + subshape, dtype, self.current_node
+                    Role.REPLICATED, (1,) + subshape, dtype
                 )
             )
 
         return PreprocessDecision.CONTINUE
 
-    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
         """
         Like PyTorch, esr.sum on int32/etc. will result in int64/etc. to
         avoid overflow, unless dtype is explicitly specified
@@ -487,35 +778,34 @@ class FirstRunAggregatorMetadataPropagation(NodeHandlerBase):
 
         So we need to adjust TensorMeta.dtype to be the real value.
         """
-        if self.current_node.target in _EsrMod.easier_aggregators:
+        if current_node.target in _EsrMod.easier_aggregators:
             assert isinstance(res, torch.Tensor)
             res_dtype = res.dtype
 
-            preprocess_meta = get_node_meta(self.current_node)
+            preprocess_meta = get_node_meta(current_node)
             assert isinstance(preprocess_meta, RuntimeTensorMeta)
             assert preprocess_meta.shape == tuple(res.shape)
 
             set_node_meta(
-                self.current_node,
+                current_node,
                 RuntimeTensorMeta(
                     Role.REPLICATED,
                     preprocess_meta.shape,
-                    res_dtype,  # may differ from preprocess_meta.dtype
-                    self.current_node
+                    res_dtype  # may differ from preprocess_meta.dtype
                 )
             )
 
         return res
 
 
-class FirstRunHaloExchangerMetadataPropagation(NodeHandlerBase):
+class HaloExchangerMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of HaloExchanger
     in addition to the general FirstRunMetadataPropagation.
     """
 
     def preprocess_call_module(
-        self, submod, args: List[RuntimeValue], kwargs
+        self, current_node: Node, submod, args: List[RuntimeValue], kwargs
     ) -> PreprocessDecision:
         if isinstance(submod, HaloExchanger):
 
@@ -527,7 +817,7 @@ class FirstRunHaloExchangerMetadataPropagation(NodeHandlerBase):
         return PreprocessDecision.CONTINUE
 
 
-class FirstRunReducerMetadataPropagation(NodeHandlerBase):
+class ReducerMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of Reducer
     in addition to the general FirstRunMetadataPropagation.
@@ -541,19 +831,19 @@ class FirstRunReducerMetadataPropagation(NodeHandlerBase):
     """
 
     def preprocess_call_module(
-        self, submod, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+        self,
+        current_node: Node,
+        submod,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
         if isinstance(submod, _EsrMod.Reducer):
 
             subshape, dtype = allgather_meta_for_collective_input(args[0])
 
             input_node, opt_out_node = normalize_reducer_call_into_args(
-                *self.current_node.args, **self.current_node.kwargs
+                *current_node.args, **current_node.kwargs
             )
-
-            view_src = self.current_node
-            if opt_out_node is not None:
-                view_src = get_node_meta(opt_out_node).view_src  # type: ignore
 
             if submod.n == 0:
                 # In the first run, to allgather Reducer info we need to
@@ -561,15 +851,15 @@ class FirstRunReducerMetadataPropagation(NodeHandlerBase):
                 # However, just like FirstRunMetaProp decides skip or not,
                 # if this local Reducer is a no-op,
                 # after meta prop, we should skip eval.
-                set_node_meta(self.current_node, jit_skipped_meta)
+                set_node_meta(current_node, jit_skipped_meta)
 
                 return PreprocessDecision.SKIP_EVAL
 
             else:
                 reducer_out_meta = RuntimeTensorMeta(
-                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype, view_src
+                    Role.DISTRIBUTED, (submod.n,) + subshape, dtype
                 )
-                set_node_meta(self.current_node, reducer_out_meta)
+                set_node_meta(current_node, reducer_out_meta)
 
         return PreprocessDecision.CONTINUE
 
@@ -593,6 +883,7 @@ class AggregatorNeutralInputPreparation(NodeHandlerBase):
 
     def preprocess_call_function(
         self,
+        current_node: Node,
         function,
         args: List[RuntimeValue],
         kwargs: Dict[str, RuntimeValue]
@@ -601,13 +892,13 @@ class AggregatorNeutralInputPreparation(NodeHandlerBase):
             if isinstance(args[0], JitSkipped):
                 dist_env = get_runtime_dist_env()
                 result_runtime_meta = get_node_meta(
-                    self.current_node
+                    current_node
                 )
                 assert isinstance(result_runtime_meta, RuntimeTensorMeta)
                 assert result_runtime_meta.role == Role.REPLICATED
 
                 vneutral = get_aggregator_neutral_value(
-                    self.current_node.target, result_runtime_meta.dtype
+                    current_node.target, result_runtime_meta.dtype
                 )
 
                 # TODO We may consider to create the neutral value
@@ -633,7 +924,11 @@ class AggregatorNeutralInputPreparation(NodeHandlerBase):
 
 class HaloExchangerZeroLengthInputPreparation(NodeHandlerBase):
     def preprocess_call_module(
-        self, submod, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+        self,
+        current_node: Node,
+        submod,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
         if isinstance(submod, HaloExchanger):
             if isinstance(args[0], JitSkipped):
@@ -660,7 +955,11 @@ class NotFullReducerOutputAllocation(NodeHandlerBase):
     """
 
     def preprocess_call_module(
-        self, submod, args: List[RuntimeValue], kwargs: Dict[str, RuntimeValue]
+        self,
+        current_node: Node,
+        submod,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
     ) -> PreprocessDecision:
         if isinstance(submod, _EsrMod.Reducer):
             input_val, opt_out_val = normalize_reducer_call_into_args(
@@ -668,38 +967,43 @@ class NotFullReducerOutputAllocation(NodeHandlerBase):
             )
             if isinstance(input_val, JitSkipped):
 
-                self.input_val = input_val
-                self.opt_out_val = opt_out_val
+                # Must be released in postprocess() to ensure not
+                # leaking refcount
+                self.input_val: RuntimeValue = input_val
+                self.opt_out_val: Optional[RuntimeValue] = opt_out_val
 
                 return PreprocessDecision.SKIP_EVAL
 
         return PreprocessDecision.CONTINUE
 
-    def postprocess(self, res: RuntimeValue, args, kwargs) -> RuntimeValue:
+    def postprocess(
+        self, current_node: Node, res: RuntimeValue, args, kwargs
+    ) -> RuntimeValue:
         if self.preprocess_decision == PreprocessDecision.SKIP_EVAL:
             assert isinstance(res, JitSkipped)
 
             input_val, opt_out_val = self.input_val, self.opt_out_val
+
+            # Release refcount to runtime values in time
             del self.input_val
             del self.opt_out_val
 
             if opt_out_val is None:
-                return self._alloc()
+                return self._alloc(current_node)
             else:
                 return opt_out_val
 
         return res
 
-    def _alloc(self):
+    def _alloc(self, current_node: Node):
         # Pre-Reducer HaloExchanger won't be skipped;
         # Empty input ElemPart won't have reordering Selector.
         dist_env = get_runtime_dist_env()
         result_runtime_meta = get_node_meta(
-            self.current_node
+            current_node
         )
         assert isinstance(result_runtime_meta, RuntimeTensorMeta)
         assert result_runtime_meta.role == Role.DISTRIBUTED
-        assert result_runtime_meta.view_src == self.current_node
 
         # Same as Reducer.forward()
         out = torch.zeros(
@@ -718,35 +1022,84 @@ class JitEngine:
 
         self.run_count = 0
 
-        self.first_run_handlers: List[NodeHandlerBase] = [
-            FirstRunMetadataPropagation(),
+    def create_first_run_handlers(self, stackframe: Dict[Node, RuntimeValue]):
+        first_run_handlers: List[NodeHandlerBase] = [
+            # -> Load values from stackframe
+            # <- Store result into stackframe, release unused tensors
+            StackframeManager(self.module, stackframe),
 
-            FirstRunAggregatorMetadataPropagation(),
-            FirstRunHaloExchangerMetadataPropagation(),
-            FirstRunReducerMetadataPropagation(),
+            # ->
+            # <- Updates refcount and sets view_src
+            ViewSrcTracker(self.module, stackframe),
 
-            AggregatorNeutralInputPreparation(),
-            HaloExchangerZeroLengthInputPreparation(),
-            NotFullReducerOutputAllocation(),
+            # -> Calculates expected role and batchsize --/
+            # -> if to skip and not sum/halo etc.: SKIP_EVAL --\--------
+            # <- Calculates and sets metadata _________________/________
+            MetadataPropagation(self.module, stackframe),
+
+            # -> Allgathers metadata for aggreagators and sets Node metadata
+            # <- Updates metadata dtype (e.g. int32 -> int64)
+            AggregatorMetadataPropagation(self.module, stackframe),
+            # -> Exchanges metadata for Halos and sets Node metadata
+            # <-
+            HaloExchangerMetadataPropagation(self.module, stackframe),
+            # -> Allgathers metadata for Reducers and sets Node metadata
+            # <-
+            ReducerMetadataPropagation(self.module, stackframe),
+
+            # -> Prepares neutral input to esr.sum etc. and GOTO_EVAL
+            # <-
+            AggregatorNeutralInputPreparation(self.module, stackframe),
+            # -> Prepares input to HaloExchanger and GOTO_EVAL
+            # <-
+            HaloExchangerZeroLengthInputPreparation(self.module, stackframe),
+            # -> if input is zero-length: SKIP_EVAL --\-----------------
+            # <---- Allocates zero-ed output _________/
+            # <--else --------------------------------------------------
+            NotFullReducerOutputAllocation(self.module, stackframe),
         ]
+        return first_run_handlers
 
-        self.runtime_handlers: List[NodeHandlerBase] = [
-            MetadataValidation(),
-            SkipZeroLengthNonHalo(),
+    def create_runtime_handlers(self, stackframe: Dict[Node, RuntimeValue]):
+        runtime_handlers: List[NodeHandlerBase] = [
+            # -> Loads arguments from stackframe
+            # <- Stores result into stackframe, releases unused tensors
+            StackframeManager(self.module, stackframe),
 
-            AggregatorNeutralInputPreparation(),
-            HaloExchangerZeroLengthInputPreparation(),
-            NotFullReducerOutputAllocation(),
+            # ->
+            # <- Updates refcount and asserts view_src no changes
+            ViewSrcValidation(self.module, stackframe),
+
+            # ->
+            # <- Validates metadata and asserts no changes
+            MetadataValidation(self.module, stackframe),
+
+            # -> if any dist input is zero-length: SKIP_EVAL --\--------
+            # <____ res=jit_skipped ___________________________/
+            # <--else --------------------------------------------------
+            SkipZeroLengthNonHalo(self.module, stackframe),
+
+            # -> Prepares neutral input to esr.sum etc. and GOTO_EVAL
+            # <-
+            AggregatorNeutralInputPreparation(self.module, stackframe),
+            # -> Prepares input to HaloExchanger and GOTO_EVAL
+            # <-
+            HaloExchangerZeroLengthInputPreparation(self.module, stackframe),
+            # -> if input is zero-length: SKIP_EVAL --\-----------------
+            # <---- Allocates zero-ed output _________/
+            # <--else --------------------------------------------------
+            NotFullReducerOutputAllocation(self.module, stackframe),
         ]
+        return runtime_handlers
 
-    def _update_handlers(self, handlers: List[NodeHandlerBase]):
-        """
-        Bind Handlers with latest instances of self.module/graph -- in case
-        the instances are changed by the JIT passes.
-        """
-        for h in handlers:
-            h.current_module = self.module
-            h.current_graph = self.graph
+    def compile_after_first_run(self):
+        ms, gs = [self.module], [self.graph]
+
+        ms, gs = passes.analyze_data_dependency(ms, gs)
+        # ms, gs = passes.fuse(ms, gs)
+        # ms, gs = passes.codegen(ms, gs)
+
+        [self.module], [self.graph] = ms, gs
 
     def forward(self):
         """
@@ -760,42 +1113,19 @@ class JitEngine:
         -   Handler.postprocess() can inspect and modify the
             node evaluation result.
         """
-        if self.run_count == 0:
-            self._update_handlers(self.first_run_handlers)
-            handlers = self.first_run_handlers
-        else:
-            handlers = self.runtime_handlers
-
         stackframe: Dict[Node, RuntimeValue] = {}
 
-        def _eval(x):
-            # instead sf.get(x,x) we want to also check type consistency.
-            if isinstance(x, Node):
-                return stackframe[x]
-            else:
-                return x
-
-        for h in handlers:
-            h.enter_forward()
+        if self.run_count == 0:
+            handlers = self.create_first_run_handlers(stackframe)
+        else:
+            handlers = self.create_runtime_handlers(stackframe)
 
         for node in list(self.graph.nodes):
             # args and kwargs collections are mutable for Handlers to modify.
-            args = cast(
-                List[RuntimeValue],
-                list(tree_map(v, _eval) for v in node.args)
-            )
-            kwargs = cast(
-                Dict[str, RuntimeValue],
-                {k: tree_map(v, _eval) for k, v in node.kwargs.items()}
-            )
-
-            # rank = get_runtime_dist_env().rank
-            # s = "    " * rank + "||"
-            # logger.info(s + node.format_node())
+            args, kwargs = [], {}
 
             for i_handler, handler in enumerate(handlers):
-                handler.current_node = node
-                decision = handler.preprocess(args, kwargs)
+                decision = handler.preprocess(node, args, kwargs)
                 assert isinstance(decision, PreprocessDecision)
                 handler.preprocess_decision = decision
 
@@ -820,22 +1150,10 @@ class JitEngine:
             for rev_i in range(i_handler, -1, -1):
                 rev_handler = handlers[rev_i]
                 # Pass in the final args/kwargs values
-                res = rev_handler.postprocess(res, args, kwargs)
-
-            stackframe[node] = res
-
-        for h in handlers:
-            h.exit_forward()
+                res = rev_handler.postprocess(node, res, args, kwargs)
 
         if self.run_count == 0:
-            ms, gs = [self.module], [self.graph]
-
-            ms, gs = passes.analyze_data_dependency(ms, gs)
-            # ms, gs = passes.fuse(ms, gs)
-            # ms, gs = passes.codegen(ms, gs)
-
-            [self.module], [self.graph] = ms, gs
-            self._update_handlers(self.runtime_handlers)
+            self.compile_after_first_run()
 
         self.run_count += 1
 
