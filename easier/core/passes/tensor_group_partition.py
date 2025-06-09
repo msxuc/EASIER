@@ -52,6 +52,9 @@ def parallel_partition_graph(
         (subadjmat_height, adjmat_width), dtype=np.int32)
     reducer_graph = scipy.sparse.csr_matrix(
         (subadjmat_height, adjmat_width), dtype=np.int32)
+    
+    i = 0
+    from easier.core.utils import logger
 
     # Edge weights in the adjmat are:
     # - if involved in Selectors, no matter how many times, weights are 1
@@ -60,6 +63,8 @@ def parallel_partition_graph(
     for (commpair_rowids, commpair_colids, by_reducer) in rowcolids_and_causes:
         assert commpair_rowids.ndim == commpair_colids.ndim == 1
         assert commpair_rowids.shape == commpair_rowids.shape
+
+        logger.debug(f">>> GRAPH {i}")
 
         commpair_rowids = commpair_rowids.detach().cpu().numpy()
         commpair_colids = commpair_colids.detach().cpu().numpy()
@@ -83,6 +88,7 @@ def parallel_partition_graph(
         else:
             selector_graph = selector_graph + commpair_graph
 
+    logger.debug(f">>> GRAPH s+r")
     graph = selector_graph.minimum(1) + reducer_graph
 
     local_membership = distpart_kway(
@@ -311,11 +317,17 @@ def partition_tensor_groups_with_adjmat(
             subadjmat_rowids_to_send[w] = subadjmat_rowids.to(
                 dist_env.comm_device)
             adjmat_colids_to_send[w] = adjmat_colids.to(dist_env.comm_device)
+        
+        from easier.core.utils import logger
+        _lens = [s.shape[0] for s in adjmat_colids_to_send]
+        logger.debug(f">>> ALLTOALL: {_lens}")
 
         subadjmat_rowids_tensors = \
             dist_env.all_to_all(subadjmat_rowids_to_send)
         adjmat_colids_tensors = \
             dist_env.all_to_all(adjmat_colids_to_send)
+
+        logger.debug(f">>> ALLTOALL end")
 
         # concat all recieved row/col ids
         # and the result is not ordered or uniqued.
@@ -324,6 +336,8 @@ def partition_tensor_groups_with_adjmat(
             torch.concat(adjmat_colids_tensors).cpu(),
             comm_pair.caused_by_reducer
         ))
+
+        logger.debug(f">>> COMMPAIR end")
     # endfor comm_pairs
 
     #
