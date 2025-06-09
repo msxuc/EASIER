@@ -88,6 +88,8 @@ def parallel_partition_graph(
         else:
             selector_graph = selector_graph + commpair_graph
 
+        i += 1
+
     logger.debug(f">>> GRAPH s+r")
     graph = selector_graph.minimum(1) + reducer_graph
 
