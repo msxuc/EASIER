@@ -91,6 +91,9 @@ def parallel_partition_graph(
         # in processing time will be accumulated and cause the next collective
         # call (broadcast in distpart.coarsen_level) to timeout on ranks
         # that have few nonzeros adjmat entries.
+        # TODO however, under a larger and extreme unbalanced setting
+        # it may still timeout, we may need to partition the processing into
+        # synchronized pieces.
         dist_env.barrier()
 
     graph = selector_graph.minimum(1) + reducer_graph
