@@ -24,7 +24,7 @@ from easier.core.passes.utils import \
     get_easier_tensors
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.distpart import distpart_kway, DistConfig
-from easier.core.utils import EasierJitException
+from easier.core.utils import EasierJitException, logger
 
 # METIS adj weights are ints
 METIS_ADJWGT_REDUCER: int = 10
@@ -33,7 +33,7 @@ METIS_ADJWGT_REDUCER: int = 10
 def parallel_partition_graph(
     world_size: int, rank: int,
     subadjmat_height: int, adjmat_width: int, vtxdist: torch.Tensor,
-    rowcolids_and_causes: List[Tuple[torch.Tensor, torch.Tensor, bool]]
+    rowcolids_and_causes: List[Tuple[torch.Tensor, torch.Tensor, 'CommPair']]
 ):
     """
     Args:
@@ -43,6 +43,7 @@ def parallel_partition_graph(
             where N stands for the length of a slice in `indptr`,
             i.e. the adjmat_height.
     """
+    dist_env = get_runtime_dist_env()
 
     # NOTE
     # - `csr_matrix` sums up duplicated matrix cells during construction
@@ -52,19 +53,14 @@ def parallel_partition_graph(
         (subadjmat_height, adjmat_width), dtype=np.int32)
     reducer_graph = scipy.sparse.csr_matrix(
         (subadjmat_height, adjmat_width), dtype=np.int32)
-    
-    i = 0
-    from easier.core.utils import logger
 
     # Edge weights in the adjmat are:
     # - if involved in Selectors, no matter how many times, weights are 1
     # - each time involved in Reducers, those weights are increased by 10,
     #   no matter how many edges there are.
-    for (commpair_rowids, commpair_colids, by_reducer) in rowcolids_and_causes:
+    for (commpair_rowids, commpair_colids, comm_pair) in rowcolids_and_causes:
         assert commpair_rowids.ndim == commpair_colids.ndim == 1
         assert commpair_rowids.shape == commpair_rowids.shape
-
-        logger.debug(f">>> GRAPH {i}")
 
         commpair_rowids = commpair_rowids.detach().cpu().numpy()
         commpair_colids = commpair_colids.detach().cpu().numpy()
@@ -75,7 +71,7 @@ def parallel_partition_graph(
             shape=(subadjmat_height, adjmat_width)
         )
 
-        if by_reducer:
+        if comm_pair.caused_by_reducer:
             # Clamp potentially summed up elements,
             # so that this adjmat for some reducer, as a whole,
             # has a single non-1 weight value.
@@ -88,9 +84,15 @@ def parallel_partition_graph(
         else:
             selector_graph = selector_graph + commpair_graph
 
-        i += 1
+        # Before processing there is always a collective call, so we can
+        # just record the processed event.
+        logger.debug(f"Adjmat for {comm_pair} processed")
+        # Add barriers between processing CommPairs, otherwise the difference
+        # in processing time will be accumulated and cause the next collective
+        # call (broadcast in distpart.coarsen_level) to timeout on ranks
+        # that have few nonzeros adjmat entries.
+        dist_env.barrier()
 
-    logger.debug(f">>> GRAPH s+r")
     graph = selector_graph.minimum(1) + reducer_graph
 
     local_membership = distpart_kway(
@@ -115,6 +117,7 @@ class CommPair:
     dst_idx_partition: torch.Tensor
 
     caused_by_reducer: bool
+    cause_hint: str = ""
 
     def get_symmetric_pair(self):
         return CommPair(
@@ -124,8 +127,14 @@ class CommPair:
             dst_idx_partition=self.src_idx_partition,
 
             # The original source, communication direction is irrelevant.
-            caused_by_reducer=self.caused_by_reducer
+            caused_by_reducer=self.caused_by_reducer,
+            cause_hint=self.cause_hint
         )
+
+    def __repr__(self) -> str:
+        src = self.src_tensor_group
+        dst = self.dst_tensor_group
+        return f"CommPair({src.hint} -{self.cause_hint}-> {dst.hint})"
 
 
 class CommPairCollector(EasierInterpreter):
@@ -194,9 +203,12 @@ class CommPairCollector(EasierInterpreter):
         self._init_tensor_group_offset(dst_tensor_group)
 
         src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
-        self.comm_pairs.append(CommPair(src_tensor_group, src_idx,
-                                        dst_tensor_group, dst_idx,
-                                        caused_by_reducer))
+        self.comm_pairs.append(CommPair(
+            src_tensor_group, src_idx,
+            dst_tensor_group, dst_idx,
+            caused_by_reducer,
+            submod.easier_hint_name
+        ))
 
 
 def partition_tensor_groups_with_adjmat(
@@ -272,8 +284,10 @@ def partition_tensor_groups_with_adjmat(
     # therefore there is expected to be a memory peak. We may need to
     # send and free data in stream to decrease the memory peak.
 
-    # [(concat_rowidx, concat_colidx, caused_by_reducer)]
-    rowcolids_for_commpairs: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
+    # [(concat_rowidx, concat_colidx, comm_pair)]
+    rowcolids_for_commpairs: List[Tuple[
+        torch.Tensor, torch.Tensor, CommPair
+    ]] = []
 
     for comm_pair in comm_pairs:
         row_tensor_group = comm_pair.src_tensor_group
@@ -319,27 +333,19 @@ def partition_tensor_groups_with_adjmat(
             subadjmat_rowids_to_send[w] = subadjmat_rowids.to(
                 dist_env.comm_device)
             adjmat_colids_to_send[w] = adjmat_colids.to(dist_env.comm_device)
-        
-        from easier.core.utils import logger
-        _lens = [s.shape[0] for s in adjmat_colids_to_send]
-        logger.debug(f">>> ALLTOALL: {_lens}")
 
         subadjmat_rowids_tensors = \
             dist_env.all_to_all(subadjmat_rowids_to_send)
         adjmat_colids_tensors = \
             dist_env.all_to_all(adjmat_colids_to_send)
 
-        logger.debug(f">>> ALLTOALL end")
-
         # concat all recieved row/col ids
         # and the result is not ordered or uniqued.
         rowcolids_for_commpairs.append((
             torch.concat(subadjmat_rowids_tensors).cpu(),
             torch.concat(adjmat_colids_tensors).cpu(),
-            comm_pair.caused_by_reducer
+            comm_pair
         ))
-
-        logger.debug(f">>> COMMPAIR end")
     # endfor comm_pairs
 
     #
