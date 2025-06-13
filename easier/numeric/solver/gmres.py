@@ -231,9 +231,15 @@ class GMRES(esr.Module):
                     f"{name} residual {float(self.rnorm)}"
                     f" at the {iters}-th iteration")
 
-            if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
+            _rnorm = self.rnorm.to('cpu', non_blocking=True)
+            torch.cuda.synchronize()
+            if (not torch.isnan(_rnorm) and _rnorm <= tol) or \
                (maxiter is not None and iters >= maxiter):
                 break
+
+            # if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
+            #    (maxiter is not None and iters >= maxiter):
+            #     break
             iters += 1
 
             self.B[0, 0] = self.rnorm
