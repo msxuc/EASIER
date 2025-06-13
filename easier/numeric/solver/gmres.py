@@ -232,7 +232,8 @@ class GMRES(esr.Module):
                     f" at the {iters}-th iteration")
 
             _rnorm = self.rnorm.data.to('cpu', non_blocking=True)
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             if (not torch.isnan(_rnorm) and _rnorm <= tol) or \
                (maxiter is not None and iters >= maxiter):
                 break
