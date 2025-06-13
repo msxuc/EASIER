@@ -231,7 +231,7 @@ class GMRES(esr.Module):
                     f"{name} residual {float(self.rnorm)}"
                     f" at the {iters}-th iteration")
 
-            _rnorm = self.rnorm.to('cpu', non_blocking=True)
+            _rnorm = self.rnorm.data.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             if (not torch.isnan(_rnorm) and _rnorm <= tol) or \
                (maxiter is not None and iters >= maxiter):
