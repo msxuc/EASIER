@@ -327,6 +327,9 @@ def load_replicated_tensors_from_source(modules: List[esr.Module]):
     # may be accessed outside the JIT scope.
     for p in get_easier_tensors(modules):
         if isinstance(p, esr.Tensor) and p.is_replica:
+            d = runtime_device
+            if not p.dtype.is_floating_point:
+                d = 'cpu'
             p.data = p.easier_data_loader.fully_load(
                 runtime_device, replicated=True
             )
