@@ -61,7 +61,7 @@ class InitW(esr.Module):
             mode='replicate')
 
     def forward(self):
-        self.w[:] = self.A(self.M(self.V[:, ..., self.j]))
+        self.w[:] = self.A(self.M(self.V[:, ..., self.j].squeeze(-1)))
 
 
 class SumW(esr.Module):
@@ -76,7 +76,7 @@ class SumW(esr.Module):
             mode='replicate')
 
     def forward(self):
-        self.h[:] = esr.sum(self.V[:, ..., self.i] * self.w).sum()
+        self.h[:] = esr.sum(self.V[:, ..., self.i].squeeze(-1) * self.w).sum()
 
 
 class NormW(esr.Module):
@@ -102,7 +102,7 @@ class UpdateW(esr.Module):
             mode='replicate')
 
     def forward(self):
-        self.w.sub_(self.h * self.V[:, ..., self.i])
+        self.w.sub_(self.h * self.V[:, ..., self.i].squeeze(-1))
 
 
 class UpdateV(esr.Module):
@@ -117,7 +117,7 @@ class UpdateV(esr.Module):
             mode='replicate')
 
     def forward(self):
-        self.V[:, ..., self.i] = self.w / self.h
+        self.V[:, ..., self.i] = (self.w / self.h)[:, ..., None]
 
 
 class UpdateX(esr.Module):
