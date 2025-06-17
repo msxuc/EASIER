@@ -1119,10 +1119,14 @@ class JitEngine:
             handlers = self.create_first_run_handlers(stackframe)
         else:
             handlers = self.create_runtime_handlers(stackframe)
+        
+        import nvtx
 
         for node in list(self.graph.nodes):
             # args and kwargs collections are mutable for Handlers to modify.
             args, kwargs = [], {}
+
+            nvtx.push_range(f"Node {node.name}")
 
             for i_handler, handler in enumerate(handlers):
                 decision = handler.preprocess(node, args, kwargs)
@@ -1143,7 +1147,9 @@ class JitEngine:
                 # Only if none of the preprocess steps breaks
                 # can we eval the Node;
                 # Otherwise it means the Node should be skipped.
+                nvtx.push_range(f"Eval")
                 res = evaluate_node(self.module, node, args, kwargs)
+                nvtx.pop_range()
             else:
                 res = jit_skipped
 
@@ -1151,6 +1157,8 @@ class JitEngine:
                 rev_handler = handlers[rev_i]
                 # Pass in the final args/kwargs values
                 res = rev_handler.postprocess(node, res, args, kwargs)
+
+            nvtx.pop_range()
 
         if self.run_count == 0:
             self.compile_after_first_run()

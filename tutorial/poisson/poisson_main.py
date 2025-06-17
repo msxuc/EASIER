@@ -99,7 +99,7 @@ if __name__ == '__main__':
     eqn, sol = esr.compile([eqn, sol], args.backend)
 
     tol = 1e-5
-    info = sol.solve(atol=tol, maxiter=1000, debug_iter=10)
+    info = sol.solve(atol=tol, maxiter=20, debug_iter=10)
     assert info["residual"] < tol
 
     if args.plot:
