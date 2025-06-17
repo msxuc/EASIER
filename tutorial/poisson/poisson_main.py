@@ -98,7 +98,7 @@ if __name__ == '__main__':
     # eqn, sol = esr.compile([eqn, sol], args.backend, load_dir=f'~/.easier/dump/poisson_gmres_100_w4')
     eqn, sol = esr.compile([eqn, sol], args.backend)
 
-    tol = 1e-5
+    tol = 1e-9
     info = sol.solve(atol=tol, maxiter=20, debug_iter=10)
     # assert info["residual"] < tol
 

@@ -1122,14 +1122,14 @@ class JitEngine:
         
         import nvtx
         if self.run_count > 0:
-            nvtx.push_range(self.module.__class__.__name__)
+            nvtx.push_range(self.module.__class__.__name__, domain='CLS')
 
         for node in list(self.graph.nodes):
             # args and kwargs collections are mutable for Handlers to modify.
             args, kwargs = [], {}
 
             if self.run_count > 0:
-                nvtx.push_range(f"Node {node.name}")
+                nvtx.push_range(f"Node {node.name}", domain='NODE')
 
             for i_handler, handler in enumerate(handlers):
                 decision = handler.preprocess(node, args, kwargs)
@@ -1151,7 +1151,7 @@ class JitEngine:
                 # can we eval the Node;
                 # Otherwise it means the Node should be skipped.
                 if self.run_count > 0:
-                    nvtx.push_range(f"Eval")
+                    nvtx.push_range(f"Eval", domain='EVAL')
                 res = evaluate_node(self.module, node, args, kwargs)
                 if self.run_count > 0:
                     nvtx.pop_range()
