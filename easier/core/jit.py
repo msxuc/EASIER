@@ -286,7 +286,7 @@ def init(
     local_rank = comm_backend_config.get_local_rank()
     logger.info(
         f"torch.distributed"
-        # f" backend={dist.get_backend_config()} rank={dist.get_rank()}"
+        f" backend={dist.get_backend_config()} rank={dist.get_rank()}"
         f" local_rank={local_rank}"
     )
 

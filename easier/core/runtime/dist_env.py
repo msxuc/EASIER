@@ -753,33 +753,6 @@ class TorchDistEnv(DistEnv):
 
 
 class TorchDistGlooDistEnv(TorchDistEnv):
-    def all_gather_into_tensor(
-        self,
-        send_tensor: torch.Tensor,
-        form: Literal['concat', 'stack'] = 'concat'
-    ):
-        shape = list(send_tensor.shape)
-
-        if shape[0] != 1:
-            raise NotImplementedError("Support different tensor sizes")
-
-        recv_buffers = [
-            torch.empty(
-                shape, dtype=send_tensor.dtype, device=self.comm_device
-            ) for w in range(self.world_size)
-        ]
-
-        # In our use cases of aggregators all input tensors have the same size.
-        # Don't call self.all_gather because we have reimplemented it
-        # using broadcast in base TorchDistEnv.
-        # Just call the slightly faster dist.all_gather.
-        dist.all_gather(recv_buffers, send_tensor)
-
-        if form == 'concat':
-            return torch.concat(recv_buffers)
-        else:
-            return torch.stack(recv_buffers)
-
     def all_to_all(self, tensors: Sequence[torch.Tensor]) -> List[torch.Tensor]:
         """
         GLOO doesn't support all to all.

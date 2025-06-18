@@ -239,7 +239,7 @@ class ViewSrcTrackerBase(NodeHandlerBase):
     of memory lifetime, at the price of memory not reusable,
     but not wrong read/write.
 
-    NOTE What tensor.storage() returns is a Python-world lightweight
+    NOTE What tensor.untyped_storage() returns is a Python-world lightweight
     wrapper over the native-world PyTorch memory, it's hard to answer if
     the lifetime of the wrapper Pyobj reflects the real lifetime of the memory.
     So currently we need to maintain the ref count manually.
@@ -276,7 +276,7 @@ class ViewSrcTrackerBase(NodeHandlerBase):
                 not necessary to be `res` arg of `postprocess()`
         """
         if isinstance(val, torch.Tensor):
-            item_iaddr = val.storage().data_ptr()
+            item_iaddr = val.untyped_storage().data_ptr()
             return IndexedAddr(item_iaddr, None)
 
         elif isinstance(val, (tuple, list)):

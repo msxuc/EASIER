@@ -95,7 +95,6 @@ if __name__ == '__main__':
     else:
         sol = GMRES(eqn.A, eqn.b, eqn.x)
 
-    # eqn, sol = esr.compile([eqn, sol], args.backend, load_dir=f'~/.easier/dump/poisson_gmres_100_w4')
     eqn, sol = esr.compile([eqn, sol], args.backend)
 
     tol = 1e-9

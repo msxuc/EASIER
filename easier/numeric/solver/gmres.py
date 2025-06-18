@@ -57,7 +57,7 @@ class InitW(esr.Module):
         self.V = V
         self.w = w
         self.j = esr.Tensor(
-            torch.tensor([0], dtype=torch.int64, device=V.device),
+            torch.tensor([0], dtype=torch.int32, device=V.device),
             mode='replicate')
 
     def forward(self):
@@ -72,7 +72,7 @@ class SumW(esr.Module):
         self.w = w
         self.h = h
         self.i = esr.Tensor(
-            torch.tensor([0], dtype=torch.int64, device=V.device),
+            torch.tensor([0], dtype=torch.int32, device=V.device),
             mode='replicate')
 
     def forward(self):
@@ -98,7 +98,7 @@ class UpdateW(esr.Module):
         self.w = w
         self.h = h
         self.i = esr.Tensor(
-            torch.tensor([0], dtype=torch.int64, device=V.device),
+            torch.tensor([0], dtype=torch.int32, device=V.device),
             mode='replicate')
 
     def forward(self):
@@ -113,7 +113,7 @@ class UpdateV(esr.Module):
         self.w = w
         self.h = h
         self.i = esr.Tensor(
-            torch.tensor([0], dtype=torch.int64, device=V.device),
+            torch.tensor([0], dtype=torch.int32, device=V.device),
             mode='replicate')
 
     def forward(self):
