@@ -618,8 +618,10 @@ def partition_tensor_groups(modules: List[esr.Module], graphs: List[Graph]):
 
     elemparts = get_even_elemparts(modules, graphs)
 
+    dist_env = get_runtime_dist_env()
+
     # Overwrite with better partitions for some TensorGroups
-    if partition_mode == 'metis':
+    if partition_mode == 'metis' and dist_env.world_size > 1:
         comm_pairs_collector = CommPairCollector(modules, graphs)
         comm_pairs_collector.run()
 
