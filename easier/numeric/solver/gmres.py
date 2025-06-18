@@ -138,7 +138,7 @@ class UpdateX(esr.Module):
 def _cpu(tensor: torch.Tensor):
     assert tensor.numel() == 1
     cpu_buffer = torch.empty_like(tensor, device='cpu', pin_memory=False)
-    tensor.copy_(cpu_buffer)
+    cpu_buffer.copy_(tensor)
     return cpu_buffer.item()
 
 class GMRES(esr.Module):
