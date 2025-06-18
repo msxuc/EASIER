@@ -193,7 +193,7 @@ class CommPairCollector(EasierInterpreter):
 
 def partition_tensor_groups_with_adjmat(
     tensor_group_to_matedge_offsets: OrderedDict[EasierTensorGroup, int],
-    accum_n: int,
+    # accum_n: int,
     comm_pairs: List[CommPair]
 ):
     """
@@ -251,7 +251,7 @@ def partition_tensor_groups_with_adjmat(
     dist_env = get_runtime_dist_env()
     world_size = dist_env.world_size
     rank = dist_env.rank
-    per_worker_n = (accum_n + world_size - 1) // world_size
+    # per_worker_n = (accum_n + world_size - 1) // world_size
     empty_buffer = torch.empty((0,), dtype=torch.int64,
                                device=dist_env.comm_device)
 
@@ -269,17 +269,17 @@ def partition_tensor_groups_with_adjmat(
 
     for comm_pair in comm_pairs:
         row_tensor_group = comm_pair.src_tensor_group
-        rowgrp_idx = comm_pair.src_idx_partition
+        rowgrp_idx_part = comm_pair.src_idx_partition
         col_tensor_group = comm_pair.dst_tensor_group
-        colgrp_idx = comm_pair.dst_idx_partition
+        colgrp_idx_part = comm_pair.dst_idx_partition
 
+        per_worker_nrow = (row_tensor_group.n + world_size - 1) // world_size
         rowgrp_offset = tensor_group_to_matedge_offsets[row_tensor_group]
-        next_rowgrp_offset = rowgrp_offset + row_tensor_group.n
         colgrp_offset = tensor_group_to_matedge_offsets[col_tensor_group]
 
         # Limit the region to search
-        sub_adjmat_span_lb = rowgrp_offset // per_worker_n
-        sub_adjmat_span_ub = (next_rowgrp_offset - 1) // per_worker_n + 1
+        sub_adjmat_span_lb = rowgrp_offset +1
+        sub_adjmat_span_ub = rowgrp_offset + per_worker_nrow
 
         subadjmat_rowids_to_send: List[torch.Tensor] = \
             [empty_buffer] * world_size
@@ -287,18 +287,18 @@ def partition_tensor_groups_with_adjmat(
 
         for w in range(sub_adjmat_span_lb, sub_adjmat_span_ub):
             # Region of rows of adjmat on worker-w
-            rowgrp_rowid_lb = max(per_worker_n * w, rowgrp_offset)
-            rowgrp_rowid_ub = min(per_worker_n * (w + 1), next_rowgrp_offset)
+            rowgrp_rowid_lb_w = max(per_worker_n * w, rowgrp_offset)
+            rowgrp_rowid_ub_w = min(per_worker_n * (w + 1), next_rowgrp_offset)
 
             # The range of indexes for that region on worker-w
-            rowgrp_idx_lb: int = rowgrp_rowid_lb - rowgrp_offset
-            rowgrp_idx_ub: int = rowgrp_rowid_ub - rowgrp_offset
+            rowgrp_idx_lb: int = rowgrp_rowid_lb_w - rowgrp_offset
+            rowgrp_idx_ub: int = rowgrp_rowid_ub_w - rowgrp_offset
 
             # `idx_pos.dtype == torch.bool`: this is bool-slicing
-            idx_pos = torch.logical_and(rowgrp_idx_lb <= rowgrp_idx,
-                                        rowgrp_idx < rowgrp_idx_ub)
-            rowgrp_idx_slice = rowgrp_idx[idx_pos]
-            colgrp_idx_slice = colgrp_idx[idx_pos]
+            idx_part_pos_w = torch.logical_and(rowgrp_idx_lb <= rowgrp_idx_part,
+                                        rowgrp_idx_part < rowgrp_idx_ub)
+            rowgrp_idx_slice = rowgrp_idx_part[idx_part_pos_w]
+            colgrp_idx_slice = colgrp_idx_part[idx_part_pos_w]
 
             # Adjust row_grp_idx (of domain `[0,row_group.n)`)
             # into row ids of sub adjmat on worker-w
@@ -325,6 +325,44 @@ def partition_tensor_groups_with_adjmat(
             comm_pair.caused_by_reducer
         ))
     # endfor comm_pairs
+
+
+
+
+    for comm_pair in comm_pairs:
+        row_tensor_group = comm_pair.src_tensor_group
+        rowgrp_idx_part = comm_pair.src_idx_partition
+        col_tensor_group = comm_pair.dst_tensor_group
+        colgrp_idx_part = comm_pair.dst_idx_partition
+
+        rowgrp_offset = tensor_group_to_matedge_offsets[row_tensor_group]
+        next_rowgrp_offset = rowgrp_offset + row_tensor_group.n
+        per_worker_nrow = (row_tensor_group.n + world_size - 1) // world_size
+
+        colgrp_offset = tensor_group_to_matedge_offsets[col_tensor_group]
+
+        for w in range(sub_adjmat_span_lb, sub_adjmat_span_ub):
+            # Region of rows of adjmat on worker-w
+            rowgrp_rowid_lb_w = rowgrp_offset + per_worker_nrow * w
+            rowgrp_rowid_ub_w = min(
+                rowgrp_offset + per_worker_nrow * (w + 1),
+                next_rowgrp_offset
+            )
+            idx_part_pos_w = torch.logical_and(
+                rowgrp_rowid_lb_w <= rowgrp_idx_part,
+                rowgrp_idx_part < rowgrp_rowid_ub_w
+            )
+
+            # zip(row_idxpart_w, col_idxpart_w) are for worker-w
+            rowgrp_idx_part_w = rowgrp_idx_part[idx_part_pos_w]
+            colgrp_idx_part_w = colgrp_idx_part[idx_part_pos_w]
+
+
+
+
+
+
+
 
     #
     # Invoke partition
