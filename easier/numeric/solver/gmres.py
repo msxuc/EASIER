@@ -135,6 +135,11 @@ class UpdateX(esr.Module):
         dx = torch.matmul(V, self.y[:self.i]).squeeze(dim=-1)
         self.x.add_(self.M(dx))
 
+def _cpu(tensor: torch.Tensor):
+    assert tensor.numel() == 1
+    cpu_buffer = torch.empty_like(tensor, device='cpu', pin_memory=False)
+    tensor.copy_(cpu_buffer)
+    return cpu_buffer.item()
 
 class GMRES(esr.Module):
     """General Minimal Residule"""
@@ -231,7 +236,7 @@ class GMRES(esr.Module):
                     f"{name} residual {float(self.rnorm)}"
                     f" at the {iters}-th iteration")
 
-            if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
+            if (not _cpu(torch.isnan(self.rnorm)) and _cpu(self.rnorm <= tol)) or \
                (maxiter is not None and iters >= maxiter):
                 break
             iters += 1
@@ -247,7 +252,7 @@ class GMRES(esr.Module):
 
                 self.norm_w()
                 self.H[j + 1, j] = self.h
-                if self.h < 1e-15:
+                if _cpu(self.h < 1e-15):
                     break
                 elif j < self.restart - 1:
                     self._update_V(j + 1)
