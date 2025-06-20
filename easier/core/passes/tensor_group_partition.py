@@ -24,7 +24,7 @@ from easier.core.passes.utils import \
     get_easier_tensors
 from easier.core.runtime.dist_env import get_runtime_dist_env
 from easier.core.distpart import distpart_kway, DistConfig
-from easier.core.utils import EasierJitException
+from easier.core.utils import EasierJitException, logger
 
 # METIS adj weights are ints
 METIS_ADJWGT_REDUCER: int = 10
@@ -33,7 +33,7 @@ METIS_ADJWGT_REDUCER: int = 10
 def parallel_partition_graph(
     world_size: int, rank: int,
     subadjmat_height: int, adjmat_width: int, vtxdist: torch.Tensor,
-    rowcolids_and_causes: List[Tuple[torch.Tensor, torch.Tensor, bool]]
+    rowcolids_and_causes: List[Tuple[torch.Tensor, torch.Tensor, 'CommPair']]
 ):
     """
     Args:
@@ -64,7 +64,7 @@ def parallel_partition_graph(
     # - if involved in Selectors, no matter how many times, weights are 1
     # - each time involved in Reducers, those weights are increased by 10,
     #   no matter how many edges there are.
-    for (commpair_rowids, commpair_colids, by_reducer) in rowcolids_and_causes:
+    for (commpair_rowids, commpair_colids, comm_pair) in rowcolids_and_causes:
         assert commpair_rowids.ndim == commpair_colids.ndim == 1
         assert commpair_rowids.shape == commpair_rowids.shape
 
@@ -77,7 +77,7 @@ def parallel_partition_graph(
             shape=(subadjmat_height, adjmat_width)
         )
 
-        if by_reducer:
+        if comm_pair.caused_by_reducer:
             # Clamp potentially summed up elements,
             # so that this adjmat for some reducer, as a whole,
             # has a single non-1 weight value.
@@ -89,6 +89,18 @@ def parallel_partition_graph(
 
         else:
             selector_graph = selector_graph + commpair_graph
+
+        # Before processing there is always a collective call, so we can
+        # just record the processed event.
+        logger.debug(f"Sub adjmat for {comm_pair} processed")
+        # Add barriers between processing CommPairs, otherwise the difference
+        # in processing time will be accumulated and cause the next collective
+        # call (broadcast in distpart.coarsen_level) to timeout on ranks
+        # that have few nonzeros adjmat entries.
+        # TODO however, under a larger and extreme unbalanced setting
+        # it may still timeout, we may need to partition the processing into
+        # synchronized pieces.
+        get_runtime_dist_env().barrier()
 
     graph = selector_graph.minimum(1) + reducer_graph
 
@@ -114,6 +126,7 @@ class CommPair:
     dst_idx_partition: torch.Tensor
 
     caused_by_reducer: bool
+    cause_hint: str = ""
 
     def get_symmetric_pair(self):
         return CommPair(
@@ -123,8 +136,14 @@ class CommPair:
             dst_idx_partition=self.src_idx_partition,
 
             # The original source, communication direction is irrelevant.
-            caused_by_reducer=self.caused_by_reducer
+            caused_by_reducer=self.caused_by_reducer,
+            cause_hint=self.cause_hint
         )
+    
+    def __repr__(self) -> str:
+        src = self.src_tensor_group
+        dst = self.dst_tensor_group
+        return f"CommPair({src.hint} -{self.cause_hint}-> {dst.hint})"
 
 
 class CommPairCollector(EasierInterpreter):
@@ -186,9 +205,12 @@ class CommPairCollector(EasierInterpreter):
         self.tensor_groups.add(dst_tensor_group)
 
         src_idx, dst_idx = get_selector_reducer_idx_partition_pair(submod)
-        self.comm_pairs.append(CommPair(src_tensor_group, src_idx,
-                                        dst_tensor_group, dst_idx,
-                                        caused_by_reducer))
+        self.comm_pairs.append(CommPair(
+            src_tensor_group, src_idx,
+            dst_tensor_group, dst_idx,
+            caused_by_reducer,
+            submod.easier_hint_name
+        ))
 
 
 def partition_tensor_groups_with_adjmat(
@@ -266,7 +288,9 @@ def partition_tensor_groups_with_adjmat(
 
     # rowids are subadjmat-local, i.e. with upperbound (sum(n)//world_size).
     # [(concat_rowids, concat_colids, caused_by_reducer)]
-    rowcolids_for_commpairs: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
+    rowcolids_for_commpairs: List[Tuple[
+        torch.Tensor, torch.Tensor, CommPair
+    ]] = []
 
     zero_leading_grp_sizes = torch.tensor(
         [0] + [g.n for g in tensor_groups], dtype=torch.int64
@@ -402,7 +426,7 @@ def partition_tensor_groups_with_adjmat(
         rowcolids_for_commpairs.append((
             torch.concat(rowgrp_ids),
             torch.concat(colgrp_ids),
-            comm_pair.caused_by_reducer
+            comm_pair
         ))
     # endfor comm_pairs
 
