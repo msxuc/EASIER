@@ -197,7 +197,7 @@ def partition_tensor_groups_with_adjmat(
 ):
     """
     Args:
-    -   tensor_group_to_matedge_offsets:
+    -   tensor_groups:
             In the order of how related Selector/Reducer appears in the IR.
     -   comm_pairs:
             Communication patterns appearing in the program.
@@ -206,39 +206,40 @@ def partition_tensor_groups_with_adjmat(
             should be passed in, this function will add its symmetric part
             to the adjmat.
 
-    This worker is responsible to fill in adjmat entities in
-    rows within `[grp_row_lb, grp_row_ub)`. But the indexes specifying adjmat
-    entities may locate in other workers.
+    Intuitively, we need to concat all elements from all TensorGroups:
+    into a list, and construct adjmat between elements on this list.
 
-    ```
-                  |         |
-        x x x x-----------D----------    --SubAdjMatSpanLB[y]=0
-        x     x E                    )
-        x     x   |     F   |        ) worker0
-        x x x x     G                )
-        | e     y y y y y y y y   B  )   --GroupOffset[y]=4  --GrpRowLB[y,0]=0
-    - - | -  -  y  -  -  -  - y -  - ) - --GrpRowLB[y,1]=1   ~~GrpRowUB[y,0]=1
-        |     g y |         | y      )
-        |       y             y      ) worker1
-        |   f   y |         | y     C)
-        d       y             y A    )
-    - - | -  -  y |-  -  -  | y -  - ) - ~~GrpRowUB[y,1]=6
-        |       y y y y y y y y      )
-        |                 a     z z z) worker2  ~~GroupOffset[y]+N[y]=12
-        |       b |         |   z   z)
-        |               c       z z z)
-         ~~~~~~~~~|~~~~~~~~~|~~~~~~~~    ~~SubAdjMatSpanUB[y]=3
-    ```
-    The horizontal and vertical lines in the figure stand for both
-    the upper bounds of the previous regions (i.e. exclusive) as well as
-    the lower bounds of the next regions (i.e. inclusive).
+    E.g. world_size==3
+        TensorGroup A has elements [A0, ..., A10]
+        TensorGroup B has elements [B0, ..., B15]
+        TensorGroup C has elements [C0, ..., C20]
+    
+    Instead of directly concat into [A0,...,A10, B0,...,B15, C0,...,C20]
+    we first split each TensorGroup by world_size:
+        TensorGroup A becomes { [A0, ..., A2], [A3, ..., A5], [A6, ..., A10] }
+        ...
+    The mapping is `A_n` is put into the `min(n//world_size, world_size-1)`-th
+    piece, and div remainders are simply put on the last piece.
+    
+    Then, pieces for the same rank are concat-ed to form a _cluster_:
+        [A0,...,A2, B0,...,A4, C0,...,C6]  # length = 3 + 5 + 7
 
-    For example, `Select([5,0,4], Y)` from Group-y into Group-z will fill in
-    matrix entities pointed by `A B C`, across two workers;
-    and symmetrically, entities `a b c` will also be filled in.
+    and the last cluster will have different lengths because of remainders:
+        [A6,...,A10, B10,...,B15, C14,...,C20]  # length = 5 + 6 + 7
+    
+    The final list of the 3 clusters will be:
+        [
+            A0,...,A2,  B0,...,A4,   C0,...,C6,    # subadjmat for rank-0
+            A3,...,A5,  B5,...,A9,   C7,...,C13,   # subadjmat for rank-1
+            A6,...,A10, B10,...,B15, C14,...,C20,  # subadjmat for rank-2
+        ]
+    and the adjmat between list elements can naturally be divided into
+    `world_size` subadjmats.
+    (note, both rows and columns of the adjmat must be reordered,
+    as the adjmat is symmetric.)
 
-    While `Reduce([5,0,4,2], X)` from Group-x into Group-y will fill in entities
-    `D E F G` and symmetrically `d e f g`.
+    Such split and reorganization would balance non-zero entities among
+    the workers.
     """
     # TODO tensor_group_partition didn't handle the cases well
     # where the number of vertexes is less than the world size.
@@ -263,28 +264,30 @@ def partition_tensor_groups_with_adjmat(
     # therefore there is expected to be a memory peak. We may need to
     # send and free data in stream to decrease the memory peak.
 
-    # [(concat_rowidx, concat_colidx, caused_by_reducer)]
+    # rowids are subadjmat-local, i.e. with upperbound (sum(n)//world_size).
+    # [(concat_rowids, concat_colids, caused_by_reducer)]
     rowcolids_for_commpairs: List[Tuple[torch.Tensor, torch.Tensor, bool]] = []
 
-    zero_leading_grp_sizes = torch.tensor([0] + [g.n for g in tensor_groups], dtype=torch.int64)
+    zero_leading_grp_sizes = torch.tensor(
+        [0] + [g.n for g in tensor_groups], dtype=torch.int64
+    )
     grp_cluster_size = int((zero_leading_grp_sizes // world_size).sum())
 
-    grps_offsets_in_cluster: Dict[EasierTensorGroup, int] = dict(zip(
+    grps_offsets_in_clusters_beforelast: Dict[EasierTensorGroup, int] = dict(zip(
         tensor_groups,
         torch.cumsum(  # the first 0 keeps unchanged
             zero_leading_grp_sizes // world_size, dim=0
         )[:-1].tolist()
     ))
-    grps_offsets_in_cluster_lastw: Dict[EasierTensorGroup, int] = dict(zip(
+    grps_offsets_in_cluster_lastrank: Dict[EasierTensorGroup, int] = dict(zip(
         tensor_groups,
         torch.cumsum(  # the first 0 keeps unchanged
             zero_leading_grp_sizes - (
                 zero_leading_grp_sizes // world_size * (world_size - 1)
-            ),
+            ),  # cumsum with accumulated remainders
             dim=0
         )[:-1].tolist()
     ))
-
 
     for comm_pair in comm_pairs:
         row_tensor_group = comm_pair.src_tensor_group
@@ -292,59 +295,95 @@ def partition_tensor_groups_with_adjmat(
         col_tensor_group = comm_pair.dst_tensor_group
         colgrp_idx_part = comm_pair.dst_idx_partition
 
-        # rowgrp_perw_n, rowgrp_n_residue = divmod(row_tensor_group.n, world_size)
-        rowgrp_perw_n = row_tensor_group.n // world_size
-        assert rowgrp_perw_n > 0, "consider not distributing this group"
+        rowgrp_per_worker_n = row_tensor_group.n // world_size
+        assert rowgrp_per_worker_n > 0, "consider not distributing this group"
 
-        colgrp_perw_n = col_tensor_group.n // world_size
-        assert colgrp_perw_n > 0, "consider not distributing this group"
+        colgrp_per_worker_n = col_tensor_group.n // world_size
+        assert colgrp_per_worker_n > 0, "consider not distributing this group"
 
+        # zip(rowgrp_ids_w, colgrp_ids_w) are for worker-w
+        # - rowgrp IDs are subadjmat-local row IDs
+        # - colgrp IDs are adjmat col IDs
         rowgrp_ids_to_send: List[torch.Tensor] = []
         colgrp_ids_to_send: List[torch.Tensor] = []
 
         for w in range(dist_env.world_size):
-            # Region of rows of adjmat on worker-w
-            rowgrp_idx_lb_w = rowgrp_perw_n * w
+            rowgrp_idx_lb_w = rowgrp_per_worker_n * w
             if w == world_size - 1:
-                rowgrp_idx_ub_w = row_tensor_group.n
-                grps_offsets_in_cluster_w = grps_offsets_in_cluster_lastw
-            else:
-                rowgrp_idx_ub_w = rowgrp_perw_n * (w + 1)
-                grps_offsets_in_cluster_w = grps_offsets_in_cluster
+                rowgrp_offset_in_cluster: int = \
+                    grps_offsets_in_cluster_lastrank[row_tensor_group]
 
+                rowgrp_idx_ub_w: int = row_tensor_group.n
+            else:
+                rowgrp_offset_in_cluster: int = \
+                    grps_offsets_in_clusters_beforelast[row_tensor_group]
+
+                rowgrp_idx_ub_w: int = rowgrp_per_worker_n * (w + 1)
 
             idx_part_pos_w = torch.logical_and(
                 rowgrp_idx_lb_w <= rowgrp_idx_part,
                 rowgrp_idx_part < rowgrp_idx_ub_w
             )
 
-
             #
-            # zip(rowgrp_ids_w, colgrp_ids_w) are for worker-w
-            # rowgrp IDs are subadjmat-local row IDs
-            # colgrp IDs are adjmat col IDs
+            # map (split only) row idxes into adjmat col IDs
             #
-
-            rowgrp_offset_in_cluster_w = grps_offsets_in_cluster_w[row_tensor_group]
+            rowgrp_idx_part_w = rowgrp_idx_part[idx_part_pos_w]
             rowgrp_ids_w = \
-                rowgrp_idx_part[idx_part_pos_w] \
-                - rowgrp_idx_lb_w + rowgrp_offset_in_cluster_w
+                rowgrp_idx_part_w - rowgrp_idx_lb_w + rowgrp_offset_in_cluster
 
-            # scatter col idxes into adjmat IDs
+            #
+            # map (split + scatter pieces) col idxes into adjmat col IDs
+            #
             colgrp_idx_part_w = colgrp_idx_part[idx_part_pos_w]
 
             colgrp_idx_part_w_cluster_ids = (
-                colgrp_idx_part_w // colgrp_perw_n
+                colgrp_idx_part_w // colgrp_per_worker_n
             # last cluster has more than colgrp_perw_n
             ).clamp(max=world_size - 1)
-            colgrp_idx_part_w_cluster_residues = \
-                colgrp_idx_part_w - \
-                colgrp_idx_part_w_cluster_ids * colgrp_perw_n
 
-            colgrp_ids_w = \
-                colgrp_idx_part_w_cluster_ids * grp_cluster_size \
-                + grps_offsets_in_cluster_w[col_tensor_group] \
-                + colgrp_idx_part_w_cluster_residues
+            # remainders are in [0, colgrp_per_worker_n) if before last, or
+            # [0, colgrp.n - colgrp_per_worker_n * (world_size-1))
+            colgrp_idx_part_w_cluster_remainders = \
+                colgrp_idx_part_w - \
+                colgrp_idx_part_w_cluster_ids * colgrp_per_worker_n
+
+            idx_is_before_last_rank = \
+                colgrp_idx_part_w_cluster_ids < (world_size - 1)
+
+            colgrp_ids_w = torch.empty_like(colgrp_idx_part_w)
+
+            def _for_column_clustersbefore_or_lastcluster(
+                clusters_kind_mask: torch.Tensor,
+                colgrps_offsets_in_cluster: Dict[EasierTensorGroup, int]
+            ) -> None:
+                # We have two kinds of clusters:
+                # - clusters before the last;
+                # - the last cluster itself.
+                colgrp_offset_in_cluster: int = colgrps_offsets_in_cluster[
+                    col_tensor_group
+                ]
+                
+                clusters_offsets = \
+                    colgrp_idx_part_w_cluster_ids[clusters_kind_mask] \
+                    * grp_cluster_size
+                
+                remainders_in_cluster = \
+                    colgrp_idx_part_w_cluster_remainders[clusters_kind_mask]
+                
+                colgrp_ids_kind = \
+                    clusters_offsets + colgrp_offset_in_cluster \
+                    + remainders_in_cluster
+
+                colgrp_ids_w[clusters_kind_mask] = colgrp_ids_kind
+
+            # for all ranks before the last: equal offsets and cluster sizes
+            _for_column_clustersbefore_or_lastcluster(
+                idx_is_before_last_rank, grps_offsets_in_clusters_beforelast
+            )
+            _for_column_clustersbefore_or_lastcluster(
+                ~idx_is_before_last_rank, grps_offsets_in_cluster_lastrank
+            )
 
             rowgrp_ids_to_send.append(rowgrp_ids_w.to(dist_env.comm_device))            
             colgrp_ids_to_send.append(colgrp_ids_w.to(dist_env.comm_device))
@@ -524,17 +563,6 @@ def synchronize_partition_result(
         synced_elemparts[tensor_group] = ElemPart(
             None, elempart_idx, elempart_lengths, hint=elempart_hint
         )
-
-
-
-
-
-
-
-
-
-
-
 
     return synced_elemparts
 
