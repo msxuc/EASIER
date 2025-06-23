@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from math import dist
 from typing import Dict, List, Sequence, Tuple, Union
 from dataclasses import dataclass
 from typing_extensions import Literal
@@ -103,7 +104,7 @@ def parallel_partition_graph(
 
     graph = selector_graph.minimum(1) + reducer_graph
 
-    local_membership = distpart_kway(
+    local_membership = distpart_kway, (
         DistConfig(
             int(vtxdist[-1]),
             (vtxdist[1:] - vtxdist[:-1]).tolist()
@@ -747,9 +748,11 @@ def partition_tensor_groups(modules: List[esr.Module], graphs: List[Graph]):
         if len(comm_pairs_collector.comm_pairs) > 0:
             # always check comm_pairs > 0 to exclude the real cases where
             # there is really no communication.
-            local_membership = partition_tensor_groups_with_adjmat(
-                comm_pairs_collector.tensor_groups,
-                comm_pairs_collector.comm_pairs)
+            # local_membership = partition_tensor_groups_with_adjmat(
+            #     comm_pairs_collector.tensor_groups,
+            #     comm_pairs_collector.comm_pairs)
+
+            local_membership = _run_distpart_with_cache(comm_pairs_collector)
 
             comm_elemparts = synchronize_partition_result(
                 comm_pairs_collector.tensor_groups,
@@ -763,3 +766,47 @@ def partition_tensor_groups(modules: List[esr.Module], graphs: List[Graph]):
         root.easier_elemparts = elemparts
 
     return modules, graphs
+
+
+import os
+adjmat_cachekey = os.environ.get("GROUP_PARTITION_adjmat", None)
+if adjmat_cachekey == None:
+    logger.error("export GROUP_PARTITION_adjmat !")
+    exit(-1)
+def adjmat_cachefile():
+    dist_env = get_runtime_dist_env()
+    world_size = dist_env.world_size
+    rank = dist_env.rank
+    cache_dir = os.path.join(
+        os.path.expanduser('~/.easier'), 'cache',
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+
+    return os.path.join(
+        cache_dir,
+        f"adjmat_{adjmat_cachekey}_W{world_size}_R{rank}.pt"
+    )
+
+def _run_distpart_with_cache(
+    comm_pairs_collector
+):
+    dist_env = get_runtime_dist_env()
+
+    if os.path.exists(adjmat_cachefile()):
+        logger.warning(f"\n\n>>>>> LOAD ADJMAT cache from {adjmat_cachefile()} ...")
+        fn_args = torch.load(adjmat_cachefile(), weights_only=False)
+        logger.warning(f">>>>> LOAD ADJMAT cache DONE\n\n")
+
+    else:
+        distpart_fn, fn_args = partition_tensor_groups_with_adjmat(
+            comm_pairs_collector.tensor_groups,
+            comm_pairs_collector.comm_pairs
+        )
+
+        logger.warning(f"\n\n>>>>> SAVE ADJMAT cache to {adjmat_cachefile()} ...")
+        torch.save(fn_args, adjmat_cachefile())
+        logger.warning(f">>>>> SAVE ADJMAT cache DONE\n\n")
+
+
+    local_membership = distpart_kway(*fn_args)
+    return local_membership
