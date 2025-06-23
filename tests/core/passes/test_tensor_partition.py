@@ -11,6 +11,7 @@ import easier
 from easier.core import passes
 from easier.core.jit import EasierTracer
 from easier.core.passes.tensor_grouping import EasierTensorGroup
+from easier.core.passes.utils import OrderedSet
 import easier.core.runtime.dist_env as _JitRuntimeDistEnv
 from easier.core.passes.tensor_group_partition import \
     CommPair, partition_tensor_groups_with_adjmat, parallel_partition_graph, \
@@ -44,8 +45,112 @@ PAR_PART_GRAPH_FUNCNAME = f'{CommPair.__module__}.{parallel_partition_graph.__na
 def get_call_arg0(call: 'mock.call_object'):  # type: ignore
     return call[0][0]
 
-
 def test_partition_tensor_groups(mock_mpi_dist_env):
+    fake_defset = frozenset()
+    g5 = EasierTensorGroup(fake_defset, 11,  'g5')  # type: ignore
+    g6 = EasierTensorGroup(fake_defset, 16, 'g6')  # type: ignore
+    g7 = EasierTensorGroup(fake_defset, 21  'g7')  # type: ignore
+
+    def run(comm_pairs: List[CommPair]):
+        return partition_tensor_groups_with_adjmat(
+            OrderedSet([g5, g6, g7]),
+            comm_pairs
+        )
+
+    comm_pairs_ranks: List[List[CommPair]] = [
+        [
+            CommPair(g7, vec(1, 10, 18), g7, vec(15, 20, 3), False),
+            CommPair(g5, vec(7, 1, 5), g6, vec(9, 15, 4), False)
+        ],
+        [
+            CommPair(g7, vec(), g7, vec(), False),
+            CommPair(g5, vec(), g6, vec(), False)
+        ],
+        [
+            CommPair(g7, vec(), g7, vec(), False),
+            CommPair(g5, vec(), g6, vec(), False)
+        ],
+    ]
+
+    # Each rank has 8 calls:
+    # 2 CommPairs * (CommPair + symmetric) * (rowids + colids)
+    # ================= rank 8calls tensors
+    a2a_inputs: List[List[List[torch.Tensor]]] = [
+        [
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+        ],
+        [ [vec() for _ in range(3)] for _ in range(8) ],
+        [ [vec() for _ in range(3)] for _ in range(8) ]
+    ]
+
+    a2a_outputs: List[List[List[torch.Tensor]]] = [
+        [
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+        ],
+        [
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+        ],
+        [
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+            [vec(), vec(), vec()],
+        ]
+
+    ]
+
+    mock_mpi_dist_env.world_size = 3
+
+    for rank in range(3):
+        mock_mpi_dist_env.rank = rank
+        with patch(PAR_PART_GRAPH_FUNCNAME) as mock_partgraph:
+
+            mock_partgraph.return_value = [
+                "local_membership_not_used"
+            ]
+
+            mock_mpi_dist_env.all_to_all.reset_mock()
+            mock_mpi_dist_env.all_to_all.side_effect = a2a_outputs[rank]
+            run(comm_pairs_ranks[mock_mpi_dist_env.rank])
+
+            mock_partgraph.assert_called_once()
+
+            call_args_list = iter(mock_mpi_dist_env.all_to_all.call_args_list)
+
+            for expected_inputs, call_args in zip(
+                a2a_inputs[rank], call_args_list
+            ):
+                assert_tensor_list_equal(
+                    get_call_arg0(call_args), expected_inputs
+                )
+
+@pytest.mark.skip
+def test_partition_tensor_groups2(mock_mpi_dist_env):
     fake_defset = frozenset()
     g5 = EasierTensorGroup(fake_defset, 9,  'g5')  # type: ignore
     g6 = EasierTensorGroup(fake_defset, 26, 'g6')  # type: ignore

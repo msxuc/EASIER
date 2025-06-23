@@ -212,6 +212,33 @@ class CommPairCollector(EasierInterpreter):
             submod.easier_hint_name
         ))
 
+def calculate_group_offsets(tensor_groups: OrderedSet[EasierTensorGroup]):
+    dist_env = get_runtime_dist_env()
+    world_size = dist_env.world_size
+
+    zero_leading_grp_sizes = torch.tensor(
+        [0] + [g.n for g in tensor_groups], dtype=torch.int64
+    )
+    grp_cluster_size_beforelast = int((zero_leading_grp_sizes // world_size).sum())
+
+    grps_offsets_in_clusters_beforelast: Dict[EasierTensorGroup, int] = dict(zip(
+        tensor_groups,
+        torch.cumsum(  # the first 0 keeps unchanged
+            zero_leading_grp_sizes // world_size, dim=0
+        )[:-1].tolist()
+    ))
+    grps_offsets_in_cluster_lastrank: Dict[EasierTensorGroup, int] = dict(zip(
+        tensor_groups,
+        torch.cumsum(  # the first 0 keeps unchanged
+            zero_leading_grp_sizes - (
+                zero_leading_grp_sizes // world_size * (world_size - 1)
+            ),  # cumsum with accumulated remainders
+            dim=0
+        )[:-1].tolist()
+    ))
+
+    return zero_leading_grp_sizes, grp_cluster_size_beforelast, \
+        grps_offsets_in_clusters_beforelast, grps_offsets_in_cluster_lastrank
 
 def partition_tensor_groups_with_adjmat(
     tensor_groups: OrderedSet[EasierTensorGroup],
@@ -292,26 +319,11 @@ def partition_tensor_groups_with_adjmat(
         torch.Tensor, torch.Tensor, CommPair
     ]] = []
 
-    zero_leading_grp_sizes = torch.tensor(
-        [0] + [g.n for g in tensor_groups], dtype=torch.int64
-    )
-    grp_cluster_size = int((zero_leading_grp_sizes // world_size).sum())
-
-    grps_offsets_in_clusters_beforelast: Dict[EasierTensorGroup, int] = dict(zip(
-        tensor_groups,
-        torch.cumsum(  # the first 0 keeps unchanged
-            zero_leading_grp_sizes // world_size, dim=0
-        )[:-1].tolist()
-    ))
-    grps_offsets_in_cluster_lastrank: Dict[EasierTensorGroup, int] = dict(zip(
-        tensor_groups,
-        torch.cumsum(  # the first 0 keeps unchanged
-            zero_leading_grp_sizes - (
-                zero_leading_grp_sizes // world_size * (world_size - 1)
-            ),  # cumsum with accumulated remainders
-            dim=0
-        )[:-1].tolist()
-    ))
+    zero_leading_grp_sizes, grp_cluster_size_beforelast, \
+        grps_offsets_in_clusters_beforelast, \
+        grps_offsets_in_cluster_lastrank = calculate_group_offsets(
+            tensor_groups
+        )
 
     for comm_pair in comm_pairs:
         row_tensor_group = comm_pair.src_tensor_group
@@ -390,7 +402,7 @@ def partition_tensor_groups_with_adjmat(
                 
                 clusters_offsets = \
                     colgrp_idx_part_w_cluster_ids[clusters_kind_mask] \
-                    * grp_cluster_size
+                    * grp_cluster_size_beforelast
                 
                 remainders_in_cluster = \
                     colgrp_idx_part_w_cluster_remainders[clusters_kind_mask]
@@ -542,14 +554,16 @@ def synchronize_partition_result(
     world_size = dist_env.world_size
     rank = dist_env.rank
 
+    zero_leading_grp_sizes, grp_cluster_size_beforelast, \
+        _grps_offsets_in_clusters_beforelast, \
+        _grps_offsets_in_cluster_lastrank = calculate_group_offsets(
+            tensor_groups
+        )
 
-    perw_nrows_of_grps: List[int] = []
-    for grp in tensor_groups:
-        grp_nrow_per_worker, grp_residue = divmod(grp.n, world_size)
-        if rank == world_size - 1:
-            grp_nrow_per_worker += grp_residue
-
-        perw_nrows_of_grps.append(grp_nrow_per_worker)
+    if rank == world_size - 1:
+        grps_offsets = _grps_offsets_in_cluster_lastrank
+    else:
+        grps_offsets = _grps_offsets_in_clusters_beforelast
     
     synced_elemparts: Dict[EasierTensorGroup, ElemPart] = {}
 
@@ -557,13 +571,20 @@ def synchronize_partition_result(
     # [perw_nrow_sum * rank, max(perw_nrow_sum * (rank + 1), accum_n)
 
     for grp_i, tensor_group in enumerate(tensor_groups):
-        local_membership_begin = sum(perw_nrows_of_grps[:grp_i])
-        local_membership_end = local_membership_begin + perw_nrows_of_grps[grp_i]
+        local_membership_begin = grps_offsets[tensor_group]
 
-        per_worker_nrow, residue = divmod(tensor_group.n, world_size)
+        perworker_n = tensor_group.n // world_size
+        last_n = tensor_group.n - perworker_n * (world_size - 1)
+
+        if rank == world_size - 1:
+            this_n = last_n
+        else:
+            this_n = perworker_n
+
+        local_membership_end = local_membership_begin + this_n
 
         grp_membership = local_membership[local_membership_begin:local_membership_end]
-        tensor_group_begin = per_worker_nrow * rank
+        tensor_group_begin = perworker_n * rank
 
         elempart_idxes_by_rank = []
 
