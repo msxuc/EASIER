@@ -696,6 +696,7 @@ def distpart_kway(
     logger.debug(f"EASIER coarsening started. nv={dist_config.nv}")
 
     while True:
+        logger.debug(f"COARSEN LEVEL nv={cur_lv.dist_config.nv}")
         new_lv, cvids = coarsen_level(cur_lv)
         # TODO levels.append(new_lv)
         c_dist_configs.append(new_lv.dist_config)
