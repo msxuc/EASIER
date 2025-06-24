@@ -796,6 +796,8 @@ class TorchDistGlooDistEnv(TorchDistEnv):
         for p2p in self.batch_isend_irecv(p2ps):
             p2p.wait()
 
+        self.barrier()
+
         return buffers
 
 
