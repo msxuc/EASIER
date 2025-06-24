@@ -278,8 +278,9 @@ def init(
         f"Initializing torch.distributed with '{comm_backend}'"
     )
 
+    import datetime
     import torch.distributed as dist
-    dist.init_process_group(comm_backend, **kwargs)
+    dist.init_process_group(comm_backend, timeout=datetime.timedelta(minutes=3), **kwargs)
 
     init_logger(dist.get_rank())
 
