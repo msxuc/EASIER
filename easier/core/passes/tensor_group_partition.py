@@ -807,6 +807,10 @@ def _run_distpart_with_cache(
         torch.save(fn_args, adjmat_cachefile())
         logger.warning(f">>>>> SAVE ADJMAT cache DONE\n\n")
 
+    from runtime.dist_env import debug_flag
+    debug_flag[0] = 1
 
     local_membership = distpart_kway(*fn_args)
+    
+    debug_flag[0] = 0
     return local_membership

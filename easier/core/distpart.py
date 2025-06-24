@@ -478,6 +478,7 @@ def merge_vertexes(
         To each new ID there may be many (even more than world_size)
         old vertexes mapped.
     """
+    logger.debug("MERGE VERTEX")
     c_dist_config = DistConfig.create_default(cnv)
     xchg = CoarseningRowDataExchanger(c_dist_config, cvids)
 
@@ -577,6 +578,7 @@ def coarsen_level(
         prev_lv.colidx,
         prev_lv.adjwgt,
     )
+    logger.debug("C match DONE")
     # Possible value of matched[x]:
     # -1
     #   unmatched
@@ -593,6 +595,7 @@ def coarsen_level(
     cvids = torch.full((end - start,), fill_value=-1, dtype=torch.int64)
 
     for w in range(dist_env.world_size - 1, -1, -1):
+        logger.debug(f"COARSEN LEVEL rank {w}")
         w_start, w_end = prev_lv.dist_config.get_start_end(w)
 
         if w == dist_env.rank:
@@ -612,6 +615,8 @@ def coarsen_level(
             # iterations of those subsequent workers.
             assert torch.all(cvids != -1), \
                 "All local vertexes should be assigned with coarser IDs"
+            
+
 
             # TODO make a masked broadcast for only (rank < w) workers.
             w_cvids = dist_env.broadcast(

@@ -18,6 +18,9 @@ from easier.core.utils import logger, EasierJitException
 _T = TypeVar("_T")
 
 
+debug_flag = [0]
+
+
 def _wrap_function(pre_hook, func):
     """
     Both `api` and `pre_hook` function objects are not 
@@ -29,6 +32,8 @@ def _wrap_function(pre_hook, func):
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        if debug_flag[0] != 0:
+            logger.debug(f"||| {func}")
         args, kwargs = pre_hook(*args, **kwargs)
         return func(*args, **kwargs)
     return wrapper
