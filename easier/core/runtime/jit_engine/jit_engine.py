@@ -253,16 +253,6 @@ class ViewSrcTrackerBase(NodeHandlerBase):
         self.addr2refcount: Dict[int, int] = {}
         self.addr2viewsrc: Dict[int, ViewSrc] = {}
 
-        # TODO record (within storage lifetime) the address of a tensor,
-        # we need the invariant that tensor storage never changes
-        # because they are allocated by EASIER AOT.
-        # E.g. Tensor.set_ resets the storage, but Tensor.copy_ does not.
-        # self.tensor2addr: Dict[torch.Tensor, int] = {}
-        #
-        # NOTE but if it's not an esr.Tensor, but an immediate tensors, can
-        # their storage be changed? We can detect the change and decr refcount
-        # before resetting and incr refcount of the shared storage.
-
     def _get_indexed_addr(
         self, iaddr_node: Node, val: RuntimeValue,
         *,
@@ -1129,10 +1119,17 @@ class JitEngine:
             handlers = self.create_first_run_handlers(stackframe)
         else:
             handlers = self.create_runtime_handlers(stackframe)
+        
+        import nvtx
+        if self.run_count > 0:
+            nvtx.push_range(self.module.__class__.__name__, domain='CLS')
 
         for node in list(self.graph.nodes):
             # args and kwargs collections are mutable for Handlers to modify.
             args, kwargs = [], {}
+
+            if self.run_count > 0:
+                nvtx.push_range(f"Node {node.name}", domain='NODE')
 
             for i_handler, handler in enumerate(handlers):
                 decision = handler.preprocess(node, args, kwargs)
@@ -1153,7 +1150,11 @@ class JitEngine:
                 # Only if none of the preprocess steps breaks
                 # can we eval the Node;
                 # Otherwise it means the Node should be skipped.
+                if self.run_count > 0:
+                    nvtx.push_range(f"Eval", domain='EVAL')
                 res = evaluate_node(self.module, node, args, kwargs)
+                if self.run_count > 0:
+                    nvtx.pop_range()
             else:
                 res = jit_skipped
 
@@ -1161,6 +1162,12 @@ class JitEngine:
                 rev_handler = handlers[rev_i]
                 # Pass in the final args/kwargs values
                 res = rev_handler.postprocess(node, res, args, kwargs)
+
+            if self.run_count > 0:
+                nvtx.pop_range()
+
+        if self.run_count > 0:
+            nvtx.pop_range()
 
         if self.run_count == 0:
             self.compile_after_first_run()

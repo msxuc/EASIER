@@ -908,6 +908,10 @@ def load_dumps(
             modules, raw_graphs, jit_f, dump_info.primitives
         )
         fw_graphs = load_modules(modules, jit_f, dump_info.modules)
+    
+    # HOTFIX
+    from easier.core.passes.dataflow_distribution import AllReducePrimitivesRewriter
+    AllReducePrimitivesRewriter(modules, fw_graphs).run()
 
     # Prepare Tensor and idx data
     load_partitioned_tensors_from_source(modules)
@@ -1033,11 +1037,11 @@ def rank0_validates_dumps(
         logger.debug("The number of easier.Modules changes")
         return False
 
-    ir_changes = _detect_user_program_changes(
-        modules, raw_graphs, h5root, dump_info
-    )
-    if ir_changes:
-        return False
+    # ir_changes = _detect_user_program_changes(
+    #     modules, raw_graphs, h5root, dump_info
+    # )
+    # if ir_changes:
+    #     return False
 
     for mod, mod_info in zip(modules, dump_info.modules):
         if mod_info.partition_mode != mod.partition_mode:
@@ -1258,11 +1262,55 @@ def load_modules(
             )
             assert inst.is_needed
             mod.add_module(haloxchg_attrname, inst)
-
+        
+        from easier.core.passes.utils import FX, get_called_module
+        from easier.core.utils import logger
         fw_graph = serializable_ir_to_fx_graph(unpickle_ir(
             h5_ep_root[mod_info.h5_group_basepath][  # type: ignore
                 H5_DATASET_MODULE_FORWARD_IR][...]
         ))
-        results.append(fw_graph)
+        # which S/R have which Halo, note Nodes may share S/R instance.
+        halo_belong: List[Tuple[Union[esr.Selector, esr.Reducer], str]] = []
+        for sr_node in list(fw_graph.nodes):
+            if sr_node.op == FX.CALL_MODULE:
+                sr = get_called_module(mod, sr_node)
+                if isinstance(sr, (esr.Selector, esr.Reducer)):
+                    sr_input_node = sr_node.all_input_nodes[0]
+
+                    if sr_input_node.op == FX.CALL_MODULE:
+                        halo = get_called_module(mod, sr_input_node)
+                        if isinstance(halo, HaloExchanger):
+                            halo_belong.append((sr, cast(str, sr_input_node.target)))
+                            logger.info(f"Found {sr_input_node.target} for {sr_node.name}[{sr_node.target}]")
+
+        raw_graph: Graph = mod.easier_raw_graph # type: ignore
+        for node in list(raw_graph.nodes):
+            if node.op == FX.CALL_MODULE:
+                submod = get_called_module(mod, node)
+
+                if len(halo_belong) > 0 and submod is halo_belong[0][0]:
+                    haloxchg_modpath = halo_belong[0][1]
+                    halo_belong.pop()
+
+                    input_node = node.all_input_nodes[0]
+
+                    with node.graph.inserting_before(node):
+                        haloxchg_node = node.graph.call_module(
+                            haloxchg_modpath, (input_node,)
+                        )
+                        node.replace_input_with(input_node, haloxchg_node)
+                    logger.info(f"HOTFIX: rewrite {haloxchg_modpath} to {node.name}[{node.target}]")
+
+        assert len(halo_belong) == 0
+                    
+        results.append(raw_graph)
+
+
+        # fw_graph = serializable_ir_to_fx_graph(unpickle_ir(
+        #     h5_ep_root[mod_info.h5_group_basepath][  # type: ignore
+        #         H5_DATASET_MODULE_FORWARD_IR][...]
+        # ))
+
+        # results.append(fw_graph)
 
     return results
