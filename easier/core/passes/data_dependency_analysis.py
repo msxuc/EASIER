@@ -258,8 +258,18 @@ class DataDependencyAnalyzer(EasierInterpreter[None]):
                     param_srcs.add(attr_view_src)
 
             for param_src in param_srcs:
-                self.add_reader_dependency(param_src)
+                # Only add_writer_deps first on esr.Module calls. See below.
                 self.add_writer_dependency(param_src)
+                self.add_reader_dependency(param_src)
+
+            # About add_writer_deps first:
+            # get_attr Nodes may appear after the esr.Module call,
+            # in such cases the initial writer for the ViewSrc hasn't
+            # been decided yet -- the esr.Module call is the initial
+            # writer.
+            # And unlike other Nodes, esr.Module calls do not have IO dataflow,
+            # it's safe to update writer first. Otherwise we'll lose the true
+            # previous writer.
 
 
 def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):

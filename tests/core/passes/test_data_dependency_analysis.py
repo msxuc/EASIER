@@ -196,6 +196,7 @@ def test_data_dependency_nested_call():
         def __init__(self):
             super().__init__()
             self.r = esr.Tensor(torch.zeros(3, 3), mode='replicate')
+            self.r2 = esr.Tensor(torch.ones(1), mode='replicate')
             self.inner = Inner()
 
         def forward(self):
@@ -212,7 +213,8 @@ def test_data_dependency_nested_call():
             a = self.v[:]
             a[:] += 1
             self.intermediate()
-            a[:] *= 1
+            r2 = self.intermediate.r2
+            a[:] *= r2
 
     m = Outer()
     from easier.core.jit import compile
@@ -223,7 +225,7 @@ def test_data_dependency_nested_call():
     get_attr, a, \
         a_view, add, set_a, \
         call_intermediate, \
-        a_view2, mul, set_a2, output \
+        get_attr_r, a_view2, mul, set_a2, output \
         = graph.nodes
 
     assert _get_viewsrc_node(get_attr) == get_attr
