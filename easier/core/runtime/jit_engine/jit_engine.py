@@ -467,7 +467,7 @@ class ViewSrcTracker(ViewSrcTrackerBase):
         post_eval_args_siaddrs = self._get_args_siaddrs(current_node)
         if post_eval_args_siaddrs != self.args_siaddrs:
             raise EasierJitException(
-                f"The operation {current_node.format_node()} is not allowed,"
+                f"The operation '{current_node.format_node()}' is not allowed,"
                 " because it changes the storage of the input tensor"
             )
 
