@@ -2,8 +2,10 @@
 # Licensed under the MIT License.
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import os
-from typing import Iterator, Optional, Tuple, TypeAlias, Union, cast
+from types import EllipsisType
+from typing import Iterator, List, Optional, Self, Tuple, TypeAlias, Union, cast
 import h5py
 import functools
 import copy
@@ -58,6 +60,41 @@ def _wrap_function(pre_hook, post_hook, func):
     return wrapper
 
 
+@dataclass
+class DataLoaderViewBase:
+    def append_to(self, data_loader: 'DataLoaderBase') -> None:
+        """
+        By default, simply do `data_loader.views.append(self)`,
+        and the `data_loader` is already a deep copy from a fundanmental
+        DataLoader instance, with all previous views deepcopied too.
+
+        Sub view class may override this method to:
+        -   recalculate programming-time attributes shape/dtype;
+        -   compose and simplify `data_loader.views` list when possible.
+        """
+        data_loader.views.append(self)
+    
+
+_IndexType: TypeAlias = Union[int, slice, EllipsisType, None]
+
+@dataclass
+class StridedView(DataLoaderViewBase):
+    """
+    E.g. `data_loader[1, 2, 3, :, 4, 5, 6]`
+    """
+    index: Union[_IndexType, Tuple[_IndexType, ...]]
+
+    def append_to(self, data_loader: 'DataLoaderBase') -> None:
+        if len(data_loader.views) > 0:
+            last_view = data_loader.views[-1]
+            if isinstance(last_view, StridedView):
+                data_loader.views.pop()
+
+                data_loader.shape = (123,)
+
+        data_loader.views.append(self)
+
+
 class DataLoaderBase:
     """
     The data loader for one specified data source, e.g. a HDF5 dataset.
@@ -79,6 +116,21 @@ class DataLoaderBase:
         # The device on which the data loader is intially defined.
         # This device configuration only take effect with "torch" JIT backend.
         self.device: torch.device
+
+        #
+        # DataLoader _views_ are layers over a fundamental DataLoader.
+        # A view encapsulates compile-time data filtering and transformation
+        # logic.
+        # When loading (load_by_rank) or examining (minmax) data, the
+        # fundamental DataLoader must respect all its views
+        # (in an inverse order).
+        #
+        # NOTE shape/dtype/device are commonly used attributes during
+        # programming time, so they are not inferred through DataLoader views,
+        # but every time a DataLoader view is created, new shape/dtype/device
+        # must be re-calculated immediately.
+        #
+        self.views: List[DataLoaderViewBase] = []
 
         # e.g. "(Module).(a.b.c:Selector).idx"
         # Decided during `esr.compile()`
@@ -108,6 +160,11 @@ class DataLoaderBase:
                     _wrap_function(pre_hook, post_hook, member)
                 )
 
+    def apply_view(self, view: DataLoaderViewBase) -> 'DataLoaderBase':
+        clone = copy.deepcopy(self)
+        view.append_to(clone)
+        return clone
+        
     def coll_check_dtype_shape_devicetype(self):
         check_collective_equality(
             f"Tensor properties of {self.easier_hint_name}",
@@ -148,6 +205,9 @@ class DataLoaderBase:
             clone.device = torch.device(device)
         return clone
 
+    def __getitem__(self, index: _IndexType) -> 'DataLoaderBase':
+        return self.apply_view(StridedView(index))
+
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:
         """
@@ -180,6 +240,12 @@ class DataLoaderBase:
         """
         Collectively load an evenly distributed part of the target dataset
         for each rank.
+
+        TODO for passes where DataLoaders are used, they may leverage the
+        properties of data such as being arange-d, or bounded, or ordered, etc.
+        DataLoader internal methods currently return Tensors only
+        therefore we didn't recognize such properties in the 1st place.
+        Do DataLoaders need to tell caller its properties? How?
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
@@ -759,6 +825,8 @@ class FulledTensorLoader(DataLoaderBase):
         self.shape = tuple(shape)
         self.dtype = dtype
         self.device = torch.device(device)
+
+        # Views are not effective for FullTensorLoader.
 
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
