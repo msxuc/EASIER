@@ -95,6 +95,38 @@ class StridedView(DataLoaderViewBase):
         data_loader.views.append(self)
 
 
+"""
+TODO
+
+Passes like tensor_partitioning and sparse_encoding (and potentially codegen)
+leverages properties of idx tensors like being arange-d, being bounded or
+being ordered to boost index calculation. The idx tensors are all originally
+loaded by DataLoaders.
+However, DataLoader internal methods currently return Tensors only,
+therefore we didn't recognize such properties in the 1st place.
+And the passes themselves maintain then discard the record objects that
+indicate such properties, without making a global effort to leverage it.
+
+Given the data-oriented nature of EASIER AOT, we may make every subsystem in
+AOT return symbolic representation of data.
+It's not the `pass.py` itself, but the interpreter in another layer to evaluate
+the symbolic representation, deciding how to do the transformation on data.
+Nonetheless, CUDA acceleration, GC in AOT can also be handled by it, authors
+of passes can focus on compilation logic.
+
+That said, because of the need to balance computation costs for general cases
+and the requirement of managing synchronization points of collective
+communication APIs,
+we may fallback to tensor calculation once when the "generalness" occur again
+during AOT.
+
+P.S. DataLoaders themselves and the AOT passes that use torch vectorized
+operators (which opened a space for CUDA acceleration) are already similar
+approaches, but using different symbol sets from easier.runtime.data_loader
+or of torch operators.
+"""
+
+
 class DataLoaderBase:
     """
     The data loader for one specified data source, e.g. a HDF5 dataset.
@@ -240,12 +272,6 @@ class DataLoaderBase:
         """
         Collectively load an evenly distributed part of the target dataset
         for each rank.
-
-        TODO for passes where DataLoaders are used, they may leverage the
-        properties of data such as being arange-d, or bounded, or ordered, etc.
-        DataLoader internal methods currently return Tensors only
-        therefore we didn't recognize such properties in the 1st place.
-        Do DataLoaders need to tell caller its properties? How?
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU

@@ -243,6 +243,23 @@ def arange(*args, **kwargs):
     return ArangeTensorLoader(start, end, step, dtype, device)
 
 
+class Mesh:
+    def __init__(self, *data_loaders: DataLoaderBase):
+        self.nc: int
+        self.ne: int
+
+        # size=len(dts), each for one dim.
+        self.src_p: List[DataLoaderBase]
+        self.dst_p: List[DataLoaderBase]
+
+        # flattened cartesian product of all arg dataloaders.
+        self.points: DataLoaderBase
+
+        # multidimension, each dimension has 2 parts:
+        # shape=(2_0, 2_1, ..., 2_{len(dts)-1})
+        self.boundary: DataLoaderBase
+
+
 def _resolve_data_loader(arg) -> DataLoaderBase:
     if isinstance(arg, DataLoaderBase):
         return arg
