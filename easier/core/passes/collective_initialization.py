@@ -86,7 +86,8 @@ def validate_idx_range(
             f"{hint_name}.idx must be integer"
         )
 
-    idxmin, idxmax = cast(Tuple[int, int], dl.minmax())
+    idxslice = slice(0, dl.shape[0])
+    idxmin, idxmax = cast(Tuple[int, int], dl.minmax(idxslice))
 
     if not (0 <= idxmin):
         raise ValueError(

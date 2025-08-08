@@ -243,8 +243,15 @@ def arange(*args, **kwargs):
     return ArangeTensorLoader(start, end, step, dtype, device)
 
 
+def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
+    if dtype is None:
+        dtype = torch.float64
+    
+    ArangeTensorLoader(start,1)
+
+
 class Mesh:
-    def __init__(self, *data_loaders: DataLoaderBase):
+    def __init__(self, data_loaders: Sequence[DataLoaderBase]):
         self.nc: int
         self.ne: int
 

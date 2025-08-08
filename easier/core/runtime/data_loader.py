@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 import os
 from types import EllipsisType
 from typing import Iterator, List, Optional, Self, Tuple, TypeAlias, Union, cast
@@ -60,39 +61,19 @@ def _wrap_function(pre_hook, post_hook, func):
     return wrapper
 
 
-@dataclass
-class DataLoaderViewBase:
-    def append_to(self, data_loader: 'DataLoaderBase') -> None:
-        """
-        By default, simply do `data_loader.views.append(self)`,
-        and the `data_loader` is already a deep copy from a fundanmental
-        DataLoader instance, with all previous views deepcopied too.
+# Python __getitem__ protocol only support one index parameter, and require
+# caller to wrap multiple arugments in a tuple (only tuple, not list).
+# Given a value of such a Union type, we can directly pass it into
+# Tensor.__getitem__ etc. without extra unpacking like `*args`.
+_SimpleIndex: TypeAlias = Union[
+    int, slice, EllipsisType, None,
+    Tuple['_SimpleIndex', ...]
+]
+_GeneralIndex: TypeAlias = Union[
+    int, slice, EllipsisType, None, torch.Tensor,
+    Tuple['_GeneralIndex', ...]
+]
 
-        Sub view class may override this method to:
-        -   recalculate programming-time attributes shape/dtype;
-        -   compose and simplify `data_loader.views` list when possible.
-        """
-        data_loader.views.append(self)
-    
-
-_IndexType: TypeAlias = Union[int, slice, EllipsisType, None]
-
-@dataclass
-class StridedView(DataLoaderViewBase):
-    """
-    E.g. `data_loader[1, 2, 3, :, 4, 5, 6]`
-    """
-    index: Union[_IndexType, Tuple[_IndexType, ...]]
-
-    def append_to(self, data_loader: 'DataLoaderBase') -> None:
-        if len(data_loader.views) > 0:
-            last_view = data_loader.views[-1]
-            if isinstance(last_view, StridedView):
-                data_loader.views.pop()
-
-                data_loader.shape = (123,)
-
-        data_loader.views.append(self)
 
 
 """
@@ -111,6 +92,9 @@ Given the data-oriented nature of EASIER AOT, we may make every subsystem in
 AOT return symbolic representation of data.
 It's not the `pass.py` itself, but the interpreter in another layer to evaluate
 the symbolic representation, deciding how to do the transformation on data.
+To the extreme extent, (the symbolic representation of) simple DataLoaders
+like esr.arange might get kept, and in codegen each thread can calculate data
+from thread id rather than loading arange-d data from memory.
 Nonetheless, CUDA acceleration, GC in AOT can also be handled by it, authors
 of passes can focus on compilation logic.
 
@@ -132,6 +116,22 @@ class DataLoaderBase:
     The data loader for one specified data source, e.g. a HDF5 dataset.
 
     Calls to every method should be collective.
+
+    NOTE for subclasses:
+    Subclasses should implement each method in a way that suits the use case,
+    for example, to load a range we should avoid loading-all-then-slicing.
+    
+    But this is not always possible, an extreme example may be:
+    ```
+    class RandomSamplerLoader(DataLoaderBase):
+        def __init__(self, inner: DataLoaderBase):
+            self.inner = inner
+        def partially_load_by_range(self, region):
+            random_idx = randint([for dimlen in region])
+            return self.inner.partially_load_by_index(random_idx)
+    ```
+    where we cannot keep the simplicity of range and must fallback to load
+    by index tensor.
     """
 
     def __init__(self) -> None:
@@ -141,6 +141,12 @@ class DataLoaderBase:
         When collective operations are needed, implementations should use
         `get_default_dist_env` because the constructors are called by users
         before `esr.compile()`.
+
+        NOTE subclasses should not put communication, especially not call
+        `coll_check_dtype_shape_devicetype` etc. in constructors.
+        As DataLoaders are not only used by end users (where collective check
+        makes sense) but also used by internal passes (where it's not
+        collective at all).
         """
         self.shape: Tuple[int, ...]
         self.dtype: torch.dtype
@@ -148,21 +154,6 @@ class DataLoaderBase:
         # The device on which the data loader is intially defined.
         # This device configuration only take effect with "torch" JIT backend.
         self.device: torch.device
-
-        #
-        # DataLoader _views_ are layers over a fundamental DataLoader.
-        # A view encapsulates compile-time data filtering and transformation
-        # logic.
-        # When loading (load_by_rank) or examining (minmax) data, the
-        # fundamental DataLoader must respect all its views
-        # (in an inverse order).
-        #
-        # NOTE shape/dtype/device are commonly used attributes during
-        # programming time, so they are not inferred through DataLoader views,
-        # but every time a DataLoader view is created, new shape/dtype/device
-        # must be re-calculated immediately.
-        #
-        self.views: List[DataLoaderViewBase] = []
 
         # e.g. "(Module).(a.b.c:Selector).idx"
         # Decided during `esr.compile()`
@@ -192,11 +183,6 @@ class DataLoaderBase:
                     _wrap_function(pre_hook, post_hook, member)
                 )
 
-    def apply_view(self, view: DataLoaderViewBase) -> 'DataLoaderBase':
-        clone = copy.deepcopy(self)
-        view.append_to(clone)
-        return clone
-        
     def coll_check_dtype_shape_devicetype(self):
         check_collective_equality(
             f"Tensor properties of {self.easier_hint_name}",
@@ -207,15 +193,22 @@ class DataLoaderBase:
         """
         Validate if the the data of this data loader is collectively correct.
 
-        Require callers to first ensure the data loders among workers are
+        Mainly to validate DataLoaders defiend by users.
+        DataLoaders created by EASIER internally generally do not need this.
+
+        Require callers (i.e. collective_initialization pass)
+        to first ensure the data loders among workers are
         actually referring to the same data set i.e. of the same type.
         """
         raise NotImplementedError()
 
-    def minmax(self) -> Tuple[Num, Num]:
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        """
+        Get minimum and maximum value within the `region` range of data source.
+        """
         raise NotImplementedError()
 
-    def count_unique(self) -> int:
+    def count_unique(self, region: _SimpleIndex) -> int:
         """
         Used by Reducer.set_fullness()
         """
@@ -237,8 +230,8 @@ class DataLoaderBase:
             clone.device = torch.device(device)
         return clone
 
-    def __getitem__(self, index: _IndexType) -> 'DataLoaderBase':
-        return self.apply_view(StridedView(index))
+    def __getitem__(self, index: _SimpleIndex) -> 'DataLoaderBase':
+        return StridedDataLoader(self, index)
 
     def partially_load_by_chunk(self, chunk_size: int
                                 ) -> Iterator[torch.Tensor]:
@@ -279,11 +272,24 @@ class DataLoaderBase:
         - int: the end offset of the part (exclusive)
         """
         raise NotImplementedError()
-
+    
     def _post_partially_load_by_rank(self, res):
         (tensor, begin, end) = res
         assert tensor.device.type == 'cpu'
         return res
+
+    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+        raise NotImplementedError()
+
+
+    def _pre_partially_load_by_range(self, index):
+        assert isinstance(index, (int, slice, tuple)) \
+            or index in [Ellipsis, None]
+
+    def _post_partially_load_by_range(self, res):
+        assert res.device.type == 'cpu'
+        return res
+
 
     def partially_load_by_index(self, index: torch.Tensor, **kwargs
                                 ) -> torch.Tensor:
@@ -295,6 +301,14 @@ class DataLoaderBase:
         Args:
         - index: should always be on CPU
         - kwargs: subtype-specific config
+
+            Common configs:
+            -   chunk_size: int
+
+            TODO as DataLoader subsystem gets complicated, other loading API
+            may need kwargs config too.
+            TODO or any DataLoader needs configs may have configs being
+            attributes.
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
@@ -437,13 +451,13 @@ class InMemoryTensorLoader(DataLoaderBase):
         )
 
     @functools.cache
-    def minmax(self) -> Tuple[Num, Num]:
-        amin, amax = self.tensor.aminmax()
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        amin, amax = self.tensor[region].aminmax()
         return amin.item(), amax.item()
 
     @functools.cache
-    def count_unique(self) -> int:
-        return self.tensor.unique().shape[0]
+    def count_unique(self, region: _SimpleIndex) -> int:
+        return self.tensor[region].unique().shape[0]
 
     def partially_load_by_chunk(
         self, chunk_size: int
@@ -585,7 +599,7 @@ class H5DataLoader(DataLoaderBase):
             yield d
 
     @functools.cache
-    def minmax(self) -> Tuple[Num, Num]:
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
@@ -614,7 +628,7 @@ class H5DataLoader(DataLoaderBase):
         return amin, amax
 
     @functools.cache
-    def count_unique(self) -> int:
+    def count_unique(self, ) -> int:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
@@ -925,11 +939,16 @@ class FulledTensorLoader(DataLoaderBase):
 
 
 class ArangeTensorLoader(DataLoaderBase):
-    def __init__(self, start: int, end: int, step: int, dtype, device) -> None:
+    def __init__(self, start: Num, end: Num, step: Num, dtype, device) -> None:
         super().__init__()
 
         if step == 0:
             raise ValueError("step must not be 0")
+        if math.isinf(start) or math.isinf(end):
+            raise ValueError(f"range cannot be {start} to {end}")
+
+        # TODO torch.arange rejects (0, 10, -1) -- sign must be consistent
+        # -- but numpy allows and returns empty list.
 
         self._start = start
         self._end = end
@@ -1023,3 +1042,58 @@ class ArangeTensorLoader(DataLoaderBase):
             f'dtype={self.dtype}',
             ')'
         ])
+
+
+class StridedDataLoader(DataLoaderBase):
+    def __init__(self, inner: DataLoaderBase, index: _SimpleIndex):
+        super().__init__()
+
+        self.inner = inner
+        self.index = index
+
+        strided = inner.get_placeholder()[index]
+        self.shape = tuple(strided.shape)
+    
+    def collective_init(self) -> None:
+        self.coll_check_dtype_shape_devicetype()
+    
+    def _rev_compose_index_range(self, region: _SimpleIndex) -> _SimpleIndex:
+        raise NotImplementedError()
+    def _rev_compose_index_tensor(self, index: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+    
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        region = self._rev_compose_index_range(region)
+        return self.inner.minmax(region)
+    
+    def count_unique(self, region: _SimpleIndex) -> int:
+        region = self._rev_compose_index_range(region)
+        return self.inner.count_unique(region)
+    
+    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+        region = self._rev_compose_index_range(region)
+        return self.inner.partially_load_by_range(region)
+    
+    def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
+        index = self._rev_compose_index_tensor(index)
+        return self.inner.partially_load_by_index(index, **kwargs)
+
+
+class CartesianProductDataLoader(DataLoaderBase):
+    def __init__(self, components: List[DataLoaderBase]):
+        super().__init__()
+
+        self.components = components
+    
+    def collective_init(self) -> None:
+        pass
+
+
+class FlattenDataLoader(DataLoaderBase):
+    """
+    Flatten n-dim DataLoader to 1-d, in an innermost-major manner.
+    """
+    def __init__(self, inner: DataLoaderBase):
+        super().__init__()
+
+        self.inner = inner
