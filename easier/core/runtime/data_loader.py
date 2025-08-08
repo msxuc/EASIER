@@ -205,11 +205,18 @@ class DataLoaderBase:
     def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
         """
         Get minimum and maximum value within the `region` range of data source.
+
+        TODO minmax() and count_unique() both accept *simple* index as range,
+        i.e. tensor-typed index is not allowed.
+        This indicates we may need to reimplement minmax()/count_unique() on a
+        very detailed, tensor-indexed region if we provides such DataLoaders.
         """
         raise NotImplementedError()
 
     def count_unique(self, region: _SimpleIndex) -> int:
         """
+        Count unique elements in the exact `region` range of data source.
+
         Used by Reducer.set_fullness()
         """
         raise NotImplementedError()
@@ -231,6 +238,7 @@ class DataLoaderBase:
         return clone
 
     def __getitem__(self, index: _SimpleIndex) -> 'DataLoaderBase':
+        # TODO certain DataLoader stack can be reduced and simplified
         return StridedDataLoader(self, index)
 
     def partially_load_by_chunk(self, chunk_size: int
@@ -939,7 +947,14 @@ class FulledTensorLoader(DataLoaderBase):
 
 
 class ArangeTensorLoader(DataLoaderBase):
-    def __init__(self, start: Num, end: Num, step: Num, dtype, device) -> None:
+    def __init__(
+        self,
+        start: Num,
+        end: Num,
+        step: Num,
+        dtype: torch.dtype,
+        device: Union[str, torch.device]
+    ):
         super().__init__()
 
         if step == 0:
@@ -947,14 +962,25 @@ class ArangeTensorLoader(DataLoaderBase):
         if math.isinf(start) or math.isinf(end):
             raise ValueError(f"range cannot be {start} to {end}")
 
-        # TODO torch.arange rejects (0, 10, -1) -- sign must be consistent
-        # -- but numpy allows and returns empty list.
+        # # TODO torch.arange rejects (0, 10, -1) -- sign must be consistent
+        # # -- but numpy allows and returns empty list.
+        # if not (
+        #     (step > 0 and end >= start) or (step < 0 and end <= start)
+        # ):
+        #     raise ValueError("inconsistent step sign")
+
+        if dtype.is_complex:
+            raise NotImplementedError("range cannot be complex")
 
         self._start = start
         self._end = end
         self._step = step
 
-        length = len(range(start, end, step))
+        # TODO both torch and numpy have very careful calculation for length,
+        # we need to reinforce this.
+        length = math.ceil((end - start) / step)
+        length = max(0, length)
+        
         self.shape = (length,)
         self.dtype = dtype
         self.device = torch.device(device)
@@ -966,14 +992,14 @@ class ArangeTensorLoader(DataLoaderBase):
             [self._start, self._end, self._step]
         )
 
-    def minmax(self) -> Tuple[Num, Num]:
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
         r = range(self._start, self._end, self._step)
         if self._step > 0:
             return r[0], r[-1]
         else:
             return r[-1], r[0]
 
-    def count_unique(self) -> int:
+    def count_unique(self, region: _SimpleIndex) -> int:
         return self.shape[0]
 
     def partially_load_by_chunk(

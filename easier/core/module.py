@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import math
 from typing import \
     Dict, List, Optional, Sequence, Tuple, Union, overload, TYPE_CHECKING
 from typing_extensions import TypeAlias, Self
@@ -244,26 +245,75 @@ def arange(*args, **kwargs):
 
 
 def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
+    for arg in [start, stop]:
+        if not isinstance(arg, (int, float)):
+            raise TypeError(
+                'argument to easier.linspace must be integer or floating-point'
+            )
+    if isinstance(num, int) or num <= 0:
+        raise TypeError(
+            'argument `num` to easier.linspace must be positive integer'
+        )
+
     if dtype is None:
         dtype = torch.float64
     
-    ArangeTensorLoader(start,1)
+    if not endpoint:
+        num += 1
+    step = (stop - start) / (num - 1)
+    arange_end = start + step * num
+    
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return ArangeTensorLoader(
+        start, arange_end, step, dtype=dtype, device=device
+    )
 
 
 class Mesh:
-    def __init__(self, data_loaders: Sequence[DataLoaderBase]):
-        self.nc: int
-        self.ne: int
+    def __init__(self, *dimensional_vertices: DataLoaderBase):
+        ndim = len(dimensional_vertices)
+        if ndim == 0:
+            raise ValueError("Must have at least one input data")
 
-        # size=len(dts), each for one dim.
-        self.src_p: List[DataLoaderBase]
-        self.dst_p: List[DataLoaderBase]
+        # number of vertices per dim
+        nvs: List[int] = []
+        # number of hypercubes per dim
+        ncs: List[int] = []
+        for dt in dimensional_vertices:
+            if isinstance(dt, (ArangeTensorLoader, FulledTensorLoader)):
+                # TODO support general DataLoader like H5 and InMemTensor.
+                raise NotImplementedError(
+                    "only support easier.arange/linspace/full/ones/zeros"
+                )
+
+            if len(dt.shape) != 1:
+                raise ValueError("Input data must be 1-d")
+            dim_nv = dt.shape[0]
+            if dim_nv == 0:
+                raise ValueError("Input data vector must not be empty")
+
+            nvs.append(dim_nv)
+            ncs.append(dim_nv - 1)
+        
+        self.nv: int = math.prod(nvs)
+
+        # each hypercube has 2*ND (ND-1)-d facets.
+        nfacets = math.prod(ncs) * 2 * ndim
+        nbfacets = 1  # 2 * \sum_i { \prod_{i!=j} ncs[j]  }
+        self.ne: int = nfacets - nbfacets
+
+        # shape=(ne, ND)
+        self.src: DataLoaderBase
+        self.dst: DataLoaderBase
 
         # flattened cartesian product of all arg dataloaders.
-        self.points: DataLoaderBase
+        # shape=(nv, ND)
+        self.vertices: DataLoaderBase
 
         # multidimension, each dimension has 2 parts:
-        # shape=(2_0, 2_1, ..., 2_{len(dts)-1})
+        # shape==(2, 2, ..., 2) and len(shape)==ND
         self.boundary: DataLoaderBase
 
 
