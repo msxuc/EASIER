@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import math
 from typing import \
     Dict, List, Optional, Sequence, Tuple, Union, overload, TYPE_CHECKING
 from typing_extensions import TypeAlias, Self
@@ -269,52 +268,6 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
     return ArangeTensorLoader(
         start, arange_end, step, dtype=dtype, device=device
     )
-
-
-class Mesh:
-    def __init__(self, *dimensional_vertices: DataLoaderBase):
-        ndim = len(dimensional_vertices)
-        if ndim == 0:
-            raise ValueError("Must have at least one input data")
-
-        # number of vertices per dim
-        nvs: List[int] = []
-        # number of hypercubes per dim
-        ncs: List[int] = []
-        for dt in dimensional_vertices:
-            if isinstance(dt, (ArangeTensorLoader, FulledTensorLoader)):
-                # TODO support general DataLoader like H5 and InMemTensor.
-                raise NotImplementedError(
-                    "only support easier.arange/linspace/full/ones/zeros"
-                )
-
-            if len(dt.shape) != 1:
-                raise ValueError("Input data must be 1-d")
-            dim_nv = dt.shape[0]
-            if dim_nv == 0:
-                raise ValueError("Input data vector must not be empty")
-
-            nvs.append(dim_nv)
-            ncs.append(dim_nv - 1)
-        
-        self.nv: int = math.prod(nvs)
-
-        # each hypercube has 2*ND (ND-1)-d facets.
-        nfacets = math.prod(ncs) * 2 * ndim
-        nbfacets = 1  # 2 * \sum_i { \prod_{i!=j} ncs[j]  }
-        self.ne: int = nfacets - nbfacets
-
-        # shape=(ne, ND)
-        self.src: DataLoaderBase
-        self.dst: DataLoaderBase
-
-        # flattened cartesian product of all arg dataloaders.
-        # shape=(nv, ND)
-        self.vertices: DataLoaderBase
-
-        # multidimension, each dimension has 2 parts:
-        # shape==(2, 2, ..., 2) and len(shape)==ND
-        self.boundary: DataLoaderBase
 
 
 def _resolve_data_loader(arg) -> DataLoaderBase:

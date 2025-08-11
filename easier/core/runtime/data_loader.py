@@ -2,11 +2,10 @@
 # Licensed under the MIT License.
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 import math
 import os
 from types import EllipsisType
-from typing import Iterator, List, Optional, Self, Tuple, TypeAlias, Union, cast
+from typing import Iterator, List, Optional, Tuple, TypeAlias, Union, cast
 import h5py
 import functools
 import copy
@@ -1123,3 +1122,130 @@ class FlattenDataLoader(DataLoaderBase):
         super().__init__()
 
         self.inner = inner
+
+
+class Mesh:
+    """
+    Define a regular N-d mesh whose vertices are the cartesian product of
+    N input arrays, the i-th input array has the shape of `(L_i,) + DIMS_i`
+    (If original `DIM_i` is empty then it's treated as `(1,)`).
+
+    The vertices of the mesh are organized in a flattened manner, the result
+    shape will be 2-d and be
+    `( L_0*...*L_{N-1} , prod(DIMS_1)+...+prod(DIMS_{N-1}) )`.
+
+    Remarks:
+    -   In case of each input array carries different vertex properties,
+        the subtensors for vertices are always flattened firstly
+        i.e. `prod(DIMS_i)`.
+    """
+    def __init__(
+        self,
+        *dimensional_vertices: DataLoaderBase,
+        device: Union[torch.device, str, None] = None
+    ):
+        if device is None:
+            # TODO like torch.set_default_device()
+            device = 'cpu'
+
+        ndim = len(dimensional_vertices)
+        if ndim == 0:
+            raise ValueError("Must have at least one input data")
+
+        # number of vertices per dim
+        nvs: List[int] = []
+        # number of hypercubes per dim
+        ncs: List[int] = []
+        for dt in dimensional_vertices:
+            if isinstance(dt, (ArangeTensorLoader, FulledTensorLoader)):
+                # TODO support general DataLoader like H5 and InMemTensor.
+                raise NotImplementedError(
+                    "only support easier.arange/linspace/full/ones/zeros"
+                )
+
+            if not len(dt.shape) >= 1:
+                raise ValueError("Input data must be at least 1-d")
+            dim_nv = dt.shape[0]
+            if dim_nv == 0:
+                raise ValueError("Input data must not be empty")
+
+            nvs.append(dim_nv)
+            ncs.append(dim_nv - 1)
+        
+        self.nv: int = math.prod(nvs)
+
+        # each hypercube has 2*ND (ND-1)-d faces.
+        nfaces = math.prod(ncs) * 2 * ndim
+        nbfaces = 1  # 2 * \sum_i { \prod_{i!=j} ncs[j]  }
+        self.ne: int = nfaces - nbfaces
+
+        # shape=(ne, ND)
+        self.src = MeshInteriorFaceIdxDataLoader(ncs, True, device)
+        self.dst = MeshInteriorFaceIdxDataLoader(ncs, False, device)
+
+        # flattened cartesian product of all arg dataloaders.
+        # shape=(nv, ND)
+        self.vertices = CartesianProductDataLoader(list(dimensional_vertices))
+    
+    def get_index(self, *idx: Union[int, slice, EllipsisType]) -> DataLoaderBase:
+        """
+        Since EASIER requires vertices in a mesh to be organized as 1-d list,
+        user can call `mesh.get_index(*IDX)` to get an index data for
+        EASIER program to reconstruct indexing in traditional N-d array for the
+        mesh, i.e.:
+        ```
+        mesh = esr.Mesh(d0, ..., d{N-1})
+        idx = mesh.get_index(idx_0, ..., idx_{N-1})
+        vdata = mesh.vertices[idx]
+        # equals to
+        ndarray = torch.cartesian_prod(d0, ..., d{N-1}).reshape(L0, ..., L{N-1}, -1)
+        vdata = ndarray[idx_0, ..., idx_{N-1}]
+        ```
+
+        For example, to calculate the distances between vertices along dim-2:
+        ```
+        def __init__(self):
+            self.mesh = esr.Mesh(d0, d1, d2)
+
+            end_vertices_idx = self.mesh.get_index(0, 0, 1:)  # for dim-2
+            start_vertices_idx = self.mesh.get_index(0, 0, :-1)
+
+            self.end_vertices_selector = Selector(end_vertices_idx)
+            self.start_vertices_selector = Selector(start_vertices_idx)
+
+        def forward(self):
+            dim2_distances = \
+                self.end_vertices_selector(self.mesh.vertices) \
+                - self.start_vertices_selector(self.mesh.vertices)
+        ```
+        """
+        pass
+
+
+class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
+    R"""
+    Given a N-d hypercube volume at (i_1, i_2, ..., i_N) in the regular mesh
+    whose i-d edge has L_i hypercubes (L_i + 1 vertices):
+    -   it has 2N faces, each face is a (N-1)-d hypercube.
+        e.g. 2d rect has 4 edges, 3d cube has 6 faces.
+    -   the total number of interior faces is
+        $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i} L_j } $
+    """
+    def __init__(
+        self,
+        dim_ncells: List[int],
+        flow_src: bool,
+        device: Union[torch.device, str] = 'cpu'
+    ):
+        super().__init__()
+        self.dtype = torch.int64
+        self.shape = 1
+        self.device = torch.device(device)
+
+        self.dim_ncells = dim_ncells
+
+        # A reference direction for flow direction on the volume
+        self.flow_src = flow_src
+    
+    def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
+        return super().fully_load(device, replicated)
