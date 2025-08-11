@@ -1218,6 +1218,16 @@ class Mesh:
                 self.end_vertices_selector(self.mesh.vertices) \
                 - self.start_vertices_selector(self.mesh.vertices)
         ```
+
+        TODO Looks a bit rigid that users must define so many idx/selector
+        fields. How about allowing directly indexing batch dim using
+        DataLoaders? If detected we can insert Selector for it (and can share
+        Selector instances).
+        TODO arguably Reducer won't be symmetrically benefited from syntactic
+        sugar like this, as Reducer is more configureable and there seems no
+        torch ops for Reducer as concise as getitem for Selector.
+        (torch.index_reduce_ seems to exactly match Reducer)
+
         """
         pass
 
