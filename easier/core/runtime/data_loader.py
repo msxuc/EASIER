@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import math
 import os
 from types import EllipsisType
@@ -1124,7 +1125,9 @@ class FlattenDataLoader(DataLoaderBase):
         self.inner = inner
 
 
-class Mesh:
+# Make Mesh a nn.Module so that EASIER can look through to get DataLoaders
+# that are Mesh's attributes.
+class Mesh(torch.nn.Module):
     """
     Define a regular N-d mesh whose vertices are the cartesian product of
     N input arrays, the i-th input array has the shape of `(L_i,) + DIMS_i`
@@ -1179,6 +1182,11 @@ class Mesh:
         nbfaces = 1  # 2 * \sum_i { \prod_{i!=j} ncs[j]  }
         self.ne: int = nfaces - nbfaces
 
+        # TODO
+        # We may assume hypercubes/cells are innermost flattened,
+        # to apply src/dst Selectors, we must ensure from vertices+get_index
+        # user could construct cell data in the exactly innermost order.
+
         # shape=(ne, ND)
         self.src = MeshInteriorFaceIdxDataLoader(ncs, True, device)
         self.dst = MeshInteriorFaceIdxDataLoader(ncs, False, device)
@@ -1192,13 +1200,15 @@ class Mesh:
         Since EASIER requires vertices in a mesh to be organized as 1-d list,
         user can call `mesh.get_index(*IDX)` to get an index data for
         EASIER program to reconstruct indexing in traditional N-d array for the
-        mesh, i.e.:
+        mesh/vertices, i.e.:
         ```
         mesh = esr.Mesh(d0, ..., d{N-1})
         idx = mesh.get_index(idx_0, ..., idx_{N-1})
         vdata = mesh.vertices[idx]
         # equals to
-        ndarray = torch.cartesian_prod(d0, ..., d{N-1}).reshape(L0, ..., L{N-1}, -1)
+        ndarray = torch.cartesian_prod(
+                d0, ..., d{N-1}
+            ).reshape(L0, ..., L{N-1}, -1)
         vdata = ndarray[idx_0, ..., idx_{N-1}]
         ```
 
@@ -1231,6 +1241,9 @@ class Mesh:
         """
         pass
 
+        # TODO can be composed as
+        # flatten( cartesian_product([ ... esr.arange(L_i) ... ])[*idx] )
+
 
 class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
     R"""
@@ -1239,7 +1252,9 @@ class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
     -   it has 2N faces, each face is a (N-1)-d hypercube.
         e.g. 2d rect has 4 edges, 3d cube has 6 faces.
     -   the total number of interior faces is
-        $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i} L_j } $
+        $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i}{ L_j } } $
+        or
+        $ 2 * \sum_i { (L_i - 1) * \prod_{j!=i}{ L_j } }$
     """
     def __init__(
         self,
@@ -1259,3 +1274,73 @@ class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
     
     def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
         return super().fully_load(device, replicated)
+    
+
+
+class CartesianProductConcatSymbolicDataLoaderBase(DataLoaderBase):
+    """
+    Each CP to concat is at most prod(L_i), but each may be subtracted with
+    some panels (making it a CP of one axis/set being smaller).
+
+    The result is flattened into 1-d, as concat (disjoint union) of many
+    cartesian products is generally not a cartesian product anymore.
+
+    for each original item, apply a symbolic expr `f` on it.
+    """
+    def __init__(self) -> None:
+        super().__init__()
+
+        concat_components: List[CartesianProductDataLoader] = []
+        self.concat_components = concat_components
+        # TODO assert ndim and kdim
+
+        # self.shape = ('sum', 'kk')
+
+
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        """
+        Get minimum and maximum value within the `region` range of data source.
+
+        TODO minmax() and count_unique() both accept *simple* index as range,
+        i.e. tensor-typed index is not allowed.
+        This indicates we may need to reimplement minmax()/count_unique() on a
+        very detailed, tensor-indexed region if we provides such DataLoaders.
+        """
+        raise NotImplementedError()
+
+    def count_unique(self, region: _SimpleIndex) -> int:
+        """
+        Count unique elements in the exact `region` range of data source.
+
+        Used by Reducer.set_fullness()
+        """
+        raise NotImplementedError()
+    
+
+
+    def partially_load_by_chunk(self, chunk_size: int
+                                ) -> Iterator[torch.Tensor]:
+        """
+        Only callable at rank-0.
+
+        Chuck size is only about the first dimension and item tensors in
+        the resultant sequence:
+        - always on CPU;
+        - may not have batch size that exactly equals chunk_size.
+        """
+        raise NotImplementedError()
+
+
+    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+        raise NotImplementedError()
+
+
+    def partially_load_by_index(self, index: torch.Tensor, **kwargs
+                                ) -> torch.Tensor:
+
+        raise NotImplementedError()
+    
+
+    def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
+        return super().fully_load(device, replicated)
+    
