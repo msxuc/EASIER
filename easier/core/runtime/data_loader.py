@@ -1144,20 +1144,106 @@ class FlattenDataLoader(DataLoaderBase):
         return f'{self.__class__.__name__}' \
             f'(inner={repr(self.inner)}, ndims={self.ndims})'
 
+
+def _get_overlapped_slice(region: slice, s: slice) -> slice:
+    """
+    Start/stop of both input slices must be converted to non-negative ints.
+
+    The result will have the same step sign as `s`, i.e. the direction in
+    `region` is ignored.
+    """
+    raise NotImplementedError()
+
+
 class ConcatDataLoader(DataLoaderBase):
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
-        dim: int
+        # TODO allow nonzero dims
     ):
         super().__init__()
 
-        if dim != 0:
-            raise NotImplementedError("can only concat alogn dim-0 now")
+        if 1 != len(
+            set((d.shape[1:], d.dtype, d.device) for d in components)
+        ):
+            raise ValueError(
+                "Inputs to concat must have the same shape[1:]/dtype/device"
+            )
 
-        # TODO check shapes are same and dim is valid
         self.components = list(components)
-        self.dim = dim
+        self._lengths = list(d.shape[0] for d in components)
+
+        self.shape = (sum(self._lengths),) + components[0].shape[1:]
+        self.dtype = components[0].dtype
+        self.device = components[0].device
+
+    def collective_init(self) -> None:
+        self.coll_check_dtype_shape_devicetype()
+        check_collective_equality(
+            'components batch sizes', self._lengths
+        )
+        # TODO check the equality of the whole hierarchy?
+    
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        if not isinstance(region, tuple):
+            region = (region,)
+
+        bs_idx = region[0]
+        other_idxess = region[1:]
+
+        amin = math.inf
+        amax = -math.inf
+
+        _offset = 0
+        for i, comp in enumerate(self.components):
+            comp_start = _offset
+            comp_end = _offset + comp.shape[0]
+
+            if isinstance(bs_idx, int):
+                if comp_start <= bs_idx and bs_idx < comp_end:
+                    comp_bs_idx = bs_idx - comp_start
+                    return comp.minmax((comp_bs_idx,) + other_idxess)
+
+            if isinstance(bs_idx, slice):
+                bs_idx = slice(*bs_idx.indices(self.shape[0]))
+                overlap = _get_overlapped_slice(slice(comp_start, comp_end), bs_idx)
+                if overlap.start != overlap.stop:
+                    comp_s = slice(
+                        overlap.start - comp_start,
+                        overlap.stop - comp_end,
+                        overlap.step
+                    )
+                    comp_min, comp_max = comp.minmax((comp_s,) + other_idxess)
+                    amin = min(comp_min, amin)
+                    amax = min(comp_max, amax)
+
+            elif bs_idx is Ellipsis:
+                comp_min, comp_max = comp.minmax((Ellipsis,) + other_idxess)
+                amin = min(comp_min, amin)
+                amax = min(comp_max, amax)
+
+            else:
+                assert False, f'unexpected dim-0 index {bs_idx}'
+
+            _offset = comp_end
+
+        return amin, amax
+    
+    def count_unique(self, region: _SimpleIndex) -> int:
+        _, c = self.partially_load_by_range(region).unique(return_counts=True)
+        return c
+    
+    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+        region = self._rev_compose_index_range(region)
+        return self.inner.partially_load_by_range(region)
+    
+    def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
+        index = self._rev_compose_index_tensor(index)
+        return self.inner.partially_load_by_index(index, **kwargs)
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(tensor={self.tensor})'
+
+
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}' \
             f'(components={repr(self.components)}, dim={self.dim})'
