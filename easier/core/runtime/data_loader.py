@@ -108,6 +108,11 @@ P.S. DataLoaders themselves and the AOT passes that use torch vectorized
 operators (which opened a space for CUDA acceleration) are already similar
 approaches, but using different symbol sets from easier.runtime.data_loader
 or of torch operators.
+
+NOTE A critical point is that when materializing data from the
+symbolic representation, we do not want the symbolic engine to generate items
+one-by-one and on CPU side. Possible directions for data preparation:
+convert sym.rep. to torch vectorized ops, or e.g. sympy+cupy.
 """
 
 
@@ -1103,32 +1108,41 @@ class StridedDataLoader(DataLoaderBase):
     def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
         index = self._rev_compose_index_tensor(index)
         return self.inner.partially_load_by_index(index, **kwargs)
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(tensor={self.tensor})'
 
 
 class CartesianProductDataLoader(DataLoaderBase):
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
-        # 'concat/stack' only allowed if all k-dims are of the same shape.
-        # TODO needs concat? If concat, along with dim of the k-dims?
-        combination: Literal['flatten', 'concat', 'stack'] = 'flatten'
+        form: Literal['flatten', 'stack'] = 'flatten'
     ):
         super().__init__()
 
         self.components = list(components)
-        self.combination = combination
+        self.form = form
     
     def collective_init(self) -> None:
         pass
 
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(tensor={self.tensor})'
+
 
 class FlattenDataLoader(DataLoaderBase):
     """
-    Flatten n-dim DataLoader to 1-d, in an innermost-major manner.
+    Flatten (n+k)-dim DataLoader to (1+k)-d, in an innermost-major manner.
+    TODO more general solution: Reshape.
     """
-    def __init__(self, inner: DataLoaderBase):
+    def __init__(self, inner: DataLoaderBase, ndims: int):
         super().__init__()
         self.inner = inner
+        self.ndims = ndims  # first `ndims` dims are flattened
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}' \
+            f'(inner={repr(self.inner)}, ndims={self.ndims})'
 
 class ConcatDataLoader(DataLoaderBase):
     def __init__(
@@ -1137,9 +1151,16 @@ class ConcatDataLoader(DataLoaderBase):
         dim: int
     ):
         super().__init__()
+
+        if dim != 0:
+            raise NotImplementedError("can only concat alogn dim-0 now")
+
         # TODO check shapes are same and dim is valid
         self.components = list(components)
         self.dim = dim
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}' \
+            f'(components={repr(self.components)}, dim={self.dim})'
 
 # Make Mesh a nn.Module so that EASIER can look through to get DataLoaders
 # that are Mesh's attributes.
@@ -1149,10 +1170,24 @@ class Mesh(torch.nn.Module):
     N input arrays, the i-th input array has the shape of `(L_i,) + DIMS_i`
     (If original `DIM_i` is empty then it's treated as `(1,)`).
 
-    The vertices of the mesh are organized in a flattened manner, the result
-    shape will be 2-d and be
-    `( L_0*...*L_{N-1} , prod(DIMS_1)+...+prod(DIMS_{N-1}) )`.
-    # TODO propagate 'combination' arg of CartesianProdDL.
+    The resultant shape will be like `( L_0*...*L_{N-1} ,) + DIMS`,
+    and `DIMS` is a tuple and its content depends on `form`.
+
+    Args:
+    -   form ('flatten' or 'stack):
+        -   'flatten': the default option.
+            Subtensors for vertices in each dimensions are first
+            flattened to 1-d then concat-ed.
+    
+            Aforementioned resultant `DIMS` will be
+            `( prod(DIMS_1)+...+prod(DIMS_{N-1}), )`.
+
+            This is the only possible organization if input arrays are not
+            all homogeneous, and is the default option.
+
+        -   'stack': only allowed if all DIMS_i are the same.
+            Aforementioned resultant `DIMS` will be
+            `(N,) + DIMS_0`.
 
     Remarks:
     -   In case of each input array carries different vertex properties,
@@ -1162,6 +1197,7 @@ class Mesh(torch.nn.Module):
     def __init__(
         self,
         *dimensional_vertices: DataLoaderBase,
+        form: Literal['flatten', 'stack'] = 'flatten',
         device: Union[torch.device, str, None] = None
     ):
         if device is None:
@@ -1192,11 +1228,23 @@ class Mesh(torch.nn.Module):
             nvs.append(dim_nv)
             ncs.append(dim_nv - 1)
         
+        self._nvs = nvs
+        self._ncs = ncs
+
         self.nv: int = math.prod(nvs)
 
-        # each hypercube has 2*ND (ND-1)-d faces.
+        """
+        Given a N-d hypercube volume at (i_1, i_2, ..., i_N) in the mesh
+        whose i-d edge has L_i hypercubes (L_i + 1 vertices):
+        -   it has 2N faces, each face is a (N-1)-d hypercube.
+            e.g. 2d rect has 4 edges, 3d cube has 6 faces.
+        -   the total number of interior faces is
+            $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i}{ L_j } } $
+            or
+            $ 2 * \sum_i { (L_i - 1) * \prod_{j!=i}{ L_j } }$
+        """
         nfaces = math.prod(ncs) * 2 * ndim
-        nbfaces = 1  # 2 * \sum_i { \prod_{i!=j} ncs[j]  }
+        nbfaces = sum(math.prod(ncs[:i] + ncs[(i+1):]) for i in range(ndim))
         self.ne: int = nfaces - nbfaces
 
         # TODO
@@ -1224,17 +1272,21 @@ class Mesh(torch.nn.Module):
         # shape=(ne, ND)
         self.src = ConcatDataLoader(srcs, dim=0)
         self.dst = ConcatDataLoader(dsts, dim=0)
+        assert self.src.shape == (self.ne,)
+        assert self.dst.shape == (self.ne,)
 
         # flattened cartesian product of all arg dataloaders.
         # shape=(nv, ND)
-        self.vertices = CartesianProductDataLoader(dimensional_vertices)
+        vertices = CartesianProductDataLoader(dimensional_vertices, form)
+        vertices = FlattenDataLoader(vertices, ndims=ndim)
+        self.vertices = vertices
     
-    def get_index(self, *idx: Union[int, slice, EllipsisType]) -> DataLoaderBase:
+    def get_index(self, *indices: Union[int, slice, EllipsisType]) -> DataLoaderBase:
         """
         Since EASIER requires vertices in a mesh to be organized as 1-d list,
         user can call `mesh.get_index(*IDX)` to get an index data for
-        EASIER program to reconstruct indexing in traditional N-d array for the
-        mesh/vertices, i.e.:
+        EASIER program to reconstruct indexing using coordinates in
+        traditional N-d array for the mesh/vertices, i.e.:
         ```
         mesh = esr.Mesh(d0, ..., d{N-1})
         idx = mesh.get_index(idx_0, ..., idx_{N-1})
@@ -1263,6 +1315,10 @@ class Mesh(torch.nn.Module):
                 - self.start_vertices_selector(self.mesh.vertices)
         ```
 
+        Remarkably, the dimensions for vertex data in all source lists
+        are not supported by this method. Users have to manually index on those
+        dimensions in addition to the index of vertex coordinates.
+
         TODO Looks a bit rigid that users must define so many idx/selector
         fields. How about allowing directly indexing batch dim using
         DataLoaders? If detected we can insert Selector for it (and can share
@@ -1273,7 +1329,17 @@ class Mesh(torch.nn.Module):
         (torch.index_reduce_ seems to exactly match Reducer)
 
         """
-        pass
+        if not (len(indices) <= len(self._nvs)):
+            raise ValueError(
+                "Indices must not be more than dimensions of vertices"
+            )
+
+        for idx in indices:
+            if not (isinstance(idx, (int, slice)) or idx is Ellipsis):
+                # TODO None -- which unsqueezes dimensions -- is not supported.
+                raise TypeError("Index must be int, slice or Ellipsis")
+
+        1
 
         # TODO can be composed as
         # flatten( cartesian_product([ ... esr.arange(L_i) ... ])[*idx] )
@@ -1317,7 +1383,7 @@ class MeshOneDimInteriorFaceIdxDataLoader(DataLoaderBase):
     ):
         super().__init__()
 
-        assert interior_facets.combination == 'flatten'
+        assert interior_facets.form == 'flatten'
 
         self.ndim = len(self.interior_facets.components)
         assert len(interior_facets.shape) == self.ndim + 1
