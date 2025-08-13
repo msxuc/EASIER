@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 import os
 from types import EllipsisType
-from typing import Iterator, List, Optional, Tuple, TypeAlias, Union, cast
+from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast
 import h5py
 import functools
 import copy
@@ -1106,10 +1106,17 @@ class StridedDataLoader(DataLoaderBase):
 
 
 class CartesianProductDataLoader(DataLoaderBase):
-    def __init__(self, components: List[DataLoaderBase]):
+    def __init__(
+        self,
+        components: Sequence[DataLoaderBase],
+        # 'concat/stack' only allowed if all k-dims are of the same shape.
+        # TODO needs concat? If concat, along with dim of the k-dims?
+        combination: Literal['flatten', 'concat', 'stack'] = 'flatten'
+    ):
         super().__init__()
 
-        self.components = components
+        self.components = list(components)
+        self.combination = combination
     
     def collective_init(self) -> None:
         pass
@@ -1121,9 +1128,18 @@ class FlattenDataLoader(DataLoaderBase):
     """
     def __init__(self, inner: DataLoaderBase):
         super().__init__()
-
         self.inner = inner
 
+class ConcatDataLoader(DataLoaderBase):
+    def __init__(
+        self,
+        components: Sequence[DataLoaderBase],
+        dim: int
+    ):
+        super().__init__()
+        # TODO check shapes are same and dim is valid
+        self.components = list(components)
+        self.dim = dim
 
 # Make Mesh a nn.Module so that EASIER can look through to get DataLoaders
 # that are Mesh's attributes.
@@ -1136,6 +1152,7 @@ class Mesh(torch.nn.Module):
     The vertices of the mesh are organized in a flattened manner, the result
     shape will be 2-d and be
     `( L_0*...*L_{N-1} , prod(DIMS_1)+...+prod(DIMS_{N-1}) )`.
+    # TODO propagate 'combination' arg of CartesianProdDL.
 
     Remarks:
     -   In case of each input array carries different vertex properties,
@@ -1187,13 +1204,30 @@ class Mesh(torch.nn.Module):
         # to apply src/dst Selectors, we must ensure from vertices+get_index
         # user could construct cell data in the exactly innermost order.
 
+        srcs = []
+        dsts = []
+        for i in range(ndim):
+            interior_facets = CartesianProductDataLoader([
+                ArangeTensorLoader(0, ncs[j], 1, torch.int64, device)
+                if i != j else
+                ArangeTensorLoader(0, ncs[i] - 1, 1, torch.int64, device)
+                for j in range(ndim)
+            ])
+            # TODO insert Flatten to decoupling flattened indexing?
+            srcs.append(
+                MeshOneDimInteriorFaceIdxDataLoader(i, interior_facets, True)
+            )
+            dsts.append(
+                MeshOneDimInteriorFaceIdxDataLoader(i, interior_facets, False)
+            )
+        
         # shape=(ne, ND)
-        self.src = MeshInteriorFaceIdxDataLoader(ncs, True, device)
-        self.dst = MeshInteriorFaceIdxDataLoader(ncs, False, device)
+        self.src = ConcatDataLoader(srcs, dim=0)
+        self.dst = ConcatDataLoader(dsts, dim=0)
 
         # flattened cartesian product of all arg dataloaders.
         # shape=(nv, ND)
-        self.vertices = CartesianProductDataLoader(list(dimensional_vertices))
+        self.vertices = CartesianProductDataLoader(dimensional_vertices)
     
     def get_index(self, *idx: Union[int, slice, EllipsisType]) -> DataLoaderBase:
         """
@@ -1244,8 +1278,19 @@ class Mesh(torch.nn.Module):
         # TODO can be composed as
         # flatten( cartesian_product([ ... esr.arange(L_i) ... ])[*idx] )
 
+def _get_strides(shape: Tuple[int, ...]):
+    """
+    Innermost-major strides.
+    P.S. use Tensor.tolist() to get a List[int] of strides.
+    """
+    r_shp = torch.tensor(shape + (1,), dtype=torch.int64).flip(dims=[0])
+    r_strides = torch.cumprod(r_shp, dim=0)
+    strides = r_strides[:-1].flip(dims=[0])
+    return strides
 
-class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
+
+
+class MeshOneDimInteriorFaceIdxDataLoader(DataLoaderBase):
     R"""
     Given a N-d hypercube volume at (i_1, i_2, ..., i_N) in the regular mesh
     whose i-d edge has L_i hypercubes (L_i + 1 vertices):
@@ -1255,92 +1300,57 @@ class MeshInteriorFaceIdxDataLoader(DataLoaderBase):
         $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i}{ L_j } } $
         or
         $ 2 * \sum_i { (L_i - 1) * \prod_{j!=i}{ L_j } }$
+    
+    TODO this is basically a "mapped" DataLoader. A mapped DataLoader may
+    either elementwise on all Tensor items or treat it as batch dim + k-dims.
+    Then we can simply apply a chain of torch ops on load methods.
     """
     def __init__(
         self,
-        dim_ncells: List[int],
-        flow_src: bool,
+        # Along which dim are we traversing the faces
+        dim: int,
+        # A facet is where two interior faces contact
+        interior_facets: CartesianProductDataLoader,
+        # A reference flag for which one of the two faces
+        direction: bool,
         device: Union[torch.device, str] = 'cpu'
     ):
         super().__init__()
+
+        assert interior_facets.combination == 'flatten'
+
+        self.ndim = len(self.interior_facets.components)
+        assert len(interior_facets.shape) == self.ndim + 1
+        assert interior_facets.shape[self.ndim] == self.ndim
+
+        self.interior_facets = interior_facets
+
         self.dtype = torch.int64
-        self.shape = 1
+        self.shape = (math.prod(interior_facets.shape),)
         self.device = torch.device(device)
 
-        self.dim_ncells = dim_ncells
+        self.dim = dim
+        self.dimlen = interior_facets.shape[dim]  # L_i - 1
 
-        # A reference direction for flow direction on the volume
-        self.flow_src = flow_src
+        # A reference direction along/against the dimension.
+        self.direction = direction
     
     def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
-        return super().fully_load(device, replicated)
-    
+        # (L_0*...*L_{N-1}, N) -- the last N is for coordinates.
+        facets = self.interior_facets.fully_load(device, replicated).reshape(-1, self.ndim)
 
+        # upstream/downstream cube IDs around the facet
+        strides = _get_strides(facets.shape)  # == (N, 1)
 
-class CartesianProductConcatSymbolicDataLoaderBase(DataLoaderBase):
-    """
-    Each CP to concat is at most prod(L_i), but each may be subtracted with
-    some panels (making it a CP of one axis/set being smaller).
+        up_cubes = (facets * strides).sum()
 
-    The result is flattened into 1-d, as concat (disjoint union) of many
-    cartesian products is generally not a cartesian product anymore.
+        down_cube_coords = facets.clone()
+        down_cube_coords[:, self.dim] += 1
+        down_cubes = (down_cube_coords * strides).sum()
 
-    for each original item, apply a symbolic expr `f` on it.
-    """
-    def __init__(self) -> None:
-        super().__init__()
+        # TODO interleaving? Which kind is easier for other load methods?
+        if self.direction:
+            return torch.concat([up_cubes, down_cubes])
+        else:
+            return torch.concat([down_cubes, up_cubes])
 
-        concat_components: List[CartesianProductDataLoader] = []
-        self.concat_components = concat_components
-        # TODO assert ndim and kdim
-
-        # self.shape = ('sum', 'kk')
-
-
-    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
-        """
-        Get minimum and maximum value within the `region` range of data source.
-
-        TODO minmax() and count_unique() both accept *simple* index as range,
-        i.e. tensor-typed index is not allowed.
-        This indicates we may need to reimplement minmax()/count_unique() on a
-        very detailed, tensor-indexed region if we provides such DataLoaders.
-        """
-        raise NotImplementedError()
-
-    def count_unique(self, region: _SimpleIndex) -> int:
-        """
-        Count unique elements in the exact `region` range of data source.
-
-        Used by Reducer.set_fullness()
-        """
-        raise NotImplementedError()
-    
-
-
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        """
-        Only callable at rank-0.
-
-        Chuck size is only about the first dimension and item tensors in
-        the resultant sequence:
-        - always on CPU;
-        - may not have batch size that exactly equals chunk_size.
-        """
-        raise NotImplementedError()
-
-
-    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
-        raise NotImplementedError()
-
-
-    def partially_load_by_index(self, index: torch.Tensor, **kwargs
-                                ) -> torch.Tensor:
-
-        raise NotImplementedError()
-    
-
-    def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
-        return super().fully_load(device, replicated)
-    
