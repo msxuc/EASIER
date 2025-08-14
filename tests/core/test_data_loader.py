@@ -48,7 +48,7 @@ def worker__test_load_by_rank(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    tensor, start, end = dl.partially_load_by_rank()
+    tensor, start, end = dl.partially_load_by_rank_REMOVE_THIS()
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
@@ -198,7 +198,7 @@ def worker__test_load_full_by_rank(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17, 2)
 
-    tensor, start, end = dl.partially_load_by_rank()
+    tensor, start, end = dl.partially_load_by_rank_REMOVE_THIS()
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU
@@ -273,7 +273,7 @@ def worker__test_load_arange_by_rank(local_rank: int, world_size: int,
     assert dl.device.type == device_type
     assert dl.shape == (17,)
 
-    tensor, start, end = dl.partially_load_by_rank()
+    tensor, start, end = dl.partially_load_by_rank_REMOVE_THIS()
 
     assert tensor.dtype == dtype
     assert tensor.device.type == 'cpu'  # by rank always CPU

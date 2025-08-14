@@ -12,6 +12,7 @@ import functools
 import copy
 
 import numpy as np
+import sympy
 import torch
 
 from easier.core.runtime.dist_env import \
@@ -65,6 +66,10 @@ def _wrap_function(pre_hook, post_hook, func):
 # caller to wrap multiple arugments in a tuple (only tuple, not list).
 # Given a value of such a Union type, we can directly pass it into
 # Tensor.__getitem__ etc. without extra unpacking like `*args`.
+#
+# NOTE In internal subprocedures, when _SimpleIndex is declared, all slice
+# objects in it should not have negative start/stop values, i.e. must be
+# zero-based. (step can still be negative)
 _SimpleIndex: TypeAlias = Union[
     int, slice, EllipsisType, None,
     Tuple['_SimpleIndex', ...]
@@ -113,6 +118,30 @@ NOTE A critical point is that when materializing data from the
 symbolic representation, we do not want the symbolic engine to generate items
 one-by-one and on CPU side. Possible directions for data preparation:
 convert sym.rep. to torch vectorized ops, or e.g. sympy+cupy.
+"""
+
+
+"""
+A quick template for derived DataLoader classes.
+```
+class DerivedDataLoader(DataLoaderBase):
+    def collective_init(self) -> None:
+        raise NotImplementedError()
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        raise NotImplementedError()
+    def count_unique(self, region: _SimpleIndex) -> int:
+        raise NotImplementedError()
+    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+        raise NotImplementedError()
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+    def fully_load(
+        self, device: Union[torch.device, str], replicated=False
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+    def __repr__(self) -> str:
+        raise NotImplementedError()
+```
 """
 
 
@@ -246,35 +275,8 @@ class DataLoaderBase:
         # TODO certain DataLoader stack can be reduced and simplified
         return StridedDataLoader(self, index)
 
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        """
-        Only callable at rank-0.
 
-        Chuck size is only about the first dimension and item tensors in
-        the resultant sequence:
-        - always on CPU;
-        - may not have batch size that exactly equals chunk_size.
-        """
-        raise NotImplementedError()
-
-    def _pre_partially_load_by_chunk(self, chunk_size):
-        dist_env = get_runtime_dist_env()
-        assert dist_env.rank == 0, \
-            "Loading-by-chunk is only available on rank-0"
-
-    def _post_partially_load_by_chunk(
-        self, res: Iterator[torch.Tensor], chunk_size
-    ) -> Iterator[torch.Tensor]:
-        def _check_item(chunk):
-            assert chunk.device.type == 'cpu'
-            return chunk
-
-        # `map()` make a new iterator, the `_check_item` is run when the
-        # iterator get actually iterated.
-        return map(_check_item, res)
-
-    def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         """
         Collectively load an evenly distributed part of the target dataset
         for each rank.
@@ -284,12 +286,14 @@ class DataLoaderBase:
         - int: the beginning offset of the part (inclusive)
         - int: the end offset of the part (exclusive)
         """
-        raise NotImplementedError()
+        dist_env = get_default_dist_env()
+        begin, end = _get_offset_exactly_nparts(
+            self.shape[0], dist_env.world_size, dist_env.rank
+        )
+        ndim = len(self.shape)
+        rank_region = (slice(begin, end),) + (Ellipsis,) * (ndim - 1)
+        return self.partially_load_by_range(rank_region), begin, end
     
-    def _post_partially_load_by_rank(self, res):
-        (tensor, begin, end) = res
-        assert tensor.device.type == 'cpu'
-        return res
 
     def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
         raise NotImplementedError()
@@ -491,7 +495,7 @@ class InMemoryTensorLoader(DataLoaderBase):
             chunk = self.tensor[start:end].clone()
             yield chunk
 
-    def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         dist_env = get_runtime_dist_env()
         world_size = dist_env.world_size
         rank = dist_env.rank
@@ -707,7 +711,7 @@ class H5DataLoader(DataLoaderBase):
                 chunk: torch.Tensor = torch.from_numpy(chunk_np)
                 yield chunk
 
-    def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
 
@@ -919,7 +923,7 @@ class FulledTensorLoader(DataLoaderBase):
             chunk = self._full(end - start, 'cpu')
             yield chunk
 
-    def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
@@ -998,7 +1002,7 @@ class ArangeTensorLoader(DataLoaderBase):
         )
 
     def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
-        r = range(self._start, self._end, self._step)
+        r = range(self._start, self._end, self._step)  # type: ignore
         if self._step > 0:
             return r[0], r[-1]
         else:
@@ -1029,7 +1033,7 @@ class ArangeTensorLoader(DataLoaderBase):
                                  dtype=self.dtype, device='cpu')
             yield chunk
 
-    def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
@@ -1075,6 +1079,31 @@ class ArangeTensorLoader(DataLoaderBase):
         ])
 
 
+def _get_overlapped_range(region: slice, selection: slice) -> slice:
+    """
+    Start/stop of both input slices must be converted to non-negative ints.
+
+    The result will have the same step sign as `selection`,
+    i.e. the direction in `region` is ignored.
+    """
+    assert all(v >= 0 for v in [
+        region.start, region.stop, selection.start, selection.stop
+    ])
+    r_region = sympy.Range(region.start, region.stop, region.step)
+    r_s = sympy.Range(selection.start, selection.stop, selection.step)
+    r_overlap = cast(sympy.Range, r_region.intersect(r_s))
+
+    if len(r_overlap) == 0:
+        assert isinstance(r_overlap, sympy.EmptySet)
+        return slice(0, 0)
+
+    # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
+    # so we need to reverse it if s.step < 0
+    if selection.step < 0:
+        r_overlap = r_overlap.reversed
+    
+    return slice(r_overlap.start, r_overlap.stop, r_overlap.step)
+
 class StridedDataLoader(DataLoaderBase):
     def __init__(self, inner: DataLoaderBase, index: _SimpleIndex):
         super().__init__()
@@ -1113,6 +1142,9 @@ class StridedDataLoader(DataLoaderBase):
 
 
 class CartesianProductDataLoader(DataLoaderBase):
+    """
+    Result is 1-d.
+    """
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
@@ -1130,29 +1162,7 @@ class CartesianProductDataLoader(DataLoaderBase):
         return f'{self.__class__.__name__}(tensor={self.tensor})'
 
 
-class FlattenDataLoader(DataLoaderBase):
-    """
-    Flatten (n+k)-dim DataLoader to (1+k)-d, in an innermost-major manner.
-    TODO more general solution: Reshape.
-    """
-    def __init__(self, inner: DataLoaderBase, ndims: int):
-        super().__init__()
-        self.inner = inner
-        self.ndims = ndims  # first `ndims` dims are flattened
-
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}' \
-            f'(inner={repr(self.inner)}, ndims={self.ndims})'
-
-
-def _get_overlapped_slice(region: slice, s: slice) -> slice:
-    """
-    Start/stop of both input slices must be converted to non-negative ints.
-
-    The result will have the same step sign as `s`, i.e. the direction in
-    `region` is ignored.
-    """
-    raise NotImplementedError()
+    
 
 
 class ConcatDataLoader(DataLoaderBase):
@@ -1184,69 +1194,98 @@ class ConcatDataLoader(DataLoaderBase):
         )
         # TODO check the equality of the whole hierarchy?
     
-    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+    def _foreach_in_region(self, region, fn):
+        # fn: (DataLoaderBase, _SimpleIndex) -> None
+        # NOTE if region[0] is slice-with-negative-step, foreach in reversed.
+
         if not isinstance(region, tuple):
             region = (region,)
 
-        bs_idx = region[0]
-        other_idxess = region[1:]
+        batch_idx = region[0]
+        other_idxes = region[1:]
 
-        amin = math.inf
-        amax = -math.inf
+        _components = self.components
+        if isinstance(batch_idx, slice):
+            if batch_idx.step < 0:
+                _components = reversed(self.components)
 
         _offset = 0
-        for i, comp in enumerate(self.components):
+        for comp in _components:
             comp_start = _offset
             comp_end = _offset + comp.shape[0]
 
-            if isinstance(bs_idx, int):
-                if comp_start <= bs_idx and bs_idx < comp_end:
-                    comp_bs_idx = bs_idx - comp_start
-                    return comp.minmax((comp_bs_idx,) + other_idxess)
+            if isinstance(batch_idx, int):
+                if comp_start <= batch_idx and batch_idx < comp_end:
+                    comp_bs_idx = batch_idx - comp_start
+                    fn(comp, (comp_bs_idx,) + other_idxes)
+                    return
 
-            if isinstance(bs_idx, slice):
-                bs_idx = slice(*bs_idx.indices(self.shape[0]))
-                overlap = _get_overlapped_slice(slice(comp_start, comp_end), bs_idx)
+            if isinstance(batch_idx, slice):
+                overlap = _get_overlapped_range(
+                    slice(comp_start, comp_end), batch_idx
+                )
                 if overlap.start != overlap.stop:
-                    comp_s = slice(
+                    comp_batch = slice(
                         overlap.start - comp_start,
                         overlap.stop - comp_end,
                         overlap.step
                     )
-                    comp_min, comp_max = comp.minmax((comp_s,) + other_idxess)
-                    amin = min(comp_min, amin)
-                    amax = min(comp_max, amax)
+                    fn(comp, (comp_batch,) + other_idxes)
 
-            elif bs_idx is Ellipsis:
-                comp_min, comp_max = comp.minmax((Ellipsis,) + other_idxess)
-                amin = min(comp_min, amin)
-                amax = min(comp_max, amax)
+            elif batch_idx is Ellipsis:
+                fn(comp, (Ellipsis,) + other_idxes)
 
             else:
-                assert False, f'unexpected dim-0 index {bs_idx}'
+                assert False, f'unexpected dim-0 index {batch_idx}'
 
             _offset = comp_end
 
-        return amin, amax
+    
+    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+        aminmax = [math.inf, -math.inf]
+        def _minmax(comp: DataLoaderBase, comp_region: _SimpleIndex):
+            comp_minmax = comp.minmax(comp_region)
+            aminmax[0] = min(comp_minmax[0], aminmax[0])
+            aminmax[1] = max(comp_minmax[1], aminmax[1])
+        self._foreach_in_region(region, _minmax)
+        return tuple(aminmax)  # type: ignore
+
     
     def count_unique(self, region: _SimpleIndex) -> int:
         _, c = self.partially_load_by_range(region).unique(return_counts=True)
         return c
     
     def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
-        region = self._rev_compose_index_range(region)
-        return self.inner.partially_load_by_range(region)
+        parts = []
+        def _load_comp(comp: DataLoaderBase, comp_region: _SimpleIndex):
+            parts.append(comp.partially_load_by_range(comp_region))
+        self._foreach_in_region(region, _load_comp)
+        # If region[0].step < 0, parts will be in reversed order
+        return torch.concat(parts, dim=0)
     
     def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
-        index = self._rev_compose_index_tensor(index)
-        return self.inner.partially_load_by_index(index, **kwargs)
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}(tensor={self.tensor})'
+        ret = torch.empty(
+            (index.shape[0],) + self.shape[1:], dtype=self.dtype, device='cpu'
+        )
 
+        _offset = 0
+        for i, comp in enumerate(self.components):
+            comp_start = _offset
+            comp_end = _offset + comp.shape[0]
+
+            mask = torch.logical_and(comp_start <= index, index < comp_end)
+            comp_index = index[mask] - comp_start
+            comp_slice = comp.partially_load_by_index(comp_index)
+
+            ret[mask] = comp_slice
+
+            _offset = comp_end
+        
+        return ret
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}' \
-            f'(components={repr(self.components)}, dim={self.dim})'
+            f'(components={repr(self.components)})'
 
 # Make Mesh a nn.Module so that EASIER can look through to get DataLoaders
 # that are Mesh's attributes.
@@ -1289,6 +1328,7 @@ class Mesh(torch.nn.Module):
         if device is None:
             # TODO like torch.set_default_device()
             device = 'cpu'
+        self.device = torch.device(device)
 
         ndim = len(dimensional_vertices)
         if ndim == 0:
@@ -1356,15 +1396,14 @@ class Mesh(torch.nn.Module):
             )
         
         # shape=(ne, ND)
-        self.src = ConcatDataLoader(srcs, dim=0)
-        self.dst = ConcatDataLoader(dsts, dim=0)
+        self.src = ConcatDataLoader(srcs)
+        self.dst = ConcatDataLoader(dsts)
         assert self.src.shape == (self.ne,)
         assert self.dst.shape == (self.ne,)
 
         # flattened cartesian product of all arg dataloaders.
         # shape=(nv, ND)
         vertices = CartesianProductDataLoader(dimensional_vertices, form)
-        vertices = FlattenDataLoader(vertices, ndims=ndim)
         self.vertices = vertices
     
     def get_index(self, *indices: Union[int, slice, EllipsisType]) -> DataLoaderBase:
@@ -1380,7 +1419,7 @@ class Mesh(torch.nn.Module):
         # equals to
         ndarray = torch.cartesian_prod(
                 d0, ..., d{N-1}
-            ).reshape(L0, ..., L{N-1}, -1)
+            ).reshape(L0, ..., L{N-1}, -1)  # L{i} = d{i}.shape[0]
         vdata = ndarray[idx_0, ..., idx_{N-1}]
         ```
 
@@ -1425,10 +1464,14 @@ class Mesh(torch.nn.Module):
                 # TODO None -- which unsqueezes dimensions -- is not supported.
                 raise TypeError("Index must be int, slice or Ellipsis")
 
-        1
-
-        # TODO can be composed as
-        # flatten( cartesian_product([ ... esr.arange(L_i) ... ])[*idx] )
+        idx_dls: List[DataLoaderBase] = []
+        for dim, nv in enumerate(self._nvs):
+            idx_dl = ArangeTensorLoader(0, nv, 1, dtype=torch.int64, device=self.device)
+            if dim < len(indices):
+                idx = indices[dim]
+                idx_dl = StridedDataLoader(idx_dl, idx)
+            idx_dls.append(idx_dl)
+        return CartesianProductDataLoader(idx_dls)
 
 def _get_strides(shape: Tuple[int, ...]):
     """

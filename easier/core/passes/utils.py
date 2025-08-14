@@ -352,7 +352,7 @@ def get_selector_reducer_idx_partition(
     assert module.easier_index_status in ['placeholder', 'partially_loaded']
     if module.easier_index_status == 'placeholder':
         partial_idx, pstart, pend = \
-            module.easier_data_loader.partially_load_by_rank()
+            module.easier_data_loader.partially_load_by_rank_REMOVE_THIS()
         module.idx = partial_idx
         module.easier_idx_part_range = (pstart, pend)
         module.easier_index_status = 'partially_loaded'
