@@ -7,7 +7,7 @@ import contextlib
 import torch
 
 from easier.core.passes.tensor_grouping import EasierTensorGroup
-from easier.core.runtime.data_loader import \
+from easier.core.runtime.data_loader.data_loader import \
     _get_offset_exactly_nparts
 from easier.core.distpart import \
     metis_wrapper as _metis

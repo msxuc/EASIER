@@ -9,7 +9,7 @@ from .core.module import (
     sum, prod, norm, max, min,
     hdf5, full, zeros, ones, full_like, zeros_like, ones_like, arange,
 )
-from .core.runtime.data_loader import Mesh  # TODO put into .module?
+from .core.runtime.data_loader.data_loader import Mesh  # TODO put into .module?
 from .core.jit import init, compile
 from .core.utils import logger, EasierJitException
 from . import numeric

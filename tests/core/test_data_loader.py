@@ -9,7 +9,7 @@ import h5py
 import tempfile
 import os
 
-from easier.core.runtime.data_loader import \
+from easier.core.runtime.data_loader.data_loader import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
 

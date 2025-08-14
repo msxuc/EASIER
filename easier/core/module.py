@@ -22,7 +22,7 @@ import h5py
 
 from easier.core.runtime.dist_env import \
     get_runtime_dist_env, get_default_dist_env
-from easier.core.runtime.data_loader import \
+from easier.core.runtime.data_loader.data_loader import \
     ArangeTensorLoader, DataLoaderBase, InMemoryTensorLoader, H5DataLoader, \
     FulledTensorLoader, ATTRIBUTE_PLACEHOLDER, torch_dtype_to_numpy_dtype
 
