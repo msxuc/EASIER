@@ -33,10 +33,12 @@ from easier.core.utils import EasierJitException
 
 
 class StridedDataLoader(DataLoaderBase):
-    def __init__(self, inner: DataLoaderBase, index: SimpleIndex):
+    def __init__(self, inner: DataLoaderBase, index: Sequence[SimpleIndex]):
         super().__init__()
 
         self.inner = inner
+
+        # The index must be converted to valid and in-range values.
         self.index = index
 
         strided = inner.get_placeholder()[index]

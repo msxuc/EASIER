@@ -79,7 +79,7 @@ def compose_slice(s1: slice, s2: slice) -> slice:
 
     ret_start = s1.start + s2.start * s1.step
     ret_step = s2.step * s1.step
-    ret_end = ret_start + 
+    ret_end = ret_start + 1
 
 
 

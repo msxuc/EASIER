@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 from types import EllipsisType
-from typing import Optional, Tuple, TypeAlias, Union
+from typing import List, Optional, Sequence, Tuple, TypeAlias, Union
 import functools
 import copy
 
@@ -25,22 +25,23 @@ Num: TypeAlias = Union[int, float, bool]
 # Given a value of such a Union type, we can directly pass it into
 # Tensor.__getitem__ etc. without extra unpacking like `*args`.
 #
-# NOTE In internal subprocedures, when SimpleIndex is declared, all slice
-# objects in it should:
+# NOTE In internal subprocedures, when Seq[SimpleIndex] is declared,
+# all slice objects in it should:
 # - not have negative start/stop values, i.e. must be # zero-based
 #   (step can still be negative)
 # - not be out-of-range.
 #   Although Python standard behavior is that the indexing operation will
-#   simply ignore the out-of-range part, a key difference is 
+#   simply ignore the out-of-range part, because EASIER may compose multiple
+#   layers slices for nested DataLoaders, we need to ensure each layer is in
+#   right region without materializing the tensor like PyTorch eager-mode.
 SimpleIndex: TypeAlias = Union[
-    int, slice, EllipsisType, None,
-    Tuple['SimpleIndex', ...]
+    int, slice, # TODO None,
 ]
 
-# TODO GeneralIndex: TypeAlias = Union[
-#     int, slice, EllipsisType, None, torch.Tensor,
-#     Tuple['GeneralIndex', ...]
-# ]
+_GeneralIndex: TypeAlias = Union[
+    int, slice, EllipsisType, # TODO None, torch.Tensor,
+    Tuple['_GeneralIndex', ...]
+]
 
 
 def _wrap_function(pre_hook, post_hook, func):
@@ -63,11 +64,13 @@ A quick template for derived DataLoader classes.
 class DerivedDataLoader(DataLoaderBase):
     def collective_init(self) -> None:
         raise NotImplementedError()
-    def minmax(self, region: _SimpleIndex) -> Tuple[Num, Num]:
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         raise NotImplementedError()
-    def count_unique(self, region: _SimpleIndex) -> int:
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         raise NotImplementedError()
-    def partially_load_by_range(self, region: _SimpleIndex) -> torch.Tensor:
+    def partially_load_by_range(
+        self, region: Sequence[SimpleIndex]
+    ) -> torch.Tensor:
         raise NotImplementedError()
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
@@ -172,7 +175,7 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    def minmax(self, region: SimpleIndex) -> Tuple[Num, Num]:
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         """
         Get minimum and maximum value within the `region` range of data source.
 
@@ -183,7 +186,7 @@ class DataLoaderBase:
         """
         raise NotImplementedError()
 
-    def count_unique(self, region: SimpleIndex) -> int:
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         """
         Count unique elements in the exact `region` range of data source.
 
@@ -207,10 +210,46 @@ class DataLoaderBase:
             clone.device = torch.device(device)
         return clone
 
-    def __getitem__(self, index: SimpleIndex) -> 'DataLoaderBase':
+    def __getitem__(self, index: _GeneralIndex) -> 'DataLoaderBase':
+        """
+        The standard behavior of Python and PyTorch for out-of-range slicing
+        is to ignore the out-of-range parts.
+        But for int-indexing, we need to check it's in-range.
+        """
+        if not isinstance(index, tuple):
+            index = (index,)
+
+        ndim = len(self.shape)
+        if len(index) > ndim:
+            raise IndexError("Too many indices")
+
+        simple_indices: List[SimpleIndex] = []
+        for i, idx in enumerate(index):
+            dimlen = self.shape[i]
+            if isinstance(idx, int):
+                norm_idx = idx
+                if idx < 0:
+                    norm_idx = dimlen + idx
+                if not (0 <= idx and idx < dimlen):
+                    raise IndexError(
+                        f"Index {idx} is out-of-range for dimension {i}"
+                        f" with length {dimlen}"
+                    )
+                simple_indices.append(norm_idx)
+            elif isinstance(idx, slice):
+                norm_slice = slice(*idx.indices(dimlen))
+                # effectively calculate the intersection of idx and :dimlen
+                simple_indices.append(norm_slice)
+            elif idx is Ellipsis:
+                norm_slice = slice(0, dimlen)
+                simple_indices.append(norm_slice)
+            else:
+                # TODO support idx==None
+                raise IndexError(f"Unexpect index {idx}")
+        
         # TODO certain DataLoader stack can be reduced and simplified
         from easier.core.runtime.data_loader.ops import StridedDataLoader
-        return StridedDataLoader(self, index)
+        return StridedDataLoader(self, simple_indices)
 
 
     def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
@@ -232,13 +271,25 @@ class DataLoaderBase:
         return self.partially_load_by_range(rank_region), begin, end
     
 
-    def partially_load_by_range(self, region: SimpleIndex) -> torch.Tensor:
+    def partially_load_by_range(
+        self, region: Sequence[SimpleIndex]
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
 
-    def _pre_partially_load_by_range(self, index):
-        assert isinstance(index, (int, slice, tuple)) \
-            or index in [Ellipsis, None]
+    def _pre_partially_load_by_range(self, region):
+        # All layers in nested DataLoaders must ensure the region is not
+        # out-of-range.
+        for i, idx in enumerate(region):
+            dimlen = self.shape[i]
+            if isinstance(idx, int):
+                assert 0 <= idx and idx < dimlen
+            elif isinstance(idx, slice):
+                start, stop, step = idx.indices(dimlen)
+                assert 0 <= start < dimlen
+                assert 0 <= stop < dimlen
+            else:
+                assert False, f'Unexpected idx {idx}'
 
     def _post_partially_load_by_range(self, res):
         assert res.device.type == 'cpu'
