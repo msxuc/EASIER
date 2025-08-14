@@ -1,27 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from contextlib import contextmanager
-from dataclasses import dataclass
-import math
-import os
-from types import EllipsisType
-from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast
-import h5py
-import functools
-import copy
+from typing import Tuple, Union, cast
 
-import numpy as np
 import sympy
 import torch
 
-from easier.core.runtime.dist_env import \
-    get_default_dist_env, get_runtime_dist_env
-from easier.core.runtime.utils import check_collective_equality
-from easier.core.utils import EasierJitException
 
 
-def _get_offset_exactly_nparts(
+def ____get_offset_exactly_nparts__REMOVE_THIS(
     orig_len: int, nparts: int, part: int
 ) -> Tuple[int, int]:
     """
@@ -44,8 +31,65 @@ def _get_offset_exactly_nparts(
     return start, end
 
 
+def get_overlapping_slice(
+    region: Union[slice, range], selection: slice
+) -> slice:
+    """
+    Start/stop of both input slices must be converted to non-negative ints.
 
-def _get_strides(shape: Tuple[int, ...]):
+    The result will have the same step sign as `selection`,
+    i.e. the direction in `region` is ignored.
+    """
+    assert all(v >= 0 for v in [
+        region.start, region.stop, selection.start, selection.stop
+    ])
+    r_region = sympy.Range(region.start, region.stop, region.step)
+    r_s = sympy.Range(selection.start, selection.stop, selection.step)
+    r_overlap = cast(sympy.Range, r_region.intersect(r_s))
+
+    if len(r_overlap) == 0:
+        assert isinstance(r_overlap, sympy.EmptySet)
+        return slice(0, 0)
+
+    # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
+    # so we need to reverse it if s.step < 0
+    if selection.step < 0:
+        r_overlap = r_overlap.reversed
+    
+    return slice(r_overlap.start, r_overlap.stop, r_overlap.step)
+
+
+def compose_slice(s1: slice, s2: slice) -> slice:
+    """
+    v[s1][s2] == v[compose_slice(s1, s2)].
+
+    Remarks:
+    -   s1, s2 and the result slice must not have negative start/stop
+        (but step can be negative)
+    -   s1, s2 and the result slice can be out-of-range
+        (out-of-range part will be simply ignored by the indexing operation,
+        this is the common Python behavior)
+    """
+    assert all(v >= 0 for v in [
+        s1.start, s1.stop, s2.start, s2.stop
+    ])
+
+    s1_len = len(range(s1.start, s1.stop, s1.step))
+    s2_len = len(range(s2.start, s2.stop, s2.step))
+
+    ret_start = s1.start + s2.start * s1.step
+    ret_step = s2.step * s1.step
+    ret_end = ret_start + 
+
+
+
+
+
+def get_sliced_region(s):
+    pass
+
+
+def get_strides(shape: Tuple[int, ...]) -> torch.Tensor:
     """
     Innermost-major strides.
     P.S. use Tensor.tolist() to get a List[int] of strides.

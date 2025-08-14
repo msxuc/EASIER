@@ -15,6 +15,15 @@ import numpy as np
 import sympy
 import torch
 
+from easier.core.runtime.data_loader.base import \
+    DataLoaderBase, SimpleIndex, Num
+from easier.core.runtime.data_loader.factories import \
+    ArangeTensorLoader, FulledTensorLoader
+from easier.core.runtime.data_loader.ops import \
+    CartesianProductDataLoader, StridedDataLoader, ConcatDataLoader
+from easier.core.runtime.data_loader.utils import \
+    get_offset_exactly_nparts, get_strides
+
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -259,7 +268,7 @@ class MeshOneDimInteriorFaceIdxDataLoader(DataLoaderBase):
         facets = self.interior_facets.fully_load(device, replicated).reshape(-1, self.ndim)
 
         # upstream/downstream cube IDs around the facet
-        strides = _get_strides(facets.shape)  # == (N, 1)
+        strides = get_strides(facets.shape)  # == (N, 1)
 
         up_cubes = (facets * strides).sum()
 

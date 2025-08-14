@@ -26,16 +26,21 @@ Num: TypeAlias = Union[int, float, bool]
 # Tensor.__getitem__ etc. without extra unpacking like `*args`.
 #
 # NOTE In internal subprocedures, when SimpleIndex is declared, all slice
-# objects in it should not have negative start/stop values, i.e. must be
-# zero-based. (step can still be negative)
+# objects in it should:
+# - not have negative start/stop values, i.e. must be # zero-based
+#   (step can still be negative)
+# - not be out-of-range.
+#   Although Python standard behavior is that the indexing operation will
+#   simply ignore the out-of-range part, a key difference is 
 SimpleIndex: TypeAlias = Union[
     int, slice, EllipsisType, None,
     Tuple['SimpleIndex', ...]
 ]
-GeneralIndex: TypeAlias = Union[
-    int, slice, EllipsisType, None, torch.Tensor,
-    Tuple['GeneralIndex', ...]
-]
+
+# TODO GeneralIndex: TypeAlias = Union[
+#     int, slice, EllipsisType, None, torch.Tensor,
+#     Tuple['GeneralIndex', ...]
+# ]
 
 
 def _wrap_function(pre_hook, post_hook, func):

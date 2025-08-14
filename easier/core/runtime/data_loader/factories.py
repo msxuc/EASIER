@@ -15,6 +15,11 @@ import numpy as np
 import sympy
 import torch
 
+from easier.core.runtime.data_loader.base import \
+    DataLoaderBase, SimpleIndex, Num
+from easier.core.runtime.data_loader.utils import \
+    get_offset_exactly_nparts, get_strides
+
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -87,7 +92,7 @@ class InMemoryTensorLoader(DataLoaderBase):
 
         # Put tailing elements in the part for the last rank, making the size
         # of that part bigger than chunk_size.
-        start, end = _get_offset_exactly_nparts(orig_len, world_size, rank)
+        start, end = get_offset_exactly_nparts(orig_len, world_size, rank)
 
         return self.tensor[start:end].clone(), start, end
 
@@ -308,7 +313,7 @@ class H5DataLoader(DataLoaderBase):
         if rank == 0:
             with self._dataset_as_dtype() as d:
                 for w in range(1, dist_env.world_size):
-                    start, end = _get_offset_exactly_nparts(
+                    start, end = get_offset_exactly_nparts(
                         orig_len, nparts=dist_env.world_size, part=w)
 
                     part_np: np.ndarray = d[start:end]
@@ -321,14 +326,14 @@ class H5DataLoader(DataLoaderBase):
                     # TODO each rank-0-rank-w comm may take a while,
                     # subsequennt recvs should not timeout.
 
-                s0, e0 = _get_offset_exactly_nparts(
+                s0, e0 = get_offset_exactly_nparts(
                     orig_len, nparts=dist_env.world_size, part=0)
                 part0_np: np.ndarray = d[s0:e0]
                 part0 = torch.from_numpy(part0_np)
                 return part0, s0, e0
 
         else:
-            start, end = _get_offset_exactly_nparts(
+            start, end = get_offset_exactly_nparts(
                 orig_len, dist_env.world_size, rank)
             buffer = torch.empty(
                 (end - start,) + sub_shape,
@@ -511,7 +516,7 @@ class FulledTensorLoader(DataLoaderBase):
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
-        start, end = _get_offset_exactly_nparts(
+        start, end = get_offset_exactly_nparts(
             orig_len, dist_env.world_size, rank)
         return self._full(end - start, 'cpu'), start, end
 
@@ -621,7 +626,7 @@ class ArangeTensorLoader(DataLoaderBase):
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
-        offset_start, offset_end = _get_offset_exactly_nparts(
+        offset_start, offset_end = get_offset_exactly_nparts(
             orig_len, dist_env.world_size, rank)
 
         range_start = self._start + offset_start * self._step

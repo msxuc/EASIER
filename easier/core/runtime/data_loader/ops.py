@@ -15,6 +15,13 @@ import numpy as np
 import sympy
 import torch
 
+from easier.core.runtime.data_loader.base import \
+    DataLoaderBase, SimpleIndex, Num
+from easier.core.runtime.data_loader.factories import \
+    ArangeTensorLoader, FulledTensorLoader
+from easier.core.runtime.data_loader.utils import \
+    get_strides
+
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -23,30 +30,7 @@ from easier.core.utils import EasierJitException
 
 
 
-def _get_overlapped_range(region: slice, selection: slice) -> slice:
-    """
-    Start/stop of both input slices must be converted to non-negative ints.
 
-    The result will have the same step sign as `selection`,
-    i.e. the direction in `region` is ignored.
-    """
-    assert all(v >= 0 for v in [
-        region.start, region.stop, selection.start, selection.stop
-    ])
-    r_region = sympy.Range(region.start, region.stop, region.step)
-    r_s = sympy.Range(selection.start, selection.stop, selection.step)
-    r_overlap = cast(sympy.Range, r_region.intersect(r_s))
-
-    if len(r_overlap) == 0:
-        assert isinstance(r_overlap, sympy.EmptySet)
-        return slice(0, 0)
-
-    # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
-    # so we need to reverse it if s.step < 0
-    if selection.step < 0:
-        r_overlap = r_overlap.reversed
-    
-    return slice(r_overlap.start, r_overlap.stop, r_overlap.step)
 
 class StridedDataLoader(DataLoaderBase):
     def __init__(self, inner: DataLoaderBase, index: SimpleIndex):
@@ -92,12 +76,12 @@ class CartesianProductDataLoader(DataLoaderBase):
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
-        form: Literal['flatten', 'stack'] = 'flatten'
+        # TODO to support item datatype other than scalar, we may need 'form':
+        # form: Literal['flatten', 'stack'] = 'flatten'
     ):
         super().__init__()
 
         self.components = list(components)
-        self.form = form
     
     def collective_init(self) -> None:
         pass
@@ -113,7 +97,7 @@ class ConcatDataLoader(DataLoaderBase):
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
-        # TODO allow nonzero dims
+        # TODO allow to concat along dim>0
     ):
         super().__init__()
 
