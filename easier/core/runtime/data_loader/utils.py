@@ -74,19 +74,16 @@ def compose_slice(s1: slice, s2: slice) -> slice:
         s1.start, s1.stop, s2.start, s2.stop
     ])
 
-    s1_len = len(range(s1.start, s1.stop, s1.step))
     s2_len = len(range(s2.start, s2.stop, s2.step))
 
     ret_start = s1.start + s2.start * s1.step
     ret_step = s2.step * s1.step
-    ret_end = ret_start + 1
+    ret_end = ret_start + (ret_step + 1) * s2_len
+    ret_slice = slice(ret_start, ret_end, ret_step)
 
-
-
-
-
-def get_sliced_region(s):
-    pass
+    # constrain to in-range
+    ret_slice = get_overlapping_slice(s1, ret_slice)
+    return ret_slice
 
 
 def get_strides(shape: Tuple[int, ...]) -> torch.Tensor:
