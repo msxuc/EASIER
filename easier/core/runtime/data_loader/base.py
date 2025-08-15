@@ -375,7 +375,7 @@ class DataLoaderBase:
         # .to() method on placeholder tensors must be strictly disabled,
         # otherwise it might materialize the memory and cause OOM!
         def _to_forbidden(self, *args, **kwargs):
-            raise EasierJitException("Cannot can .to() on placeholders!")
+            raise EasierJitException("Cannot call .to() on placeholders!")
         ph.to = _to_forbidden.__get__(ph)
 
         setattr(ph, ATTRIBUTE_PLACEHOLDER, True)

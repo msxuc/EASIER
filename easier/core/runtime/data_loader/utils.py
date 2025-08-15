@@ -27,6 +27,7 @@ def range_unpack(s: Union[slice, range, sympy.Range]) -> Tuple[int, int, int]:
     """
     return s.start, s.stop, s.step
 
+
 def simplify_indices(
     shape: Tuple[int, ...],
     general_indices: Sequence[GeneralIndex]
@@ -139,12 +140,12 @@ def get_region_shape(shape: Tuple[int, ...], region: Sequence[slice]) -> Tuple[i
     return tuple(ret)
 
 
-def get_strides(shape: Tuple[int, ...]) -> torch.Tensor:
+def get_strides(shape: Sequence[int]) -> torch.Tensor:
     """
     Innermost-major strides.
     P.S. use Tensor.tolist() to get a List[int] of strides.
     """
-    r_shp = torch.tensor(shape + (1,), dtype=torch.int64).flip(dims=[0])
+    r_shp = torch.tensor(list(shape) + [1], dtype=torch.int64).flip(dims=[0])
     r_strides = torch.cumprod(r_shp, dim=0)
     strides = r_strides[:-1].flip(dims=[0])
     return strides

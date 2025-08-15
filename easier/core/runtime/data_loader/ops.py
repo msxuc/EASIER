@@ -1,31 +1,19 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from contextlib import contextmanager
-from dataclasses import dataclass
 import math
-import os
-from types import EllipsisType
-from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast
-import h5py
-import functools
-import copy
+from typing import List, Sequence, Tuple
 
-import numpy as np
-import sympy
 import torch
 
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, SimpleIndex, Num
-from easier.core.runtime.data_loader.factories import \
-    ArangeTensorLoader, FulledTensorLoader
 from easier.core.runtime.data_loader.utils import \
-    get_strides
+    get_overlapping_slice, get_strides, range_unpack
 
 from easier.core.runtime.dist_env import \
-    get_default_dist_env, get_runtime_dist_env
+    get_default_dist_env
 from easier.core.runtime.utils import check_collective_equality
-from easier.core.utils import EasierJitException
 
 
 
@@ -77,14 +65,14 @@ class CartesianProductDataLoader(DataLoaderBase):
     ):
         super().__init__()
 
-        ns = []
+        sizes = []
 
         dtypes = []
         devices = []
         for i, dl in enumerate(components):
             if len(dl.shape) != 1:
                 raise ValueError(f"{i}-th input ndim != 1")
-            ns.append(dl.shape[0])
+            sizes.append(dl.shape[0])
 
             dtypes.append(dl.dtype)
             devices.append(dl.device)
@@ -94,10 +82,11 @@ class CartesianProductDataLoader(DataLoaderBase):
         if len(set(devices)) != 1:
             raise ValueError("Input devices must be the same")
         
-        self.shape = (math.prod(ns), len(components))
+        self.shape = (math.prod(sizes), len(components))
         self.dtype = dtypes[0]
         self.device = devices[0]
 
+        self._sizes = sizes
         self.components = list(components)
     
     def collective_init(self) -> None:
@@ -107,18 +96,47 @@ class CartesianProductDataLoader(DataLoaderBase):
 
     def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         raise NotImplementedError()
+    
     def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         raise NotImplementedError()
-    def partially_load_by_range(
-        self, index: SimpleIndex
-    ) -> torch.Tensor:
-        raise NotImplementedError()
+    
+    def partially_load_by_range(self, index: SimpleIndex) -> torch.Tensor:
+        nd_strides: List[int] = get_strides(self._sizes).tolist()
+
+        ret_len = len(range(*range_unpack(index)))
+        ret = torch.empty([ret_len, len(self.components)], dtype=self.dtype)
+
+        this_idx = torch.arange(*range_unpack(index), dtype=torch.int64)
+        for i, comp in enumerate(self.components):
+            len_i = self._sizes[i]
+            stride_i = nd_strides[i]
+            comp_idxes = (this_idx / stride_i) % len_i
+
+            # TODO each components is fully loaded, since each is O(N^(1/w))
+            # it might be acceptable
+            array = comp.fully_load(torch.device('cpu'), replicated=True)
+
+            ret[:, i] = array[comp_idxes]
+        
+        return ret
+
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
+
     def fully_load(
         self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
-        raise NotImplementedError()
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            vectors = []
+            for comp in self.components:
+                vector = comp.fully_load(device, replicated)
+                vectors.append(vector)
+            return torch.cartesian_prod(*vectors)
+        else:
+            return self.get_placeholder(device)
+
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(components={repr(self.components)})'
 
