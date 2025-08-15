@@ -263,7 +263,7 @@ class MeshOneDimInteriorFaceIdxDataLoader(DataLoaderBase):
         # A reference direction along/against the dimension.
         self.direction = direction
     
-    def fully_load(self, device: Union[torch.device, str], replicated=False) -> torch.Tensor:
+    def fully_load(self, device: torch.device, replicated: bool) -> torch.Tensor:
         # (L_0*...*L_{N-1}, N) -- the last N is for coordinates.
         facets = self.interior_facets.fully_load(device, replicated).reshape(-1, self.ndim)
 

@@ -95,7 +95,7 @@ def worker__test_fully_load(
     v = torch.arange(17) * 3 + 1
     v = v.to(final_device)
 
-    tensor = dl.fully_load(final_device, replicated=False)
+    tensor = dl.fully_load(final_device, replicated: bool)
     assert tensor.dtype == dtype
     if final_device_type == 'cpu':
         assert tensor.device.type == 'cpu'
@@ -115,6 +115,28 @@ def worker__test_fully_load(
         assert tensor.device == final_device
     assert torch.equal(v, tensor)
 
+@pytest.mark.parametrize('dtype',
+                         [torch.int64, torch.float64], ids=['i64', 'f64'])
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_load_chunk(self, dtype: torch.dtype):
+    # rank-0 only
+    dl: DataLoaderBase = get_h5_tensor_loader(dtype, 'cpu')
+    assert dl.dtype == dtype
+    assert dl.device.type == 'cpu'
+    assert dl.shape == (17,)
+
+    it = dl.partially_load_by_chunk(7)
+    chunks = list(it)
+
+    for chunk in chunks:
+        assert chunk.dtype == dtype
+        assert chunk.device == torch.device('cpu')
+
+    assert torch.equal(torch.arange(0, 7, dtype=dtype) * 3 + 1, chunks[0])
+    assert torch.equal(torch.arange(7, 14, dtype=dtype) * 3 + 1, chunks[1])
+    assert torch.equal(torch.arange(
+        14, 17, dtype=dtype) * 3 + 1, chunks[2])
+
 
 @pytest.mark.parametrize('data_loader_ctor',
                          [get_in_memory_tensor_loader, get_h5_tensor_loader])
@@ -126,27 +148,6 @@ def worker__test_fully_load(
     pytest.param('cuda', marks=have_cuda)
 ])
 class TestDataLoader:
-
-    @pytest.mark.usefixtures('dummy_dist_env')
-    def test_load_chunk(self, data_loader_ctor, dtype: torch.dtype,
-                        device_type: str):
-        # rank-0 only
-        dl: DataLoaderBase = data_loader_ctor(dtype, device_type)
-        assert dl.dtype == dtype
-        assert dl.device.type == device_type
-        assert dl.shape == (17,)
-
-        it = dl.partially_load_by_chunk(7)
-        chunks = list(it)
-
-        for chunk in chunks:
-            assert chunk.dtype == dtype
-            assert chunk.device == torch.device('cpu')
-
-        assert torch.equal(torch.arange(0, 7, dtype=dtype) * 3 + 1, chunks[0])
-        assert torch.equal(torch.arange(7, 14, dtype=dtype) * 3 + 1, chunks[1])
-        assert torch.equal(torch.arange(
-            14, 17, dtype=dtype) * 3 + 1, chunks[2])
 
     def test_load_by_rank(self, data_loader_ctor, dtype: torch.dtype,
                           device_type: str):
@@ -237,25 +238,6 @@ def worker__test_load_full_by_index(local_rank: int, world_size: int,
 ])
 class TestFulledLoader:
 
-    @pytest.mark.usefixtures('dummy_dist_env')
-    def test_load_chunk(self, dtype: torch.dtype, device_type: str):
-        dl = FulledTensorLoader(
-            42, shape=[17, 2], dtype=dtype, device=torch.device(device_type))
-        assert dl.dtype == dtype
-        assert dl.device.type == device_type
-        assert dl.shape == (17, 2)
-
-        it = dl.partially_load_by_chunk(7)
-        chunks = list(it)
-
-        for chunk in chunks:
-            assert chunk.dtype == dtype
-            assert chunk.device == torch.device('cpu')
-
-        assert torch.equal(torch.full([7, 2], 42, dtype=dtype), chunks[0])
-        assert torch.equal(torch.full([7, 2], 42, dtype=dtype), chunks[1])
-        assert torch.equal(torch.full([3, 2], 42, dtype=dtype), chunks[2])
-
     def test_load_by_rank(self, dtype: torch.dtype, device_type: str):
         torchrun_singlenode(2, worker__test_load_full_by_rank,
                             (dtype, device_type))
@@ -311,25 +293,6 @@ def worker__test_load_arange_by_index(local_rank: int, world_size: int,
     pytest.param('cuda', marks=have_cuda)
 ])
 class TestArangeLoader:
-
-    @pytest.mark.usefixtures('dummy_dist_env')
-    def test_load_chunk(self, dtype: torch.dtype, device_type: str):
-        dl = ArangeTensorLoader(0, 34, 2,
-                                dtype=dtype, device=torch.device(device_type))
-        assert dl.dtype == dtype
-        assert dl.device.type == device_type
-        assert dl.shape == (17,)
-
-        it = dl.partially_load_by_chunk(7)
-        chunks = list(it)
-
-        for chunk in chunks:
-            assert chunk.dtype == dtype
-            assert chunk.device == torch.device('cpu')
-
-        assert torch.equal(torch.arange(0, 14, 2, dtype=dtype), chunks[0])
-        assert torch.equal(torch.arange(14, 28, 2, dtype=dtype), chunks[1])
-        assert torch.equal(torch.arange(28, 34, 2, dtype=dtype), chunks[2])
 
     def test_load_by_rank(self, dtype: torch.dtype, device_type: str):
         torchrun_singlenode(2, worker__test_load_arange_by_rank,

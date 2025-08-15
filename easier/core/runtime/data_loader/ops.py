@@ -29,9 +29,6 @@ from easier.core.utils import EasierJitException
 
 
 
-
-
-
 class StridedDataLoader(DataLoaderBase):
     def __init__(self, inner: DataLoaderBase, index: Sequence[SimpleIndex]):
         super().__init__()
@@ -47,33 +44,30 @@ class StridedDataLoader(DataLoaderBase):
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
     
-    def _rev_compose_index_range(self, region: SimpleIndex) -> SimpleIndex:
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         raise NotImplementedError()
-    def _rev_compose_index_tensor(self, index: torch.Tensor) -> torch.Tensor:
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         raise NotImplementedError()
-    
-    def minmax(self, region: SimpleIndex) -> Tuple[Num, Num]:
-        region = self._rev_compose_index_range(region)
-        return self.inner.minmax(region)
-    
-    def count_unique(self, region: SimpleIndex) -> int:
-        region = self._rev_compose_index_range(region)
-        return self.inner.count_unique(region)
-    
-    def partially_load_by_range(self, region: SimpleIndex) -> torch.Tensor:
-        region = self._rev_compose_index_range(region)
-        return self.inner.partially_load_by_range(region)
-    
-    def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
-        index = self._rev_compose_index_tensor(index)
-        return self.inner.partially_load_by_index(index, **kwargs)
+    def partially_load_by_range(
+        self, region: Sequence[SimpleIndex]
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+    def fully_load(
+        self, device: torch.device, replicated: bool
+    ) -> torch.Tensor:
+        raise NotImplementedError()
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(tensor={self.tensor})'
 
 
 class CartesianProductDataLoader(DataLoaderBase):
     """
-    Result is 1-d.
+    Takes N input DataLoader component, the i-th component must have its
+    shape in form of `(L_i,)`, and all components must have the same dtype.
+
+    The result shape is `(L_0*...*L_{N-1}, N)`.
     """
     def __init__(
         self,
@@ -83,13 +77,50 @@ class CartesianProductDataLoader(DataLoaderBase):
     ):
         super().__init__()
 
+        ns = []
+
+        dtypes = []
+        devices = []
+        for i, dl in enumerate(components):
+            if len(dl.shape) != 1:
+                raise ValueError(f"{i}-th input ndim != 1")
+            ns.append(dl.shape[0])
+
+            dtypes.append(dl.dtype)
+            devices.append(dl.device)
+        
+        if len(set(dtypes)) != 1:
+            raise ValueError("Input dtypes must be the same")
+        if len(set(devices)) != 1:
+            raise ValueError("Input devices must be the same")
+        
+        self.shape = (math.prod(ns), len(components))
+        self.dtype = dtypes[0]
+        self.device = devices[0]
+
         self.components = list(components)
     
     def collective_init(self) -> None:
-        pass
+        self.coll_check_dtype_shape_devicetype()
 
+        check_collective_equality('repr', repr(self))
+
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
+        raise NotImplementedError()
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
+        raise NotImplementedError()
+    def partially_load_by_range(
+        self, index: SimpleIndex
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+    def fully_load(
+        self, device: torch.device, replicated: bool
+    ) -> torch.Tensor:
+        raise NotImplementedError()
     def __repr__(self) -> str:
-        return f'{self.__class__.__name__}(tensor={self.tensor})'
+        return f'{self.__class__.__name__}(components={repr(self.components)})'
 
 
     
@@ -170,8 +201,8 @@ class ConcatDataLoader(DataLoaderBase):
 
             _offset = comp_end
 
-    
-    def minmax(self, region: SimpleIndex) -> Tuple[Num, Num]:
+
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         aminmax = [math.inf, -math.inf]
         def _minmax(comp: DataLoaderBase, comp_region: SimpleIndex):
             comp_minmax = comp.minmax(comp_region)
@@ -181,7 +212,7 @@ class ConcatDataLoader(DataLoaderBase):
         return tuple(aminmax)  # type: ignore
 
     
-    def count_unique(self, region: SimpleIndex) -> int:
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         _, c = self.partially_load_by_range(region).unique(return_counts=True)
         return c
     
@@ -193,7 +224,7 @@ class ConcatDataLoader(DataLoaderBase):
         # If region[0].step < 0, parts will be in reversed order
         return torch.concat(parts, dim=0)
     
-    def partially_load_by_index(self, index: torch.Tensor, **kwargs) -> torch.Tensor:
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         ret = torch.empty(
             (index.shape[0],) + self.shape[1:], dtype=self.dtype, device='cpu'
         )

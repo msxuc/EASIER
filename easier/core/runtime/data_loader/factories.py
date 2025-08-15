@@ -18,7 +18,7 @@ import torch
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, SimpleIndex, Num
 from easier.core.runtime.data_loader.utils import \
-    get_offset_exactly_nparts, get_strides
+    compose_slice, get_region_shape, range_unpack, get_strides, simplify_indices
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
@@ -65,44 +65,16 @@ class InMemoryTensorLoader(DataLoaderBase):
     def count_unique(self, region: SimpleIndex) -> int:
         return self.tensor[region].unique().shape[0]
 
-    def partially_load_by_chunk(
-        self, chunk_size: int
-    ) -> Iterator[torch.Tensor]:
-        orig_len = self.tensor.shape[0]
-
-        # Put tailing elements in an individual chunk whose size is smaller.
-        nchunk, remainder = divmod(orig_len, chunk_size)
-        if remainder > 0:
-            nchunk += 1
-
-        # After we have decided a valid nchunk (>=1), it won't matter even if
-        # `_get_offset_exactly_nparts` to get offsets.
-        # But we still follow the chunk partition above.
-        for i in range(nchunk):
-            start = chunk_size * i
-            end = min(orig_len, chunk_size * (i + 1))
-            chunk = self.tensor[start:end].clone()
-            yield chunk
-
-    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
-        world_size = dist_env.world_size
-        rank = dist_env.rank
-        orig_len = self.tensor.shape[0]
-
-        # Put tailing elements in the part for the last rank, making the size
-        # of that part bigger than chunk_size.
-        start, end = get_offset_exactly_nparts(orig_len, world_size, rank)
-
-        return self.tensor[start:end].clone(), start, end
-
-    def partially_load_by_index(
-        self, index: torch.Tensor, **kwargs
+    def partially_load_by_range(
+        self, region: Sequence[SimpleIndex]
     ) -> torch.Tensor:
+        return self.tensor[*region].clone()
+
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         return self.tensor[index]
 
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
         dist_env = get_default_dist_env()
         rank = dist_env.rank
@@ -150,6 +122,8 @@ class H5DataLoader(DataLoaderBase):
         self._file_kwargs = h5_file_kwargs
 
         self.device = torch.device(device)
+
+        self.chunk_size = 1024 * 1024 * 128  # roughly 128M elements
 
         dist_env = get_default_dist_env()  # runtime dist env not decided yet
         if dist_env.rank == 0:
@@ -203,9 +177,55 @@ class H5DataLoader(DataLoaderBase):
                 d = d.astype(self._target_np_dtype)  # type: ignore
 
             yield d
+    
+
+    def _load_by_chunk(
+        self, region: Sequence[SimpleIndex]
+    ) -> Iterator[torch.Tensor]:
+        """
+        Only callable on rank-0.
+        """
+        batch_idx = region[0]
+        if isinstance(batch_idx, int):
+            with self._dataset_as_dtype() as d:
+                chunk_np: np.ndarray = d[batch_idx, *region[1:]]
+                chunk: torch.Tensor = torch.from_numpy(chunk_np)
+                yield chunk
+
+        elif isinstance(batch_idx, slice):
+            batch_range = range(*range_unpack(batch_idx))
+            view_len = len(batch_range)
+
+            # Put tailing elements in an individual chunk whose size is smaller.
+            nchunk, remainder = divmod(view_len, self.chunk_size)
+            if remainder > 0:
+                nchunk += 1
+
+            with self._dataset_as_dtype() as d:
+                start = batch_idx.start
+
+                # TODO slice util: split_slice(): Iterator[slice]
+                for i in range(nchunk):
+                    end = start + batch_idx.step * self.chunk_size * i
+
+                    # TODO unit test this H5 view
+                    # end may go beyond `self.shape[0]` if step > 0
+                    # or beyond 0 if step < 0,
+                    # but H5 would ignore the out-of-range part.
+                    view_chunk_slice = slice(start, end, batch_idx.step)
+
+                    chunk_np: np.ndarray = d[view_chunk_slice]
+                    chunk: torch.Tensor = torch.from_numpy(chunk_np)
+                    yield chunk
+
+                    start = end
+
+        else:
+            assert False, 'unreachable'
+
 
     @functools.cache
-    def minmax(self, region: SimpleIndex) -> Tuple[Num, Num]:
+    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
@@ -219,7 +239,7 @@ class H5DataLoader(DataLoaderBase):
             def _opt_cmp(a: Optional[torch.Tensor], c: torch.Tensor, op):
                 return c if a is None else op(a, c)
 
-            for chunk in self.partially_load_by_chunk(1024 * 1024 * 128):
+            for chunk in self._load_by_chunk(region):
                 chunk_min, chunk_max = torch.aminmax(chunk)
                 amin = _opt_cmp(amin, chunk_min, min)
                 amax = _opt_cmp(amax, chunk_max, max)
@@ -234,11 +254,11 @@ class H5DataLoader(DataLoaderBase):
         return amin, amax
 
     @functools.cache
-    def count_unique(self, ) -> int:
+    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
-        amin, amax = self.minmax()
+        amin, amax = self.minmax(region)
         if not (amin >= 0):
             raise NotImplementedError("simplify for Reducer.fullness cases")
         assert isinstance(amax, int)
@@ -253,6 +273,10 @@ class H5DataLoader(DataLoaderBase):
             # count "bits".
 
             bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
+
+            # TODO for Reducer.fullness cases, amax upperbound is number of
+            # vertices, so this bitpack won't be too big. But generally the
+            # amax is not bounded, causing the bitpack super sparse.
             bitpack_n, remainder = divmod(amax, bitpack_maxlen)
             if remainder > 0:
                 bitpack_n += 1
@@ -266,7 +290,7 @@ class H5DataLoader(DataLoaderBase):
                     [bitpack_max - bitpack_min], dtype=torch.bool
                 )
 
-                for chunk in self.partially_load_by_chunk(1024 * 1024 * 128):
+                for chunk in self._load_by_chunk(region):
                     in_bitpack = torch.logical_and(
                         chunk >= bitpack_min, chunk < bitpack_max)
                     bitpack[chunk[in_bitpack] - bitpack_min] = 1
@@ -281,42 +305,27 @@ class H5DataLoader(DataLoaderBase):
 
         return nunique
 
-    def partially_load_by_chunk(
-        self, chunk_size: int
-    ) -> Iterator[torch.Tensor]:
-        orig_len = self.shape[0]
 
-        # Put tailing elements in an individual chunk whose size is smaller.
-        nchunk, remainder = divmod(orig_len, chunk_size)
-        if remainder > 0:
-            nchunk += 1
-
-        with self._dataset_as_dtype() as d:
-            for i in range(nchunk):
-                start = chunk_size * i
-                end = min(orig_len, chunk_size * (i + 1))
-
-                chunk_np: np.ndarray = d[start:end]
-                chunk: torch.Tensor = torch.from_numpy(chunk_np)
-                yield chunk
-
-    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_range(
+        self, slices: Sequence[SimpleIndex]
+    ) -> torch.Tensor:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
 
-        orig_len = self.shape[0]
-        sub_shape = self.shape[1:]
+        slices = simplify_indices(self.shape, slices)
+        regions = dist_env.gather_object_list(0, slices)  # type: ignore
 
+        view_shape = get_region_shape(self.shape, slices)
+        
         # To avoid OOM, we cannot load the whole dataset on rank-0 then
         # simply call dist.scatter.
         # Instead, we load the part for each rank once, and do P2P.
         if rank == 0:
+            regions: List[Sequence[SimpleIndex]]
+
             with self._dataset_as_dtype() as d:
                 for w in range(1, dist_env.world_size):
-                    start, end = get_offset_exactly_nparts(
-                        orig_len, nparts=dist_env.world_size, part=w)
-
-                    part_np: np.ndarray = d[start:end]
+                    part_np: np.ndarray = d[*regions[w]]
                     part: torch.Tensor = \
                         torch.from_numpy(part_np).to(dist_env.comm_device)
                     isend = dist_env.def_isend(part, dst=w, tag=w)
@@ -326,30 +335,22 @@ class H5DataLoader(DataLoaderBase):
                     # TODO each rank-0-rank-w comm may take a while,
                     # subsequennt recvs should not timeout.
 
-                s0, e0 = get_offset_exactly_nparts(
-                    orig_len, nparts=dist_env.world_size, part=0)
-                part0_np: np.ndarray = d[s0:e0]
+                part0_np: np.ndarray = d[*regions[0]]
                 part0 = torch.from_numpy(part0_np)
-                return part0, s0, e0
+                return part0
 
         else:
-            start, end = get_offset_exactly_nparts(
-                orig_len, dist_env.world_size, rank)
             buffer = torch.empty(
-                (end - start,) + sub_shape,
-                dtype=self.dtype, device=dist_env.comm_device
+                view_shape, dtype=self.dtype, device=dist_env.comm_device
             )
             irecv = dist_env.def_irecv(buffer, src=0, tag=rank)
             for req in dist_env.batch_isend_irecv([irecv]):
                 req.wait()
 
-            return buffer.cpu(), start, end
+            return buffer.cpu()
 
-    def partially_load_by_index(
-        self, index: torch.Tensor, *,
-        chunk_size=1024 * 1024 * 128,  # roughly 128M elements
-        **kwargs
-    ) -> torch.Tensor:
+
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         """
         Each time, rank-0 broadcasts a chunk [chunk_size*i, chunk_size*(i+1))
         to all ranks, and each rank picks the part it needs by
@@ -366,7 +367,7 @@ class H5DataLoader(DataLoaderBase):
         sub_shape = self.shape[1:]
 
         # Put tailing elements in an individual chunk whose size is smaller.
-        nchunk, remainder = divmod(orig_len, chunk_size)
+        nchunk, remainder = divmod(orig_len, self.chunk_size)
         if remainder > 0:
             nchunk += 1
 
@@ -375,8 +376,8 @@ class H5DataLoader(DataLoaderBase):
 
         def _run(d):
             for i in range(nchunk):
-                start = chunk_size * i
-                end = min(orig_len, chunk_size * (i + 1))
+                start = self.chunk_size * i
+                end = min(orig_len, self.chunk_size * (i + 1))
 
                 if dist_env.rank == 0:
                     chunk_np: np.ndarray = d[start:end]
@@ -423,7 +424,7 @@ class H5DataLoader(DataLoaderBase):
             return _run(None)
 
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
         """
         Called by backend=='none' case, only default_dist_env is available.
@@ -486,46 +487,22 @@ class FulledTensorLoader(DataLoaderBase):
     def count_unique(self) -> int:
         return 1
 
-    def _full(
-        self, batch_dim_len: Optional[int], device: Union[torch.device, str]
-    ):
-        if batch_dim_len is None:
-            batch_dim_len = self.shape[0]
-
-        shape = (batch_dim_len,) + self.shape[1:]
+    def _full(self, shape, device: Union[torch.device, str]):
         return torch.full(
             shape, self.value, dtype=self.dtype, device=device)  # type: ignore
 
-    def partially_load_by_chunk(self, chunk_size: int
-                                ) -> Iterator[torch.Tensor]:
-        orig_len = self.shape[0]
+    def partially_load_by_range(
+        self, region: Sequence[SimpleIndex]
+    ) -> torch.Tensor:
+        shape = get_region_shape(self.shape, region)
+        return self._full(shape, 'cpu')
 
-        # Put tailing elements in an individual chunk whose size is smaller.
-        nchunk, remainder = divmod(orig_len, chunk_size)
-        if remainder > 0:
-            nchunk += 1
-
-        for i in range(nchunk):
-            start = chunk_size * i
-            end = min(orig_len, chunk_size * (i + 1))
-
-            chunk = self._full(end - start, 'cpu')
-            yield chunk
-
-    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
-        rank = dist_env.rank
-        orig_len = self.shape[0]
-        start, end = get_offset_exactly_nparts(
-            orig_len, dist_env.world_size, rank)
-        return self._full(end - start, 'cpu'), start, end
-
-    def partially_load_by_index(self, index: torch.Tensor,
-                                **kwargs) -> torch.Tensor:
-        return self._full(index.shape[0], 'cpu')
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
+        shape = (index.shape[0],) + self.shape[1:]
+        return self._full(shape, 'cpu')
 
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
         dist_env = get_default_dist_env()
         rank = dist_env.rank
@@ -600,27 +577,6 @@ class ArangeTensorLoader(DataLoaderBase):
     def count_unique(self, region: SimpleIndex) -> int:
         return self.shape[0]
 
-    def partially_load_by_chunk(
-        self, chunk_size: int
-    ) -> Iterator[torch.Tensor]:
-        orig_len = self.shape[0]
-
-        # Put tailing elements in an individual chunk whose size is smaller.
-        nchunk, remainder = divmod(orig_len, chunk_size)
-        if remainder > 0:
-            nchunk += 1
-
-        for i in range(nchunk):
-            range_start = self._start + chunk_size * i * self._step
-            range_end = range_start + chunk_size * self._step
-            if self._step > 0:
-                range_end = min(self._end, range_end)
-            else:
-                range_end = max(self._end, range_end)
-
-            chunk = torch.arange(range_start, range_end, self._step,
-                                 dtype=self.dtype, device='cpu')
-            yield chunk
 
     def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
         dist_env = get_runtime_dist_env()
@@ -640,12 +596,11 @@ class ArangeTensorLoader(DataLoaderBase):
                              dtype=self.dtype, device='cpu')
         return chunk, offset_start, offset_end
 
-    def partially_load_by_index(self, index: torch.Tensor,
-                                **kwargs) -> torch.Tensor:
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         return (index * self._step + self._start).to(dtype=self.dtype)
 
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
         dist_env = get_default_dist_env()
         rank = dist_env.rank

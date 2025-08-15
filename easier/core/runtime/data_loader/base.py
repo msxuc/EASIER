@@ -19,7 +19,6 @@ ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
 Num: TypeAlias = Union[int, float, bool]
 
 
-
 # Python __getitem__ protocol only support one index parameter, and require
 # caller to wrap multiple arugments in a tuple (only tuple, not list).
 # Given a value of such a Union type, we can directly pass it into
@@ -34,13 +33,13 @@ Num: TypeAlias = Union[int, float, bool]
 #   simply ignore the out-of-range part, because EASIER may compose multiple
 #   layers slices for nested DataLoaders, we need to ensure each layer is in
 #   right region without materializing the tensor like PyTorch eager-mode.
-SimpleIndex: TypeAlias = Union[
-    int, slice, # TODO None,
-]
+SimpleIndex: TypeAlias = slice
+# TODO SimpleIndex: TypeAlias = Union[
+#     slice, None,
+# ]
 
-_GeneralIndex: TypeAlias = Union[
+GeneralIndex: TypeAlias = Union[
     int, slice, EllipsisType, # TODO None, torch.Tensor,
-    Tuple['_GeneralIndex', ...]
 ]
 
 
@@ -68,14 +67,12 @@ class DerivedDataLoader(DataLoaderBase):
         raise NotImplementedError()
     def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         raise NotImplementedError()
-    def partially_load_by_range(
-        self, region: Sequence[SimpleIndex]
-    ) -> torch.Tensor:
+    def partially_load_by_range(self, index: SimpleIndex) -> torch.Tensor:
         raise NotImplementedError()
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device], replicated: bool
     ) -> torch.Tensor:
         raise NotImplementedError()
     def __repr__(self) -> str:
@@ -179,20 +176,35 @@ class DataLoaderBase:
         """
         Get minimum and maximum value within the `region` range of data source.
 
+        `region` should be same on all ranks.
+
         TODO minmax() and count_unique() both accept *simple* index as range,
         i.e. tensor-typed index is not allowed.
         This indicates we may need to reimplement minmax()/count_unique() on a
         very detailed, tensor-indexed region if we provides such DataLoaders.
+        TODO the critical point is for minmax/count_unique we must precisely
+        specify the region, that's why we need it to be Seq[Index] rather than
+        a single, dim-0 index.
+        TODO however, even Seq[Index] may not suffice, then we have to fallback
+        to load-all-then-filter-then-minmax approach.
         """
         raise NotImplementedError()
+    
+    def _pre_minmax(self, region):
+        check_collective_equality('minmax region', region)
 
     def count_unique(self, region: Sequence[SimpleIndex]) -> int:
         """
         Count unique elements in the exact `region` range of data source.
+        
+        `region` should be same on all ranks.
 
         Used by Reducer.set_fullness()
         """
         raise NotImplementedError()
+
+    def _pre_count_unique(self, region):
+        check_collective_equality('count_unique region', region)
 
     def to(
         self,
@@ -210,70 +222,35 @@ class DataLoaderBase:
             clone.device = torch.device(device)
         return clone
 
-    def __getitem__(self, index: _GeneralIndex) -> 'DataLoaderBase':
-        """
-        The standard behavior of Python and PyTorch for out-of-range slicing
-        is to ignore the out-of-range parts.
-        But for int-indexing, we need to check it's in-range.
-        """
+    def __getitem__(
+        self, index: Union[GeneralIndex, Tuple[GeneralIndex, ...]]
+    ) -> 'DataLoaderBase':
+        from easier.core.runtime.data_loader.utils import simplify_indices
+        from easier.core.runtime.data_loader.ops import StridedDataLoader
+
         if not isinstance(index, tuple):
             index = (index,)
 
-        ndim = len(self.shape)
-        if len(index) > ndim:
-            raise IndexError("Too many indices")
-
-        simple_indices: List[SimpleIndex] = []
-        for i, idx in enumerate(index):
-            dimlen = self.shape[i]
-            if isinstance(idx, int):
-                norm_idx = idx
-                if idx < 0:
-                    norm_idx = dimlen + idx
-                if not (0 <= idx and idx < dimlen):
-                    raise IndexError(
-                        f"Index {idx} is out-of-range for dimension {i}"
-                        f" with length {dimlen}"
-                    )
-                simple_indices.append(norm_idx)
-            elif isinstance(idx, slice):
-                norm_slice = slice(*idx.indices(dimlen))
-                # effectively calculate the intersection of idx and :dimlen
-                simple_indices.append(norm_slice)
-            elif idx is Ellipsis:
-                norm_slice = slice(0, dimlen)
-                simple_indices.append(norm_slice)
-            else:
-                # TODO support idx==None
-                raise IndexError(f"Unexpect index {idx}")
+        simple_indices = simplify_indices(self.shape, index)
         
         # TODO certain DataLoader stack can be reduced and simplified
-        from easier.core.runtime.data_loader.ops import StridedDataLoader
         return StridedDataLoader(self, simple_indices)
 
 
-    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
+    def partially_load_by_range(self, index: SimpleIndex) -> torch.Tensor:
         """
-        Collectively load an evenly distributed part of the target dataset
-        for each rank.
+        Collectively load a part of the target dataset with the
+        specified index tensor.
+        Each rank provides its own `region` and it's different from others'.
+            
+        Args:
+        -   index: SimpleIndex
+            Currently on dim-0 only
+            TODO enforced on all DataLoader layers, change to Seq[SimpleIndex]
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
-        - int: the beginning offset of the part (inclusive)
-        - int: the end offset of the part (exclusive)
         """
-        dist_env = get_default_dist_env()
-        begin, end = _get_offset_exactly_nparts(
-            self.shape[0], dist_env.world_size, dist_env.rank
-        )
-        ndim = len(self.shape)
-        rank_region = (slice(begin, end),) + (Ellipsis,) * (ndim - 1)
-        return self.partially_load_by_range(rank_region), begin, end
-    
-
-    def partially_load_by_range(
-        self, region: Sequence[SimpleIndex]
-    ) -> torch.Tensor:
         raise NotImplementedError()
 
 
@@ -296,39 +273,33 @@ class DataLoaderBase:
         return res
 
 
-    def partially_load_by_index(self, index: torch.Tensor, **kwargs
-                                ) -> torch.Tensor:
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         """
         Collectively load a part of the target dataset with the
         specified index tensor.
+        Each rank provides its own `index` and it's different from others'.
         The index is defined in the global index space.
 
         Args:
         - index: should always be on CPU
-        - kwargs: subtype-specific config
-
-            Common configs:
-            -   chunk_size: int
-
-            TODO as DataLoader subsystem gets complicated, other loading API
-            may need kwargs config too.
-            TODO or any DataLoader needs configs may have configs being
-            attributes.
+            Currently only 1-d and on dim-0 only
+            TODO enforced on all DataLoader layers, may be more flexible
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
         """
         raise NotImplementedError()
 
-    def _pre_partially_load_by_index(self, index, **kwargs):
+    def _pre_partially_load_by_index(self, index):
         assert index.device.type == 'cpu'
+        assert len(index.shape) == 1
 
-    def _post_partially_load_by_index(self, res, index, **kwargs):
+    def _post_partially_load_by_index(self, res, index):
         assert res.device.type == 'cpu'
         return res
 
     def fully_load(
-        self, device: Union[torch.device, str], replicated=False
+        self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
         """
         Collectively and fully load the dataset on all ranks,

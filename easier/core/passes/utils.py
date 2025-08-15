@@ -22,6 +22,7 @@ from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
 
 import easier.core.module as esr
+from easier.core.runtime.dist_env import get_default_dist_env
 from easier.core.utils import EasierJitException
 
 
@@ -351,8 +352,20 @@ def get_selector_reducer_idx_partition(
     """
     assert module.easier_index_status in ['placeholder', 'partially_loaded']
     if module.easier_index_status == 'placeholder':
-        partial_idx, pstart, pend = \
-            module.easier_data_loader.partially_load_by_rank_REMOVE_THIS()
+
+        dist_env = get_default_dist_env()
+        dimlen = module.easier_data_loader.shape[0]
+
+        per_worker_len = dimlen // dist_env.world_size
+        pstart = per_worker_len * dist_env.rank
+        if dist_env.rank + 1 == dist_env.world_size:
+            pend = dimlen
+        else:
+            pend = pstart + per_worker_len
+
+        partial_idx = module.easier_data_loader.partially_load_by_range(
+            [slice(pstart, pend)]
+        )
         module.idx = partial_idx
         module.easier_idx_part_range = (pstart, pend)
         module.easier_index_status = 'partially_loaded'
