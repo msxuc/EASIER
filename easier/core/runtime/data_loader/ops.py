@@ -7,7 +7,7 @@ from typing import List, Sequence, Tuple, Union
 import torch
 
 from easier.core.runtime.data_loader.base import \
-    DataLoaderBase, RegionIndex, Num
+    DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
     compose_slice, get_overlapping_slice, get_strides, range_unpack
 
@@ -19,7 +19,7 @@ from easier.core.runtime.utils import check_collective_equality
 
 class StridedDataLoader(DataLoaderBase):
     def __init__(
-        self, inner: DataLoaderBase, index: Sequence[Union[slice, int]]
+        self, inner: DataLoaderBase, index: Sequence[Union[NormalizedSlice, int]]
     ):
         super().__init__()
 
@@ -28,16 +28,31 @@ class StridedDataLoader(DataLoaderBase):
                 f"Too many indices for input with ndim=={len(inner.shape)}"
             )
 
-        for idx in self.index:
-            if not (isinstance(idx, int) or isinstance(idx, slice)):
+        for i, idx in enumerate(index):
+            if isinstance(idx, int):
+                if not (0 <= idx < inner.shape[i]):
+                    raise IndexError(
+                        f"Index {idx} is out-of-range for dimension {i}"
+                        f" with length {inner.shape[i]}"
+                    )
+
+            elif isinstance(idx, NormalizedSlice):
+                1
+
+            else:
                 raise IndexError(f"Unexpected index {idx}")
 
         # The index must be converted to valid and in-range values.
         self.index = index
         self.inner = inner
 
-        strided = inner.get_placeholder()[*index]
-        self.shape = tuple(strided.shape)
+        shape = []
+        for idx in index:
+            if isinstance(idx, NormalizedSlice):
+                shape.append(len(idx))
+        shape += list(self.inner.shape[len(index):])
+
+        self.shape = tuple(shape)
         self.dtype = inner.dtype
         self.device = inner.device
 
@@ -45,14 +60,9 @@ class StridedDataLoader(DataLoaderBase):
         # ints are discarded, i.e.:
         assert len(self.shape) <= len(self.inner.shape)
     
-    def collective_init(self) -> None:
-        self.coll_check_dtype_shape_devicetype()
-
-        check_collective_equality('repr', repr(self))
-    
     def _compose_region(
-        self, region: Sequence[RegionIndex]
-    ) -> Sequence[RegionIndex]:
+        self, region: Sequence[NormalizedSlice]
+    ) -> Sequence[NormalizedSlice]:
         # If `self.index` contains ints, those dimensions are excluded during
         # region composition.
         region_i = 0
@@ -77,15 +87,15 @@ class StridedDataLoader(DataLoaderBase):
 
         return composed_region
     
-    def minmax(self, region: Sequence[RegionIndex]) -> Tuple[Num, Num]:
-        composed_indices = self._compose_region(region)
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
+        composed_indices = self._compose_region(index)
         return self.inner.minmax(composed_indices)
 
-    def count_unique(self, region: Sequence[RegionIndex]) -> int:
-        composed_region = self._compose_region(region)
+    def count_unique(self, index: NormalizedSlice) -> int:
+        composed_region = self._compose_region(index)
         return self.inner.count_unique(composed_region)
 
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         bs_idx = self.index[0]
         if isinstance(bs_idx, int):
             idxed_inner = self.inner.partially_load_by_range(
@@ -158,22 +168,7 @@ class CartesianProductDataLoader(DataLoaderBase):
 
         self._chunk_size = 128 * 1024 * 1024
     
-    def collective_init(self) -> None:
-        self.coll_check_dtype_shape_devicetype()
-
-        check_collective_equality('repr', repr(self))
-
-    def minmax(self, region: Sequence[RegionIndex]) -> Tuple[Num, Num]:
-        part = self.partially_load_by_range(region[0])[*region[1:]]
-        amin, amax = part.aminmax()
-        return amin.item(), amax.item()
-    
-    def count_unique(self, region: Sequence[RegionIndex]) -> int:
-        part = self.partially_load_by_range(region[0])[*region[1:]]
-        _, c = part.unique(return_counts=True)
-        return c
-    
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         index_tensor = torch.arange(*range_unpack(index), dtype=torch.int64)
         return self.partially_load_by_index(index_tensor)
 
@@ -270,12 +265,7 @@ class ConcatDataLoader(DataLoaderBase):
         self.device = components[0].device
 
 
-    def collective_init(self) -> None:
-        self.coll_check_dtype_shape_devicetype()
-
-        check_collective_equality('repr', repr(self))
-    
-    def _foreach_in_region(self, region: RegionIndex, fn):
+    def _foreach_in_region(self, region: NormalizedSlice, fn):
         # fn: (DataLoaderBase, _SimpleIndex) -> None
         # NOTE if region[0] is slice-with-negative-step, foreach in reversed.
 
@@ -302,24 +292,19 @@ class ConcatDataLoader(DataLoaderBase):
             _offset = comp_end
 
 
-    def minmax(self, region: Sequence[RegionIndex]) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         aminmax = [math.inf, -math.inf]
-        def _minmax(comp: DataLoaderBase, comp_region: RegionIndex):
-            comp_minmax = comp.minmax([comp_region] + list(region[1:]))
+        def _minmax(comp: DataLoaderBase, comp_region: NormalizedSlice):
+            comp_minmax = comp.minmax([comp_region] + list(index[1:]))
             aminmax[0] = min(comp_minmax[0], aminmax[0])
             aminmax[1] = max(comp_minmax[1], aminmax[1])
-        self._foreach_in_region(region[0], _minmax)
+        self._foreach_in_region(index[0], _minmax)
         return tuple(aminmax)  # type: ignore
 
     
-    def count_unique(self, region: Sequence[RegionIndex]) -> int:
-        part = self.partially_load_by_range(region[0])[*region[1:]]
-        _, c = part.unique(return_counts=True)
-        return c
-    
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         parts = []
-        def _load_comp(comp: DataLoaderBase, comp_region: RegionIndex):
+        def _load_comp(comp: DataLoaderBase, comp_region: NormalizedSlice):
             parts.append(comp.partially_load_by_range(comp_region))
         self._foreach_in_region(index, _load_comp)
         # If region[0].step < 0, parts will be in reversed order

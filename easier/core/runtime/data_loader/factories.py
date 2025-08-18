@@ -16,7 +16,7 @@ import sympy
 import torch
 
 from easier.core.runtime.data_loader.base import \
-    DataLoaderBase, RegionIndex, Num
+    DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
     compose_slice, get_region_shape, range_unpack, get_strides
 
@@ -57,15 +57,15 @@ class InMemoryTensorLoader(DataLoaderBase):
         )
 
     @functools.cache
-    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         amin, amax = self.tensor[index].aminmax()
         return amin.item(), amax.item()
 
     @functools.cache
-    def count_unique(self, index: RegionIndex) -> int:
+    def count_unique(self, index: NormalizedSlice) -> int:
         return self.tensor[index].unique().shape[0]
 
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         return self.tensor[index].clone()
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
@@ -178,7 +178,7 @@ class H5DataLoader(DataLoaderBase):
     
 
     def _load_by_chunk(
-        self, region: Sequence[RegionIndex]
+        self, region: Sequence[NormalizedSlice]
     ) -> Iterator[torch.Tensor]:
         """
         Only callable on rank-0.
@@ -223,7 +223,7 @@ class H5DataLoader(DataLoaderBase):
 
 
     @functools.cache
-    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
@@ -252,7 +252,7 @@ class H5DataLoader(DataLoaderBase):
         return amin, amax
 
     @functools.cache
-    def count_unique(self, index: RegionIndex) -> int:
+    def count_unique(self, index: NormalizedSlice) -> int:
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
@@ -304,7 +304,7 @@ class H5DataLoader(DataLoaderBase):
         return nunique
 
 
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
 
@@ -314,7 +314,7 @@ class H5DataLoader(DataLoaderBase):
         # simply call dist.scatter.
         # Instead, we load the part for each rank once, and do P2P.
         if rank == 0:
-            idx_world: List[RegionIndex]
+            idx_world: List[NormalizedSlice]
 
             with self._dataset_as_dtype() as d:
                 for w in range(1, dist_env.world_size):
@@ -485,7 +485,7 @@ class FulledTensorLoader(DataLoaderBase):
         return torch.full(
             shape, self.value, dtype=self.dtype, device=device)  # type: ignore
 
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         shape = get_region_shape(self.shape, [index])
         return self._full(shape, 'cpu')
 
@@ -559,7 +559,7 @@ class ArangeTensorLoader(DataLoaderBase):
             [self._start, self._end, self._step]
         )
 
-    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         s = compose_slice(slice(self._start, self._end, self._step), index)
         l = len(range(*range_unpack(s)))
         if s.step > 0:
@@ -567,7 +567,7 @@ class ArangeTensorLoader(DataLoaderBase):
         else:
             return s.start + l * s.step, s.start
 
-    def count_unique(self, index: RegionIndex) -> int:
+    def count_unique(self, index: NormalizedSlice) -> int:
         s = compose_slice(slice(self._start, self._end, self._step), index)
         l = len(range(*range_unpack(s)))
         return l

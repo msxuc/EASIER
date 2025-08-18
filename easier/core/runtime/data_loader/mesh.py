@@ -16,7 +16,7 @@ import sympy
 import torch
 
 from easier.core.runtime.data_loader.base import \
-    DataLoaderBase, RegionIndex, Num
+    DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.factories import \
     ArangeTensorLoader, FulledTensorLoader
 from easier.core.runtime.data_loader.ops import \

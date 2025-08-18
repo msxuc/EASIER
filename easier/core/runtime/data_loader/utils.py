@@ -50,10 +50,10 @@ class NormalizedSlice:
             raise ValueError("NormalizedSlice.count must be >= 0")
         
         if self.step > 0:
-            if not (self.start + self.count + self.step < self.dimlen):
+            if not (self.start + self.count * self.step < self.dimlen):
                 raise ValueError("NormalizedSlice is out of range")
         else:
-            if not (self.start + self.count + self.step >= 0):
+            if not (self.start + self.count * self.step >= 0):
                 raise ValueError("NormalizedSlice is out of range")
 
 
@@ -67,8 +67,16 @@ class NormalizedSlice:
         return NormalizedSlice(length, start, step, count)
             
     def to_slice(self) -> slice:
+        """
+        The resultant slice is only applicable to a sequence with
+        length exactly equals `self.dimlen`.
+        """
         stop = self.start + self.step * self.count
         if self.step < 0 and stop < 0:
+            # this mean item at 0 should be included, but the stop cannot be
+            # simply (-1) -- this would mean the last item, given the semantics
+            # of slice -- the true value should be (-length-1), but None is
+            # equivalent given the negative step.
             stop = None
         return slice(self.start, stop, self.step)
     

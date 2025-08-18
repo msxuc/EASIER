@@ -8,6 +8,8 @@ import copy
 
 import torch
 
+from easier.core.runtime.data_loader.utils import \
+    NormalizedSlice
 from easier.core.runtime.dist_env import \
     get_default_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -18,26 +20,6 @@ ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
 
 Num: TypeAlias = Union[int, float, bool]
 
-
-"""
-NOTE About `slice`, `range`:
--   slice
-    slice object is a relative, non-normalized 
-"""
-
-# NOTE In internal subprocedures, when RegionIndex is declared,
-# all slice objects in it should:
-# - not have negative start/stop values, i.e. must be # zero-based
-#   (step can still be negative)
-# - not be out-of-range.
-#   Although Python standard behavior is that the indexing operation will
-#   simply ignore the out-of-range part, because EASIER may compose multiple
-#   layers slices for nested DataLoaders, we need to ensure each layer is in
-#   right region without materializing the tensor like PyTorch eager-mode.
-RegionIndex: TypeAlias = slice
-# TODO RegionIndex: TypeAlias = Union[
-#     slice, None,
-# ]
 
 GeneralIndex: TypeAlias = Union[
     int, slice, EllipsisType, # TODO None, torch.Tensor,
@@ -62,7 +44,7 @@ def _wrap_function(pre_hook, post_hook, func):
 A quick template for derived DataLoader classes.
 ```
 class DerivedDataLoader(DataLoaderBase):
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         raise NotImplementedError()
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
@@ -74,9 +56,9 @@ class DerivedDataLoader(DataLoaderBase):
     # overridable:
     def collective_init(self) -> None:
         return super().collective_init()
-    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         return super().minmax(index)
-    def count_unique(self, index: RegionIndex) -> int:
+    def count_unique(self, index: NormalizedSlice) -> int:
         return super().count_unique(index)
 ```
 """
@@ -178,7 +160,7 @@ class DataLoaderBase:
             repr(self)
         )
 
-    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         """
         Get minimum and maximum value within the `index` range along dim-0
         of the data source.
@@ -187,12 +169,12 @@ class DataLoaderBase:
 
         Remarks:
         -   The methods minmax()/count_unique() in derived DataLoaders
-            should handle the calculation for RegionIndex-on-dim-0 cases only.
+            should handle the calculation for NormalizedSlice-on-dim-0 cases only.
             Such cases are most common, because minmax()/count_unique() are
             used by analysis and validation for Selector/Reducer.idx,
             and their idx is always 1-d.
 
-        -   For cases that RegionIndex-on-dim-0 assumption no longer holds,
+        -   For cases that NormalizedSlice-on-dim-0 assumption no longer holds,
             callers should load the data by themselves and call
             torch.aminmax() etc. to calcuate the result in the precise region.
 
@@ -201,6 +183,10 @@ class DataLoaderBase:
                 totally.
             -   ReshapeDataLoader receives dim-0 index (may be from outside
                 StridedDataLoader) and inner dim-0&1 are flattened.
+        
+        TODO make all NormalizedSlice to Sequence[NormalizedSlice], then it's
+        possible to partially load if some k-dim is extremely long --
+        especially when Reshape-/Transpose-DataLoader are added.
         """
         # Default implementation:
         min_tensor, max_tensor = self.partially_load_by_range(index).aminmax()
@@ -208,24 +194,7 @@ class DataLoaderBase:
         amax = max_tensor.item()
         return amin, amax
     
-    def _assert_slice_in_range_and_positive_values(self, slc: slice):
-        # All layers in nested DataLoaders must ensure `index` is
-        # in-range and positive-value.
-        assert isinstance(slc, slice)
-        dimlen = self.shape[0]
-        assert 0 <= slc.start < dimlen
-        assert 0 <= slc.stop <= dimlen
-
-        if slc.step > 0:
-            assert 0 <= slc.stop < dimlen + slc.step
-        else:
-            assert slc.step < slc.start < dimlen
-    
-    def _pre_minmax(self, index):
-
-        self._assert_slice_in_range_and_positive_values(index)
-    
-    def count_unique(self, index: RegionIndex) -> int:
+    def count_unique(self, index: NormalizedSlice) -> int:
         """
         Count unique elements in the exact `region` range of data source.
         
@@ -236,9 +205,6 @@ class DataLoaderBase:
         # Default implementation:
         _, c = self.partially_load_by_range(index).unique(return_counts=True)
         return c
-
-    def _pre_count_unique(self, index):
-        self._assert_slice_in_range_and_positive_values(index)
 
     def to(
         self,
@@ -267,20 +233,19 @@ class DataLoaderBase:
         ndim = len(self.shape)
         if len(index) > ndim:
             # TODO such cases may be valid if index None is allowed.
-            raise IndexError("Too many indices")
+            raise IndexError(
+                f"Too many indices for input with ndim=={ndim}"
+            )
 
-        view_indices: List[Union[int, slice]] = []
+        # As long as `i, idx in enum(index)` is not out-of-range,
+        # we can let StridedDataLoader.__init__ to validate each index.
+        view_indices: List[Union[int, NormalizedSlice]] = []
         for i, idx in enumerate(index):
             dimlen = self.shape[i]
             if isinstance(idx, int):
                 normalized_idx = idx
                 if idx < 0:
                     normalized_idx = dimlen + idx
-                if not (0 <= idx and idx < dimlen):
-                    raise IndexError(
-                        f"Index {idx} is out-of-range for dimension {i}"
-                        f" with length {dimlen}"
-                    )
                 view_indices.append(normalized_idx)
 
             elif isinstance(idx, slice):
@@ -301,7 +266,7 @@ class DataLoaderBase:
         return StridedDataLoader(self, view_indices)
 
 
-    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         """
         Collectively load a part of the target dataset with the
         specified region.
@@ -311,9 +276,8 @@ class DataLoaderBase:
         values regarding the callee DataLoader.
             
         Args:
-        -   index: SimpleIndex
+        -   index: NormalizedSlice
             Currently on dim-0 only
-            TODO enforced on all DataLoader layers, change to Seq[SimpleIndex]
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
@@ -321,7 +285,7 @@ class DataLoaderBase:
         raise NotImplementedError()
 
 
-    def _pre_partially_load_by_range(self, index: RegionIndex):
+    def _pre_partially_load_by_range(self, index: NormalizedSlice):
         self._assert_slice_in_range_and_positive_values(index)
 
     def _post_partially_load_by_range(self, res):
@@ -338,7 +302,6 @@ class DataLoaderBase:
         Args:
         - index: should always be on CPU
             Currently only 1-d and on dim-0 only
-            TODO enforced on all DataLoader layers, may be more flexible
 
         Returns:
         - torch.Tensor: the loaded part, always on CPU
