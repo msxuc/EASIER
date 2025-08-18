@@ -16,13 +16,13 @@ import sympy
 import torch
 
 from easier.core.runtime.data_loader.base import \
-    DataLoaderBase, SimpleIndex, Num
+    DataLoaderBase, RegionIndex, Num
 from easier.core.runtime.data_loader.factories import \
     ArangeTensorLoader, FulledTensorLoader
 from easier.core.runtime.data_loader.ops import \
     CartesianProductDataLoader, StridedDataLoader, ConcatDataLoader
 from easier.core.runtime.data_loader.utils import \
-    get_offset_exactly_nparts, get_strides
+    get_strides
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
@@ -244,8 +244,6 @@ class MeshOneDimInteriorFaceIdxDataLoader(DataLoaderBase):
         device: Union[torch.device, str] = 'cpu'
     ):
         super().__init__()
-
-        assert interior_facets.form == 'flatten'
 
         self.ndim = len(self.interior_facets.components)
         assert len(interior_facets.shape) == self.ndim + 1

@@ -1,143 +1,120 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Sequence, Tuple, Union, cast, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import _T, List, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING
 
 import sympy
 import torch
 
-if TYPE_CHECKING:
-    # avoid circular imports
-    from easier.core.runtime.data_loader.base import \
-        SimpleIndex, GeneralIndex
+_TRange = TypeVar('_TRange', range, sympy.Range)
 
-def range_unpack(s: Union[slice, range, sympy.Range]) -> Tuple[int, int, int]:
+
+@dataclass
+class NormalizedSlice:
     """
-    Usage:
-    ```
-    range(*range_unpack(some_slice))
-    ```
+    Python slice objects are relative and non-normalized descriptions,
+    which are tricky to deal with in a nested manner.
 
-    `range` is good at `len(range()), list(range())`;
-    `slice` is good at `slice.indices()` to trim lower/upperbound regarding
-    the dimension length.
+    A NormalizedSlice is essentially a slice plus the length it's applied on.
 
-    NOTE Do not do `slice(*range)` directly, as `range.__iter__` generate the
-    whole list of its points.
+    Additionally, we convert the representation from a [close,open) interval
+    to start/count/step so that all fields are positive ints.
+
+    P.S. slice objects are known to:
+    -   have its `.start/.stop` be
+        negative (indexed backwards on some length that's not-seen-yet)
+        or None (along the direction of `.step` till the last element)
+    -   good for Tensor/HDF5 indexing -- PyTorch/h5py won't treat a `slice` as
+        a list of ints, but a `range` will become a list.
     """
-    return s.start, s.stop, s.step
+    dimlen: int
 
+    # strictly in [0, dimlen)
+    start: int
+    # positive or negative, cannot be 0
+    step: int
+    # always >= 0
+    count: int
 
-def simplify_indices(
-    shape: Tuple[int, ...],
-    general_indices: Sequence[GeneralIndex]
-) -> Sequence[SimpleIndex]:
-    """
-    The standard behavior of Python and PyTorch for out-of-range slicing
-    is to ignore the out-of-range parts.
-    But for int-indexing, we need to check it's in-range.
-    """
-    ndim = len(shape)
-    if len(general_indices) > ndim:
-        # TODO such cases may be valid if index None is allowed.
-        raise IndexError("Too many indices")
-
-    slices: List[slice] = []
-    for i, idx in enumerate(general_indices):
-        dimlen = shape[i]
-        if isinstance(idx, int):
-            norm_idx = idx
-            if idx < 0:
-                norm_idx = dimlen + idx
-            if not (0 <= idx and idx < dimlen):
-                raise IndexError(
-                    f"Index {idx} is out-of-range for dimension {i}"
-                    f" with length {dimlen}"
-                )
-            slices.append(slice(norm_idx, norm_idx + 1))
-        elif isinstance(idx, slice):
-            # effectively trim the slice regarding the real length,
-            # this is required by and in internal subprocedures
-            norm_slice = slice(*idx.indices(dimlen))
-            slices.append(norm_slice)
-        elif idx is Ellipsis:
-            norm_slice = slice(0, dimlen)
-            slices.append(norm_slice)
+    def __post_init__(self):
+        for k, v in self.__dict__.items():
+            raise TypeError(f"NormalizedSlice.{k} must be int")
+        if not (self.dimlen >= 0):
+            raise ValueError("NormalizedSlice.dimlen must be >= 0")
+        if not (0 <= self.start < self.dimlen):
+            raise ValueError("NormalizedSlice.start must in [0, dimlen)")
+        if self.step == 0:
+            raise ValueError("NormalizedSlice.step must be != 0")
+        if not (self.count >= 0):
+            raise ValueError("NormalizedSlice.count must be >= 0")
+        
+        if self.step > 0:
+            if not (self.start + self.count + self.step < self.dimlen):
+                raise ValueError("NormalizedSlice is out of range")
         else:
-            # TODO support idx==None
-            raise IndexError(f"Unexpect index {idx}")
+            if not (self.start + self.count + self.step >= 0):
+                raise ValueError("NormalizedSlice is out of range")
+
+
+    def __len__(self):
+        return self.count
     
-    return slices
+    @staticmethod
+    def from_slice(length: int, s: slice) -> 'NormalizedSlice':
+        start, stop, step = s.indices(length)
+        count = len(range(start, stop, step))
+        return NormalizedSlice(length, start, step, count)
+            
+    def to_slice(self) -> slice:
+        stop = self.start + self.step * self.count
+        if self.step < 0 and stop < 0:
+            stop = None
+        return slice(self.start, stop, self.step)
+    
+    def to_range(self, range_cls: Type[_TRange]=range) -> _TRange:
+        stop = self.start + self.step * self.count
+        return range_cls(self.start, stop, self.step)
+    
+    def compose(self, next: 'NormalizedSlice') -> 'NormalizedSlice':
+        if not (next.dimlen == self.count):
+            raise ValueError(
+                'Derived DataLoader methods should maintain the alignment of'
+                ' shapes during the composition of DataLoaders'
+            )
+        
+        new_start = self.start + next.start * self.step
+        new_step = self.step * next.step
+        new_count = next.count
+        return NormalizedSlice(self.dimlen, new_start, new_step, new_count)
 
 
 def get_overlapping_slice(
-    region: Union[slice, range], selection: slice
-) -> slice:
+    region: NormalizedSlice, selection: NormalizedSlice
+) -> NormalizedSlice:
     """
-    Start/stop of both input slices must be converted to non-negative ints.
-
     The result will have the same step sign as `selection`,
     i.e. the direction in `region` is ignored.
     """
-    assert all(v >= 0 for v in [
-        region.start, region.stop, selection.start, selection.stop
-    ])
-    r_region = sympy.Range(*range_unpack(region))
-    r_s = sympy.Range(*range_unpack(selection))
-    r_overlap = cast(sympy.Range, r_region.intersect(r_s))
+    assert region.dimlen == selection.dimlen
+
+    r_region = region.to_range(sympy.Range)
+    r_sel = selection.to_range(sympy.Range)
+    r_overlap = cast(sympy.Range, r_region.intersect(r_sel))
 
     if len(r_overlap) == 0:
         assert isinstance(r_overlap, sympy.EmptySet)
-        return slice(0, 0)
+        return NormalizedSlice(region.dimlen, 0, selection.step, 0)
 
     # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
     # so we need to reverse it if s.step < 0
     if selection.step < 0:
         r_overlap = r_overlap.reversed
     
-    return slice(*range_unpack(r_overlap))
+    return NormalizedSlice(
+        region.dimlen, r_overlap.start, selection.step, len(r_overlap)
+    )
 
-
-def compose_slice(s1: slice, s2: slice) -> slice:
-    """
-    v[s1][s2] == v[compose_slice(s1, s2)].
-
-    Remarks:
-    -   s1, s2 and the result slice must not have negative start/stop
-        (but step can be negative)
-    -   s1, s2 and the result slice can be out-of-range
-        (out-of-range part will be simply ignored by the indexing operation,
-        this is the common Python behavior)
-    """
-    assert all(v >= 0 for v in [
-        s1.start, s1.stop, s2.start, s2.stop
-    ])
-
-    s2_len = len(range(*range_unpack(s2)))
-
-    ret_start = s1.start + s2.start * s1.step
-    ret_step = s2.step * s1.step
-    # As abs(ret_step) >> abs(s1.step), the upperbound value -- ret_stop --
-    # may be beyond the s1.stop, but it's OK since the upperbound is exclusive.
-    ret_stop = ret_start + (ret_step + 1) * s2_len
-
-    ret = slice(ret_start, ret_stop, ret_step)
-
-    assert len(range(*range_unpack(ret))) <= len(range(*range_unpack(s1))), \
-        "every internal subprocedure should trim slices to be in-range," \
-        " so composed slices should never have extra parts"
-    return ret
-
-def get_region_shape(shape: Tuple[int, ...], region: Sequence[slice]) -> Tuple[int, ...]:
-    ret = []
-    for i, dimlen in enumerate(shape):
-        if i < len(region):
-            s = region[i]
-            size = len(range(*s.indices(dimlen)))
-        else:
-            size = dimlen
-        ret.append(size)
-    return tuple(ret)
 
 
 def get_strides(shape: Sequence[int]) -> torch.Tensor:

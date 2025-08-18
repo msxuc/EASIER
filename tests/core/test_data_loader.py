@@ -9,13 +9,25 @@ import h5py
 import tempfile
 import os
 
-from easier.core.runtime.data_loader.data_loader import \
+from easier.core.runtime.data_loader.factories import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
     ArangeTensorLoader
+from easier.core.runtime.data_loader.utils import \
+    NormalizedSlice
 
 from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2
 from easier.core.utils import get_random_str
 
+
+class TestNormalizedSlice:
+    def test_from_slice(self):
+        length, start, stop, step = 1, 1, 1, 1
+        ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
+        assert ns == NormalizedSlice(length, 1, 1, 1)
+        assert ns.to_slice == slice(start, stop, step)
+        
+
+    
 
 def get_in_memory_tensor_loader(
     dtype: torch.dtype, device_type: Literal['cpu', 'cuda']

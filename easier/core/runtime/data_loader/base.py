@@ -19,12 +19,13 @@ ATTRIBUTE_PLACEHOLDER = "easier_placeholder"
 Num: TypeAlias = Union[int, float, bool]
 
 
-# Python __getitem__ protocol only support one index parameter, and require
-# caller to wrap multiple arugments in a tuple (only tuple, not list).
-# Given a value of such a Union type, we can directly pass it into
-# Tensor.__getitem__ etc. without extra unpacking like `*args`.
-#
-# NOTE In internal subprocedures, when Seq[SimpleIndex] is declared,
+"""
+NOTE About `slice`, `range`:
+-   slice
+    slice object is a relative, non-normalized 
+"""
+
+# NOTE In internal subprocedures, when RegionIndex is declared,
 # all slice objects in it should:
 # - not have negative start/stop values, i.e. must be # zero-based
 #   (step can still be negative)
@@ -33,8 +34,8 @@ Num: TypeAlias = Union[int, float, bool]
 #   simply ignore the out-of-range part, because EASIER may compose multiple
 #   layers slices for nested DataLoaders, we need to ensure each layer is in
 #   right region without materializing the tensor like PyTorch eager-mode.
-SimpleIndex: TypeAlias = slice
-# TODO SimpleIndex: TypeAlias = Union[
+RegionIndex: TypeAlias = slice
+# TODO RegionIndex: TypeAlias = Union[
 #     slice, None,
 # ]
 
@@ -61,22 +62,22 @@ def _wrap_function(pre_hook, post_hook, func):
 A quick template for derived DataLoader classes.
 ```
 class DerivedDataLoader(DataLoaderBase):
-    def collective_init(self) -> None:
-        raise NotImplementedError()
-    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
-        raise NotImplementedError()
-    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
-        raise NotImplementedError()
-    def partially_load_by_range(self, index: SimpleIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
         raise NotImplementedError()
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
-    def fully_load(
-        self, device: torch.device], replicated: bool
-    ) -> torch.Tensor:
+    def fully_load(self, device: torch.device, replicated) -> torch.Tensor:
         raise NotImplementedError()
     def __repr__(self) -> str:
         raise NotImplementedError()
+    
+    # overridable:
+    def collective_init(self) -> None:
+        return super().collective_init()
+    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
+        return super().minmax(index)
+    def count_unique(self, index: RegionIndex) -> int:
+        return super().count_unique(index)
 ```
 """
 
@@ -170,41 +171,74 @@ class DataLoaderBase:
         to first ensure the data loders among workers are
         actually referring to the same data set i.e. of the same type.
         """
-        raise NotImplementedError()
+        # Default implementation:
+        self.coll_check_dtype_shape_devicetype()
+        check_collective_equality(
+            f"Representation of {self.easier_hint_name}",
+            repr(self)
+        )
 
-    def minmax(self, region: Sequence[SimpleIndex]) -> Tuple[Num, Num]:
+    def minmax(self, index: RegionIndex) -> Tuple[Num, Num]:
         """
-        Get minimum and maximum value within the `region` range of data source.
+        Get minimum and maximum value within the `index` range along dim-0
+        of the data source.
+        
+        `index` is not necessarily the same on all ranks.
 
-        `region` should be same on all ranks.
+        Remarks:
+        -   The methods minmax()/count_unique() in derived DataLoaders
+            should handle the calculation for RegionIndex-on-dim-0 cases only.
+            Such cases are most common, because minmax()/count_unique() are
+            used by analysis and validation for Selector/Reducer.idx,
+            and their idx is always 1-d.
 
-        TODO minmax() and count_unique() both accept *simple* index as range,
-        i.e. tensor-typed index is not allowed.
-        This indicates we may need to reimplement minmax()/count_unique() on a
-        very detailed, tensor-indexed region if we provides such DataLoaders.
-        TODO the critical point is for minmax/count_unique we must precisely
-        specify the region, that's why we need it to be Seq[Index] rather than
-        a single, dim-0 index.
-        TODO however, even Seq[Index] may not suffice, then we have to fallback
-        to load-all-then-filter-then-minmax approach.
+        -   For cases that RegionIndex-on-dim-0 assumption no longer holds,
+            callers should load the data by themselves and call
+            torch.aminmax() etc. to calcuate the result in the precise region.
+
+            Some examples when this API is not suitable:
+            -   StridedDataLoader indexes by an int on dim-0, discarding dim-0
+                totally.
+            -   ReshapeDataLoader receives dim-0 index (may be from outside
+                StridedDataLoader) and inner dim-0&1 are flattened.
         """
-        raise NotImplementedError()
+        # Default implementation:
+        min_tensor, max_tensor = self.partially_load_by_range(index).aminmax()
+        amin = min_tensor.item()
+        amax = max_tensor.item()
+        return amin, amax
     
-    def _pre_minmax(self, region):
-        check_collective_equality('minmax region', region)
+    def _assert_slice_in_range_and_positive_values(self, slc: slice):
+        # All layers in nested DataLoaders must ensure `index` is
+        # in-range and positive-value.
+        assert isinstance(slc, slice)
+        dimlen = self.shape[0]
+        assert 0 <= slc.start < dimlen
+        assert 0 <= slc.stop <= dimlen
 
-    def count_unique(self, region: Sequence[SimpleIndex]) -> int:
+        if slc.step > 0:
+            assert 0 <= slc.stop < dimlen + slc.step
+        else:
+            assert slc.step < slc.start < dimlen
+    
+    def _pre_minmax(self, index):
+
+        self._assert_slice_in_range_and_positive_values(index)
+    
+    def count_unique(self, index: RegionIndex) -> int:
         """
         Count unique elements in the exact `region` range of data source.
         
-        `region` should be same on all ranks.
+        `index` is not necessarily the same on all ranks.
 
         Used by Reducer.set_fullness()
         """
-        raise NotImplementedError()
+        # Default implementation:
+        _, c = self.partially_load_by_range(index).unique(return_counts=True)
+        return c
 
-    def _pre_count_unique(self, region):
-        check_collective_equality('count_unique region', region)
+    def _pre_count_unique(self, index):
+        self._assert_slice_in_range_and_positive_values(index)
 
     def to(
         self,
@@ -225,23 +259,56 @@ class DataLoaderBase:
     def __getitem__(
         self, index: Union[GeneralIndex, Tuple[GeneralIndex, ...]]
     ) -> 'DataLoaderBase':
-        from easier.core.runtime.data_loader.utils import simplify_indices
         from easier.core.runtime.data_loader.ops import StridedDataLoader
 
         if not isinstance(index, tuple):
             index = (index,)
 
-        simple_indices = simplify_indices(self.shape, index)
+        ndim = len(self.shape)
+        if len(index) > ndim:
+            # TODO such cases may be valid if index None is allowed.
+            raise IndexError("Too many indices")
+
+        view_indices: List[Union[int, slice]] = []
+        for i, idx in enumerate(index):
+            dimlen = self.shape[i]
+            if isinstance(idx, int):
+                normalized_idx = idx
+                if idx < 0:
+                    normalized_idx = dimlen + idx
+                if not (0 <= idx and idx < dimlen):
+                    raise IndexError(
+                        f"Index {idx} is out-of-range for dimension {i}"
+                        f" with length {dimlen}"
+                    )
+                view_indices.append(normalized_idx)
+
+            elif isinstance(idx, slice):
+                # effectively trim the slice regarding the real length,
+                # this is required by and in internal subprocedures
+                normalized_slice = slice(*idx.indices(dimlen))
+                view_indices.append(normalized_slice)
+
+            elif idx is Ellipsis:
+                normalized_slice = slice(0, dimlen)
+                view_indices.append(normalized_slice)
+
+            else:
+                # TODO support idx==None
+                raise IndexError(f"Unexpect index {idx}")
         
         # TODO certain DataLoader stack can be reduced and simplified
-        return StridedDataLoader(self, simple_indices)
+        return StridedDataLoader(self, view_indices)
 
 
-    def partially_load_by_range(self, index: SimpleIndex) -> torch.Tensor:
+    def partially_load_by_range(self, index: RegionIndex) -> torch.Tensor:
         """
         Collectively load a part of the target dataset with the
-        specified index tensor.
-        Each rank provides its own `region` and it's different from others'.
+        specified region.
+        Each rank provides its own `index` and it's different from others'.
+
+        Callers should make the argument `index` have in-range, positive-int
+        values regarding the callee DataLoader.
             
         Args:
         -   index: SimpleIndex
@@ -254,24 +321,12 @@ class DataLoaderBase:
         raise NotImplementedError()
 
 
-    def _pre_partially_load_by_range(self, region):
-        # All layers in nested DataLoaders must ensure the region is not
-        # out-of-range.
-        for i, idx in enumerate(region):
-            dimlen = self.shape[i]
-            if isinstance(idx, int):
-                assert 0 <= idx and idx < dimlen
-            elif isinstance(idx, slice):
-                start, stop, step = idx.indices(dimlen)
-                assert 0 <= start < dimlen
-                assert 0 <= stop < dimlen
-            else:
-                assert False, f'Unexpected idx {idx}'
+    def _pre_partially_load_by_range(self, index: RegionIndex):
+        self._assert_slice_in_range_and_positive_values(index)
 
     def _post_partially_load_by_range(self, res):
         assert res.device.type == 'cpu'
         return res
-
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         """
