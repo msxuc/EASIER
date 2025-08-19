@@ -9,25 +9,183 @@ import h5py
 import tempfile
 import os
 
+import easier
 from easier.core.runtime.data_loader.factories import \
-    DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledTensorLoader, \
-    ArangeTensorLoader
+    DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledDataLoader, \
+    ArangeDataLoader
+from easier.core.runtime.data_loader.ops import ConcatDataLoader
 from easier.core.runtime.data_loader.utils import \
-    NormalizedSlice
+    NormalizedSlice, get_overlapping_slice
 
 from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2
 from easier.core.utils import get_random_str
 
+def vec(*vs, dtype=torch.int64):
+    return torch.tensor(vs, dtype=dtype)
+
 
 class TestNormalizedSlice:
-    def test_from_slice(self):
-        length, start, stop, step = 1, 1, 1, 1
+    def test_from_to_slice(self):
+        length, start, stop, step = 1, 0, 0, 1
         ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
-        assert ns == NormalizedSlice(length, 1, 1, 1)
-        assert ns.to_slice == slice(start, stop, step)
-        
+        assert ns == NormalizedSlice(length, 0, 1, 0)
+        assert ns.to_slice() == slice(0, 0, 1)
 
+        length, start, stop, step = 10, 0, -3, 2
+        ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
+        assert ns == NormalizedSlice(length, 0, 2, 4)
+        assert ns.to_slice() == slice(0, 8, 2)
+        
+        length, start, stop, step = 10, -1, 2, -2
+        ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
+        assert ns == NormalizedSlice(length, 9, -2, 4)
+        assert ns.to_slice() == slice(9, 1, -2)
+
+        length, start, stop, step = 10, -1, -20, -2
+        ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
+        assert ns == NormalizedSlice(length, 9, -2, 5)
+        assert ns.to_slice() == slice(9, None, -2)
+
+        length, start, stop, step = 10, -2, -20, -2
+        ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
+        assert ns == NormalizedSlice(length, 8, -2, 5)
+        assert ns.to_slice() == slice(8, None, -2)
     
+    def test_compose(self):
+        ns1 = NormalizedSlice(20, 1, 2, 7)
+
+        with pytest.raises(ValueError, match='maintain.*shapes'):
+            ns1.compose(ns1)
+        
+        assert ns1.compose(
+            NormalizedSlice(7, 1, 2, 3)
+        ) == NormalizedSlice(20, 3, 4, 3)
+    
+        assert ns1.compose(
+            NormalizedSlice(7, 6, -3, 2)
+        ) == NormalizedSlice(20, 13, -6, 2)
+
+
+        ns2 = NormalizedSlice(20, 18, -3, 6)
+        
+        assert ns2.compose(
+            NormalizedSlice(6, 1, 2, 3)
+        ) == NormalizedSlice(20, 15, -6, 3)
+        
+        assert ns2.compose(
+            NormalizedSlice(6, 5, -1, 4)
+        ) == NormalizedSlice(20, 3, 3, 4)
+    
+    def test_overlap_region_directionless(self):
+        regions = [
+            NormalizedSlice(100, 0, 1, 100),
+            NormalizedSlice(100, 99, -1, 100),
+        ]
+        selections = [
+            NormalizedSlice(100, 22, 5, 8),
+            NormalizedSlice(100, 88, -5, 8),
+        ]
+
+        for r in regions:
+            for s in selections:
+                assert get_overlapping_slice(r, s) == s
+    
+    def test_overlap(self):
+        assert get_overlapping_slice(
+            NormalizedSlice(100, 7, 3, 30), NormalizedSlice(100, 11, 5, 15)
+        ) == NormalizedSlice(100, 16, 15, 5)
+
+        assert get_overlapping_slice(
+            NormalizedSlice(100, 7, 3, 30), NormalizedSlice(100, 97, -4, 20)
+        ) == NormalizedSlice(100, 85, -12, 6)
+
+
+
+class TestConcatDataLoader:
+    def test_ascend(self):
+        cdl = ConcatDataLoader([
+            easier.arange(0, 20),
+            easier.arange(50, 80),
+            easier.arange(100, 150),
+        ])
+        class _Ascend:
+            def __init__(self) -> None:
+                self.call = 0
+            def __call__(self, comp, concat_overlap, comp_overlap):
+                assert isinstance(comp, ArangeDataLoader)
+                if self.call == 0:
+                    assert comp._start == 0
+                    assert concat_overlap == NormalizedSlice(100, 7, 3, 5)
+                    assert comp_overlap == NormalizedSlice(20, 7, 3, 5)
+                elif self.call == 1:
+                    assert comp._start == 50
+                    assert concat_overlap == NormalizedSlice(100, 22, 3, 10)
+                    assert comp_overlap == NormalizedSlice(30, 2, 3, 10)
+                elif self.call == 2:
+                    assert comp._start == 100
+                    assert concat_overlap == NormalizedSlice(100, 52, 3, 15)
+                    assert comp_overlap == NormalizedSlice(50, 2, 3, 15)
+                else:
+                    assert False
+                self.call += 1
+        ns = NormalizedSlice(100, 7, 3, 30)
+        cdl._foreach_component(ns, _Ascend())
+
+        assert torch.equal(
+            torch.concat([
+                torch.arange(7, 20, 3),
+                torch.arange(52, 80, 3),
+                torch.arange(102, 145, 3),
+            ]),
+            cdl.partially_load_by_range(ns)
+        )
+
+        assert torch.equal(
+            vec(10, 13, 60, 70, 120, 130),
+            cdl.partially_load_by_index(vec(10, 13, 30, 40, 70, 80))
+        )
+
+        assert torch.equal(
+            vec(10, 13, 60, 70, 120, 130).flip(0),
+            cdl.partially_load_by_index(vec(10, 13, 30, 40, 70, 80).flip(0))
+        )
+
+    def test_descend(self):
+        cdl = ConcatDataLoader([
+            easier.arange(0, 20),
+            easier.arange(50, 80),
+            easier.arange(100, 150),
+        ])
+        class _Descend:
+            def __init__(self) -> None:
+                self.call = 0
+            def __call__(self, comp, concat_overlap, comp_overlap):
+                if self.call == 0:
+                    assert comp._start == 100
+                    assert concat_overlap == NormalizedSlice(100, 91, -3, 14)
+                    assert comp_overlap == NormalizedSlice(50, 41, -3, 14)
+                elif self.call == 1:
+                    assert comp._start == 50
+                    assert concat_overlap == NormalizedSlice(100, 49, -3, 10)
+                    assert comp_overlap == NormalizedSlice(30, 29, -3, 10)
+                elif self.call == 2:
+                    assert comp._start == 0
+                    assert concat_overlap == NormalizedSlice(100, 19, -3, 6)
+                    assert comp_overlap == NormalizedSlice(20, 19, -3, 6)
+                else:
+                    assert False
+                self.call += 1
+        ns = NormalizedSlice(100, 91, -3, 30)
+        cdl._foreach_component(ns, _Descend())
+
+        assert torch.equal(
+            torch.concat([
+                torch.arange(141, 101, -3),
+                torch.arange(79, 50, -3),
+                torch.arange(19, 3, -3),
+            ]),
+            cdl.partially_load_by_range(ns)
+        )
 
 def get_in_memory_tensor_loader(
     dtype: torch.dtype, device_type: Literal['cpu', 'cuda']
@@ -107,7 +265,7 @@ def worker__test_fully_load(
     v = torch.arange(17) * 3 + 1
     v = v.to(final_device)
 
-    tensor = dl.fully_load(final_device, replicated: bool)
+    tensor = dl.fully_load(final_device, replicated)
     assert tensor.dtype == dtype
     if final_device_type == 'cpu':
         assert tensor.device.type == 'cpu'
@@ -205,7 +363,7 @@ class TestDataLoader:
 
 def worker__test_load_full_by_rank(local_rank: int, world_size: int,
                                    dtype: torch.dtype, device_type: str):
-    dl = FulledTensorLoader(
+    dl = FulledDataLoader(
         42, shape=[17, 2], dtype=dtype, device=torch.device(device_type))
     assert dl.dtype == dtype
     assert dl.device.type == device_type
@@ -225,7 +383,7 @@ def worker__test_load_full_by_rank(local_rank: int, world_size: int,
 def worker__test_load_full_by_index(local_rank: int, world_size: int,
                                     dtype: torch.dtype, device_type: str):
 
-    dl = FulledTensorLoader(
+    dl = FulledDataLoader(
         42, shape=[17, 2], dtype=dtype, device=torch.device(device_type))
     assert dl.dtype == dtype
     assert dl.device.type == device_type
@@ -261,7 +419,7 @@ class TestFulledLoader:
 
 def worker__test_load_arange_by_rank(local_rank: int, world_size: int,
                                      dtype: torch.dtype, device_type: str):
-    dl = ArangeTensorLoader(0, 34, 2,
+    dl = ArangeDataLoader(0, 34, 2,
                             dtype=dtype, device=torch.device(device_type))
     assert dl.dtype == dtype
     assert dl.device.type == device_type
@@ -281,7 +439,7 @@ def worker__test_load_arange_by_rank(local_rank: int, world_size: int,
 def worker__test_load_arange_by_index(local_rank: int, world_size: int,
                                       dtype: torch.dtype, device_type: str):
 
-    dl = ArangeTensorLoader(0, 34, 2,
+    dl = ArangeDataLoader(0, 34, 2,
                             dtype=dtype, device=torch.device(device_type))
     assert dl.dtype == dtype
     assert dl.device.type == device_type

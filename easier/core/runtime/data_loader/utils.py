@@ -2,12 +2,10 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from typing import _T, List, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING
+from typing import List, Literal, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING, overload
 
 import sympy
 import torch
-
-_TRange = TypeVar('_TRange', range, sympy.Range)
 
 
 @dataclass
@@ -39,7 +37,9 @@ class NormalizedSlice:
 
     def __post_init__(self):
         for k, v in self.__dict__.items():
-            raise TypeError(f"NormalizedSlice.{k} must be int")
+            if not isinstance(v, int):
+                raise TypeError(f"NormalizedSlice.{k} must be int")
+
         if not (self.dimlen >= 0):
             raise ValueError("NormalizedSlice.dimlen must be >= 0")
         if not (0 <= self.start < self.dimlen):
@@ -49,12 +49,14 @@ class NormalizedSlice:
         if not (self.count >= 0):
             raise ValueError("NormalizedSlice.count must be >= 0")
         
-        if self.step > 0:
-            if not (self.start + self.count * self.step < self.dimlen):
-                raise ValueError("NormalizedSlice is out of range")
-        else:
-            if not (self.start + self.count * self.step >= 0):
-                raise ValueError("NormalizedSlice is out of range")
+        if self.count > 0:
+            last_idx = self.start + (self.count - 1) * self.step
+            if self.step > 0:
+                if not (last_idx < self.dimlen):
+                    raise ValueError("NormalizedSlice is out of range")
+            else:
+                if not (last_idx >= 0):
+                    raise ValueError("NormalizedSlice is out of range")
 
 
     def __len__(self):
@@ -80,7 +82,14 @@ class NormalizedSlice:
             stop = None
         return slice(self.start, stop, self.step)
     
-    def to_range(self, range_cls: Type[_TRange]=range) -> _TRange:
+    @overload
+    def to_range(self, range_cls: range) -> range: ...
+    @overload
+    def to_range(self, range_cls: sympy.Range) -> sympy.Range: ...
+    @overload
+    def to_range(self, range_cls) -> object: ...
+
+    def to_range(self, range_cls):
         stop = self.start + self.step * self.count
         return range_cls(self.start, stop, self.step)
     
@@ -95,6 +104,22 @@ class NormalizedSlice:
         new_step = self.step * next.step
         new_count = next.count
         return NormalizedSlice(self.dimlen, new_start, new_step, new_count)
+    
+    def split(self, chunk_size: int) -> List['NormalizedSlice']:
+        nchunk, remainder = divmod(self.count, chunk_size)
+        if remainder > 0:
+            nchunk += 1
+        
+        splits = []
+        for i in range(nchunk):
+            this_size = min(self.count, chunk_size * (i + 1)) - i * chunk_size
+            ns = NormalizedSlice(
+                self.dimlen,
+                self.start + i * chunk_size * self.step,
+                self.step,
+                this_size)
+            splits.append(ns)
+        return splits
 
 
 def get_overlapping_slice(
@@ -108,19 +133,19 @@ def get_overlapping_slice(
 
     r_region = region.to_range(sympy.Range)
     r_sel = selection.to_range(sympy.Range)
-    r_overlap = cast(sympy.Range, r_region.intersect(r_sel))
+    overlap = cast(sympy.Range, r_region.intersect(r_sel))
 
-    if len(r_overlap) == 0:
-        assert isinstance(r_overlap, sympy.EmptySet)
+    if len(overlap) == 0:
+        assert isinstance(overlap, sympy.EmptySet)
         return NormalizedSlice(region.dimlen, 0, selection.step, 0)
 
     # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
     # so we need to reverse it if s.step < 0
     if selection.step < 0:
-        r_overlap = r_overlap.reversed
+        overlap = overlap.reversed
     
     return NormalizedSlice(
-        region.dimlen, r_overlap.start, selection.step, len(r_overlap)
+        region.dimlen, int(overlap.start), int(overlap.step), len(overlap)
     )
 
 

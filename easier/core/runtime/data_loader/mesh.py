@@ -18,7 +18,7 @@ import torch
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.factories import \
-    ArangeTensorLoader, FulledTensorLoader
+    ArangeDataLoader, FulledDataLoader
 from easier.core.runtime.data_loader.ops import \
     CartesianProductDataLoader, StridedDataLoader, ConcatDataLoader
 from easier.core.runtime.data_loader.utils import \
@@ -82,7 +82,7 @@ class Mesh(torch.nn.Module):
         # number of hypercubes per dim
         ncs: List[int] = []
         for dt in dimensional_vertices:
-            if isinstance(dt, (ArangeTensorLoader, FulledTensorLoader)):
+            if isinstance(dt, (ArangeDataLoader, FulledDataLoader)):
                 # TODO support general DataLoader like H5 and InMemTensor.
                 raise NotImplementedError(
                     "only support easier.arange/linspace/full/ones/zeros"
@@ -125,9 +125,9 @@ class Mesh(torch.nn.Module):
         dsts = []
         for i in range(ndim):
             interior_facets = CartesianProductDataLoader([
-                ArangeTensorLoader(0, ncs[j], 1, torch.int64, device)
+                ArangeDataLoader(0, ncs[j], 1, torch.int64, device)
                 if i != j else
-                ArangeTensorLoader(0, ncs[i] - 1, 1, torch.int64, device)
+                ArangeDataLoader(0, ncs[i] - 1, 1, torch.int64, device)
                 for j in range(ndim)
             ])
             # TODO insert Flatten to decoupling flattened indexing?
@@ -209,7 +209,7 @@ class Mesh(torch.nn.Module):
 
         idx_dls: List[DataLoaderBase] = []
         for dim, nv in enumerate(self._nvs):
-            idx_dl = ArangeTensorLoader(0, nv, 1, dtype=torch.int64, device=self.device)
+            idx_dl = ArangeDataLoader(0, nv, 1, dtype=torch.int64, device=self.device)
             if dim < len(indices):
                 idx = indices[dim]
                 idx_dl = StridedDataLoader(idx_dl, idx)

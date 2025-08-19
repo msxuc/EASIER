@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import math
 from types import EllipsisType
 from typing import List, Optional, Sequence, Tuple, TypeAlias, Union
 import functools
@@ -155,6 +156,7 @@ class DataLoaderBase:
         """
         # Default implementation:
         self.coll_check_dtype_shape_devicetype()
+
         check_collective_equality(
             f"Representation of {self.easier_hint_name}",
             repr(self)
@@ -165,14 +167,24 @@ class DataLoaderBase:
         Get minimum and maximum value within the `index` range along dim-0
         of the data source.
         
-        `index` is not necessarily the same on all ranks.
+        `index` must be collectively same on all ranks.
+        And must have `len(index)` > 0.
 
         Remarks:
-        -   The methods minmax()/count_unique() in derived DataLoaders
-            should handle the calculation for NormalizedSlice-on-dim-0 cases only.
-            Such cases are most common, because minmax()/count_unique() are
-            used by analysis and validation for Selector/Reducer.idx,
-            and their idx is always 1-d.
+        -   Note the scenarios of minmax()/count_unique(), they are 
+            used by analysis and validation for Selector/Reducer.idx:
+
+            -   Most cases are 1-d, so calculation for NormalizedSlice-on-dim-0
+                cases may suffice;
+
+            -   All contents are contained in the minmax/unique calculation,
+                despite the `index` parameter, it may still OOM on rank,
+                subclass implementation of these methods should do partition.
+        
+        -   minmax/count_unique() may recursively call minmax/count_unique(),
+            but as the call stack of minmax()s serve for analysis,
+            at each callstack frame the input `index` must be collectively
+            same.
 
         -   For cases that NormalizedSlice-on-dim-0 assumption no longer holds,
             callers should load the data by themselves and call
@@ -189,22 +201,35 @@ class DataLoaderBase:
         especially when Reshape-/Transpose-DataLoader are added.
         """
         # Default implementation:
-        min_tensor, max_tensor = self.partially_load_by_range(index).aminmax()
+        # TODO use H5DataLoader-style by-chunk calculation, otherwise on
+        # a whole big data source, loading once will OOM
+        # TODO only rank-0 has nonempty load_range(index != empty).
+        part = self.partially_load_by_range(index)
+        min_tensor, max_tensor = part.aminmax()
         amin = min_tensor.item()
         amax = max_tensor.item()
         return amin, amax
+    
+    def _pre_minmax(self, index: NormalizedSlice):
+        assert index.count > 0, 'caller should handle empty cases separately'
+        check_collective_equality('minmax index', index)
     
     def count_unique(self, index: NormalizedSlice) -> int:
         """
         Count unique elements in the exact `region` range of data source.
         
-        `index` is not necessarily the same on all ranks.
+        `index` must be collectively same on all ranks.
 
         Used by Reducer.set_fullness()
         """
         # Default implementation:
-        _, c = self.partially_load_by_range(index).unique(return_counts=True)
+        part = self.partially_load_by_range(index)
+        _, c = part.unique(return_counts=True)
         return c
+
+    def _pre_count_unique(self, index: NormalizedSlice):
+        check_collective_equality('count unique index', index)
+    
 
     def to(
         self,
@@ -249,14 +274,12 @@ class DataLoaderBase:
                 view_indices.append(normalized_idx)
 
             elif isinstance(idx, slice):
-                # effectively trim the slice regarding the real length,
-                # this is required by and in internal subprocedures
-                normalized_slice = slice(*idx.indices(dimlen))
-                view_indices.append(normalized_slice)
+                ns = NormalizedSlice.from_slice(dimlen, idx)
+                view_indices.append(ns)
 
             elif idx is Ellipsis:
-                normalized_slice = slice(0, dimlen)
-                view_indices.append(normalized_slice)
+                ns = NormalizedSlice(dimlen, 0, 1, dimlen)
+                view_indices.append(ns)
 
             else:
                 # TODO support idx==None
@@ -285,10 +308,7 @@ class DataLoaderBase:
         raise NotImplementedError()
 
 
-    def _pre_partially_load_by_range(self, index: NormalizedSlice):
-        self._assert_slice_in_range_and_positive_values(index)
-
-    def _post_partially_load_by_range(self, res):
+    def _post_partially_load_by_range(self, res, index):
         assert res.device.type == 'cpu'
         return res
 

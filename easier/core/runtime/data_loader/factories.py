@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 import os
 from types import EllipsisType
-from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast
+from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast, overload
 import h5py
 import functools
 import copy
@@ -18,12 +18,13 @@ import torch
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
-    compose_slice, get_region_shape, range_unpack, get_strides
+    get_strides
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
 from easier.core.utils import EasierJitException
+
 
 class InMemoryTensorLoader(DataLoaderBase):
     """
@@ -56,17 +57,8 @@ class InMemoryTensorLoader(DataLoaderBase):
             eq=_eq_tensor
         )
 
-    @functools.cache
-    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-        amin, amax = self.tensor[index].aminmax()
-        return amin.item(), amax.item()
-
-    @functools.cache
-    def count_unique(self, index: NormalizedSlice) -> int:
-        return self.tensor[index].unique().shape[0]
-
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
-        return self.tensor[index].clone()
+        return self.tensor[index.to_slice()].clone()
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         return self.tensor[index]
@@ -178,48 +170,20 @@ class H5DataLoader(DataLoaderBase):
     
 
     def _load_by_chunk(
-        self, region: Sequence[NormalizedSlice]
+        self, index: NormalizedSlice
     ) -> Iterator[torch.Tensor]:
         """
         Only callable on rank-0.
+
+        Args:
+        -   index: slice on dim-0
         """
-        batch_idx = region[0]
-        if isinstance(batch_idx, int):
-            with self._dataset_as_dtype() as d:
-                chunk_np: np.ndarray = d[batch_idx, *region[1:]]
+        slices = index.split(self.chunk_size)
+        with self._dataset_as_dtype() as d:
+            for ns in slices:
+                chunk_np: np.ndarray = d[ns.to_slice()]
                 chunk: torch.Tensor = torch.from_numpy(chunk_np)
                 yield chunk
-
-        elif isinstance(batch_idx, slice):
-            batch_range = range(*range_unpack(batch_idx))
-            view_len = len(batch_range)
-
-            # Put tailing elements in an individual chunk whose size is smaller.
-            nchunk, remainder = divmod(view_len, self.chunk_size)
-            if remainder > 0:
-                nchunk += 1
-
-            with self._dataset_as_dtype() as d:
-                start = batch_idx.start
-
-                # TODO slice util: split_slice(): Iterator[slice]
-                for i in range(nchunk):
-                    end = start + batch_idx.step * self.chunk_size * i
-
-                    # TODO unit test this H5 view
-                    # end may go beyond `self.shape[0]` if step > 0
-                    # or beyond 0 if step < 0,
-                    # but H5 would ignore the out-of-range part.
-                    view_chunk_slice = slice(start, end, batch_idx.step)
-
-                    chunk_np: np.ndarray = d[view_chunk_slice, *region[1:]]
-                    chunk: torch.Tensor = torch.from_numpy(chunk_np)
-                    yield chunk
-
-                    start = end
-
-        else:
-            assert False, 'unreachable'
 
 
     @functools.cache
@@ -458,7 +422,7 @@ class H5DataLoader(DataLoaderBase):
         ])
 
 
-class FulledTensorLoader(DataLoaderBase):
+class FulledDataLoader(DataLoaderBase):
     def __init__(self, value: Union[int, float], shape, dtype, device) -> None:
         super().__init__()
 
@@ -466,8 +430,6 @@ class FulledTensorLoader(DataLoaderBase):
         self.shape = tuple(shape)
         self.dtype = dtype
         self.device = torch.device(device)
-
-        # Views are not effective for FullTensorLoader.
 
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
@@ -481,17 +443,15 @@ class FulledTensorLoader(DataLoaderBase):
     def count_unique(self, index) -> int:
         return 1
 
-    def _full(self, shape, device: Union[torch.device, str]):
-        return torch.full(
-            shape, self.value, dtype=self.dtype, device=device)  # type: ignore
+    def _full(self, batch_dim_len: int, device: torch.device):
+        shape = (batch_dim_len,) + self.shape[1:]
+        return torch.full(shape, self.value, dtype=self.dtype, device=device)
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
-        shape = get_region_shape(self.shape, [index])
-        return self._full(shape, 'cpu')
+        return self._full(index.count, torch.device('cpu'))
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
-        shape = (index.shape[0],) + self.shape[1:]
-        return self._full(shape, 'cpu')
+        return self._full(index.shape[0], torch.device('cpu'))
 
     def fully_load(
         self, device: torch.device, replicated: bool
@@ -499,7 +459,7 @@ class FulledTensorLoader(DataLoaderBase):
         dist_env = get_default_dist_env()
         rank = dist_env.rank
         if replicated or rank == 0:
-            return self._full(None, device)
+            return self._full(self.shape[0], device)
         else:
             return self.get_placeholder(device)
 
@@ -513,7 +473,7 @@ class FulledTensorLoader(DataLoaderBase):
         ])
 
 
-class ArangeTensorLoader(DataLoaderBase):
+class ArangeDataLoader(DataLoaderBase):
     def __init__(
         self,
         start: Num,
@@ -560,36 +520,20 @@ class ArangeTensorLoader(DataLoaderBase):
         )
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-        s = compose_slice(slice(self._start, self._end, self._step), index)
-        l = len(range(*range_unpack(s)))
-        if s.step > 0:
-            return s.start, s.start + l * s.step
-        else:
-            return s.start + l * s.step, s.start
+        idx1 = index.start
+        idx2 = index.start + index.step * (index.count - 1)
+
+        v1 = self._start + self._step * idx1
+        v2 = self._start + self._step * idx2
+
+        return min(v1, v2), max(v1, v2)
 
     def count_unique(self, index: NormalizedSlice) -> int:
-        s = compose_slice(slice(self._start, self._end, self._step), index)
-        l = len(range(*range_unpack(s)))
-        return l
+        return index.count
 
-
-    def partially_load_by_rank_REMOVE_THIS(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
-        rank = dist_env.rank
-        orig_len = self.shape[0]
-        offset_start, offset_end = get_offset_exactly_nparts(
-            orig_len, dist_env.world_size, rank)
-
-        range_start = self._start + offset_start * self._step
-        range_end = self._start + offset_end * self._step
-        if self._step > 0:
-            range_end = min(self._end, range_end)
-        else:
-            range_end = max(self._end, range_end)
-
-        chunk = torch.arange(range_start, range_end, self._step,
-                             dtype=self.dtype, device='cpu')
-        return chunk, offset_start, offset_end
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
+        idx_tensor = cast(torch.Tensor, index.to_range(torch.arange))
+        return self.partially_load_by_index(idx_tensor)
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         return (index * self._step + self._start).to(dtype=self.dtype)
@@ -616,3 +560,242 @@ class ArangeTensorLoader(DataLoaderBase):
             f'dtype={self.dtype}',
             ')'
         ])
+
+
+
+def hdf5(
+    file: str, dataset: str,
+    dtype: Optional[torch.dtype] = None,
+    device: Union[torch.device, str, None] = None,
+    **h5_file_kwargs
+):
+    """
+    The call to this function must be collectively.
+
+    Create a handle to a HDF5 dataset.
+
+    The specified dataset must be accessible from rank-0.
+    """
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return H5DataLoader(file, dataset, dtype=dtype, device=device,
+                        **h5_file_kwargs)
+
+
+def full(
+    size: Sequence[int],
+    fill_value,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    if isinstance(fill_value, int):
+        default_dtype = torch.int64
+    elif isinstance(fill_value, float):
+        default_dtype = torch.float64
+    else:
+        raise TypeError('fill_value must be integer or floating-point')
+
+    if dtype is None:
+        dtype = default_dtype
+
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return FulledDataLoader(fill_value, size, dtype, device)
+
+
+def zeros(
+    size: Sequence[int],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    # TODO torch.zeros/ones can have `size` be both tuple and `*size:int`.
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    if dtype is None:
+        dtype = torch.float64
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return full(size, 0, dtype=dtype, device=device)
+
+
+def ones(
+    size: Sequence[int],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    if dtype is None:
+        dtype = torch.float64
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return full(size, 1, dtype=dtype, device=device)
+
+
+def _dtype_device_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+) -> Tuple[torch.dtype, torch.device]:
+    if dtype is None:
+        dtype = input.dtype
+
+    if device is None:
+        device = input.device
+    device = torch.device(device)
+
+    return dtype, device
+
+
+def full_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    fill_value,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    size = input.shape
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return full(size, fill_value, dtype=dtype, device=device)
+
+
+def zeros_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return zeros(input.shape, dtype=dtype, device=device)
+
+
+def ones_like(
+    input: Union[DataLoaderBase, torch.Tensor],
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[torch.device, str]] = None
+):
+    """
+    Args:
+    - dtype: Optional[torch.dtype]:
+        If None, the default dtype is `torch.int64` for integer `fill_value`
+        and `torch.float64` for floating-poin `fill_value`.
+    - device: Optional[torch.Device]:
+        If None, the default device is `"cpu"`.
+    """
+    dtype, device = _dtype_device_like(input, dtype, device)
+    return ones(input.shape, dtype=dtype, device=device)
+
+
+@overload
+def arange(end, *, dtype=None, device=None): ...
+@overload
+def arange(start, end, step=1, *, dtype=None, device=None): ...
+
+
+def arange(*args, **kwargs):
+    def _end_matcher(end, *, dtype=None, device=None):
+        return (0, end, 1, dtype, device)
+
+    def _start_end_matcher(start, end, step=1, *, dtype=None, device=None):
+        return (start, end, step, dtype, device)
+
+    def _resolve():
+        try:
+            return _end_matcher(*args, **kwargs)
+        except TypeError:
+            pass
+
+        try:
+            return _start_end_matcher(*args, **kwargs)
+        except TypeError:
+            pass
+
+        raise TypeError(f'Unexpected arguments {args} to easier.arange')
+
+    start, end, step, dtype, device = _resolve()
+
+    for arg in [start, end, step]:
+        if not isinstance(arg, (int, float)):
+            raise TypeError(
+                'argument to easier.arange must be integer or floating-point')
+
+    promoted_value = start + end + step
+    if isinstance(promoted_value, int):
+        default_dtype = torch.int64
+    elif isinstance(promoted_value, float):
+        default_dtype = torch.float64
+    else:
+        raise TypeError(
+            'argument to easier.arange must be integer or floating-point')
+
+    if dtype is None:
+        dtype = default_dtype
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return ArangeDataLoader(start, end, step, dtype, device)
+
+
+def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
+    for arg in [start, stop]:
+        if not isinstance(arg, (int, float)):
+            raise TypeError(
+                'argument to easier.linspace must be integer or floating-point'
+            )
+    if isinstance(num, int) or num <= 0:
+        raise TypeError(
+            'argument `num` to easier.linspace must be positive integer'
+        )
+
+    if dtype is None:
+        dtype = torch.float64
+    
+    if not endpoint:
+        num += 1
+    step = (stop - start) / (num - 1)
+    arange_end = start + step * num
+    
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+    return ArangeDataLoader(
+        start, arange_end, step, dtype=dtype, device=device
+    )
