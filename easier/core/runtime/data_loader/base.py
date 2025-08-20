@@ -3,7 +3,7 @@
 
 import math
 from types import EllipsisType
-from typing import List, Optional, Sequence, Tuple, TypeAlias, Union
+from typing import Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union
 import functools
 import copy
 
@@ -12,7 +12,7 @@ import torch
 from easier.core.runtime.data_loader.utils import \
     NormalizedSlice
 from easier.core.runtime.dist_env import \
-    get_default_dist_env
+    get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
 from easier.core.utils import EasierJitException
 
@@ -161,6 +161,26 @@ class DataLoaderBase:
             f"Representation of {self.easier_hint_name}",
             repr(self)
         )
+    
+    def _load_by_chunk_rank0(
+        self, index: NormalizedSlice, *, chunk_size=1024*1024*128
+    ) -> Iterator[torch.Tensor]:
+        """
+        Collectively called, but only load data on rank-0.
+
+        Args:
+        -   index: slice on dim-0
+        """
+        dist_env = get_runtime_dist_env()
+        slices = index.split(chunk_size)
+        for s in slices:
+            if dist_env.rank != 0:
+                # Other ranks don't load data, but this method is still
+                # collectively called.
+                s = NormalizedSlice(s.dimlen, 0, 1, 0)
+            chunk = self.partially_load_by_range(s)
+            yield chunk
+
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         """
@@ -201,13 +221,35 @@ class DataLoaderBase:
         especially when Reshape-/Transpose-DataLoader are added.
         """
         # Default implementation:
-        # TODO use H5DataLoader-style by-chunk calculation, otherwise on
-        # a whole big data source, loading once will OOM
-        # TODO only rank-0 has nonempty load_range(index != empty).
-        part = self.partially_load_by_range(index)
-        min_tensor, max_tensor = part.aminmax()
-        amin = min_tensor.item()
-        amax = max_tensor.item()
+        if self.dtype.is_floating_point:
+            raise NotImplementedError("Not supporting floats yet")
+
+        dist_env = get_runtime_dist_env()
+
+        # TODO basically this is only used for idx, which are ints,
+        # but if we want this to be a universal component, we need to
+        # ensure float.NaN etc. work as expected.
+        amin, amax = None, None
+
+        def _opt_cmp(a: Optional[torch.Tensor], c: torch.Tensor, op):
+            return c if a is None else op(a, c)
+
+        for chunk in self._load_by_chunk_rank0(index):
+            # Only on rank-0 we load real data
+            if dist_env.rank == 0:
+                chunk_min, chunk_max = torch.aminmax(chunk)
+                amin = _opt_cmp(amin, chunk_min, min)
+                amax = _opt_cmp(amax, chunk_max, max)
+
+                amin, amax = amin.item(), amax.item()  # type: ignore
+            else:
+                assert chunk.shape[0] == 0
+
+        if dist_env.rank == 0:
+            dist_env.broadcast_object_list(0, [amin, amax])
+        else:
+            [amin, amax] = dist_env.broadcast_object_list(0)
+
         return amin, amax
     
     def _pre_minmax(self, index: NormalizedSlice):
@@ -223,9 +265,59 @@ class DataLoaderBase:
         Used by Reducer.set_fullness()
         """
         # Default implementation:
-        part = self.partially_load_by_range(index)
-        u = part.unique()
-        return u.shape[0]
+        if self.dtype.is_floating_point:
+            raise NotImplementedError("Not supporting floats yet")
+
+        amin, amax = self.minmax(index)
+        if not (amin >= 0):
+            raise NotImplementedError("simplify for Reducer.fullness cases")
+        assert isinstance(amax, int)
+
+        dist_env = get_runtime_dist_env()
+
+        nunique = 0
+
+        # Each time we count elements that fall in the pack,
+        # in case the pack gets too big;
+        # For each such pack, traverse all .idx data and "set the bit" and
+        # count "bits".
+
+        bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
+
+        # TODO for Reducer.fullness cases, amax upperbound is number of
+        # vertices, so this bitpack won't be too big. But generally the
+        # amax is not bounded, causing the bitpack super sparse.
+        bitpack_n, remainder = divmod(amax, bitpack_maxlen)
+        if remainder > 0:
+            bitpack_n += 1
+
+        # TODO use real bitmap and popcount instead of *bool*pack.
+        for bitpack_i in range(bitpack_n):
+            bitpack_min = bitpack_i * bitpack_maxlen
+            bitpack_max = min((bitpack_i + 1) * bitpack_maxlen, amax)
+
+            bitpack = torch.zeros(
+                [bitpack_max - bitpack_min], dtype=torch.bool
+            )
+
+            for chunk in self._load_by_chunk_rank0(index):
+                # Only on rank-0 we load real data
+                if dist_env.rank == 0:
+                    in_bitpack = torch.logical_and(
+                        chunk >= bitpack_min, chunk < bitpack_max)
+                    bitpack[chunk[in_bitpack] - bitpack_min] = 1
+                else:
+                    assert chunk.shape[0] == 0
+
+            bitpack_nnz = int(torch.count_nonzero(bitpack))
+            nunique += bitpack_nnz
+        
+        if dist_env.rank == 0:
+            dist_env.broadcast_object_list(0, [nunique])
+        else:
+            [nunique] = dist_env.broadcast_object_list(0)
+
+        return nunique
 
     def _pre_count_unique(self, index: NormalizedSlice):
         check_collective_equality('count unique index', index)

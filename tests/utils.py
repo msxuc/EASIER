@@ -184,14 +184,15 @@ class _WorkerMethodSpawner:
 
         self.test_cls_obj = None
     
-    def spawn_target(self, world_size, local_rank, *args, **kwargs):
+    def spawn_target(self, world_size, local_rank):
+        args = ()
         if self.test_cls_obj is not None:
             args = (self.test_cls_obj,) + args
-        self.worker_func(*args, **kwargs)
+        self.worker_func(*args)
 
-    def spawn(self, *args, **kwargs):
+    def spawn(self):
         torchrun_singlenode(
-            self.nprocs, self.spawn_target, args, kwargs,
+            self.nprocs, self.spawn_target, (), {},
             self.init_type  # type: ignore
         )
 
@@ -203,13 +204,15 @@ def torchrun_spawn(  # type: ignore
     A decorator to make a global function test_xxx or a method TestXXX.test_xxx
     to be spawned by torchrun.
 
-    Usage (class method):
+    TODO
+    -   @pytest.parameterize is not supported, use torchrun_singlenode instead.
+
+    Usage (class method as example):
     ```
     class Test:
-        @pytest.mark.parametrize('dev_type', [...])
-        @pytest.mark.parametrize('dtype', [...])
 
-        @torchrun_spawn()  # must be the last
+        # must be the first decorator (as decorators are stacked bottom-up)
+        @torchrun_spawn()  
 
         # must be named with 'worker__'
         def worker__test(self, dev_type: str, dtype: torch.dtype):
@@ -227,7 +230,6 @@ def torchrun_spawn(  # type: ignore
         public_name = orig_name[len('worker__'):]
 
         spawner = _WorkerMethodSpawner(nprocs, func, init_type)
-        spawner.spawn.__dict__.update(func.__dict__)  # add pytest data
 
         if qualname == orig_name:
             # global function

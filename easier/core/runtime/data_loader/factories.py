@@ -169,105 +169,6 @@ class H5DataLoader(DataLoaderBase):
             yield d
     
 
-    def _load_by_chunk(
-        self, index: NormalizedSlice
-    ) -> Iterator[torch.Tensor]:
-        """
-        Only callable on rank-0.
-
-        Args:
-        -   index: slice on dim-0
-        """
-        slices = index.split(self.chunk_size)
-        with self._dataset_as_dtype() as d:
-            for ns in slices:
-                chunk_np: np.ndarray = d[ns.to_slice()]
-                chunk: torch.Tensor = torch.from_numpy(chunk_np)
-                yield chunk
-
-
-    @functools.cache
-    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-        if self.dtype.is_floating_point:
-            raise NotImplementedError("Not supporting floats yet")
-
-        dist_env = get_runtime_dist_env()
-        if dist_env.rank == 0:
-            # TODO basically this is only used for idx, which are ints,
-            # but if we want this to be a universal component, we need to
-            # ensure float.NaN etc. work as expected.
-            amin, amax = None, None
-
-            def _opt_cmp(a: Optional[torch.Tensor], c: torch.Tensor, op):
-                return c if a is None else op(a, c)
-
-            for chunk in self._load_by_chunk(index):
-                chunk_min, chunk_max = torch.aminmax(chunk)
-                amin = _opt_cmp(amin, chunk_min, min)
-                amax = _opt_cmp(amax, chunk_max, max)
-
-            amin, amax = amin.item(), amax.item()  # type: ignore
-
-            dist_env.broadcast_object_list(0, [amin, amax])
-
-        else:
-            [amin, amax] = dist_env.broadcast_object_list(0)
-
-        return amin, amax
-
-    @functools.cache
-    def count_unique(self, index: NormalizedSlice) -> int:
-        if self.dtype.is_floating_point:
-            raise NotImplementedError("Not supporting floats yet")
-
-        amin, amax = self.minmax(index)
-        if not (amin >= 0):
-            raise NotImplementedError("simplify for Reducer.fullness cases")
-        assert isinstance(amax, int)
-
-        dist_env = get_runtime_dist_env()
-        if dist_env.rank == 0:
-            nunique = 0
-
-            # Each time we count elements that fall in the pack,
-            # in case the pack gets too big;
-            # For each such pack, traverse all .idx data and "set the bit" and
-            # count "bits".
-
-            bitpack_maxlen = 1024 * 1024 * 128  # 128MB with bools
-
-            # TODO for Reducer.fullness cases, amax upperbound is number of
-            # vertices, so this bitpack won't be too big. But generally the
-            # amax is not bounded, causing the bitpack super sparse.
-            bitpack_n, remainder = divmod(amax, bitpack_maxlen)
-            if remainder > 0:
-                bitpack_n += 1
-
-            # TODO use real bitmap and popcount instead of *bool*pack.
-            for bitpack_i in range(bitpack_n):
-                bitpack_min = bitpack_i * bitpack_maxlen
-                bitpack_max = min((bitpack_i + 1) * bitpack_maxlen, amax)
-
-                bitpack = torch.zeros(
-                    [bitpack_max - bitpack_min], dtype=torch.bool
-                )
-
-                for chunk in self._load_by_chunk(index):
-                    in_bitpack = torch.logical_and(
-                        chunk >= bitpack_min, chunk < bitpack_max)
-                    bitpack[chunk[in_bitpack] - bitpack_min] = 1
-
-                bitpack_nnz = int(torch.count_nonzero(bitpack))
-                nunique += bitpack_nnz
-
-            dist_env.broadcast_object_list(0, [nunique])
-
-        else:
-            [nunique] = dist_env.broadcast_object_list(0)
-
-        return nunique
-
-
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         dist_env = get_runtime_dist_env()
         rank = dist_env.rank
@@ -282,7 +183,7 @@ class H5DataLoader(DataLoaderBase):
 
             with self._dataset_as_dtype() as d:
                 for w in range(1, dist_env.world_size):
-                    part_np: np.ndarray = d[idx_world[w]]
+                    part_np: np.ndarray = d[idx_world[w].to_slice()]
                     part: torch.Tensor = \
                         torch.from_numpy(part_np).to(dist_env.comm_device)
                     isend = dist_env.def_isend(part, dst=w, tag=w)
@@ -292,12 +193,12 @@ class H5DataLoader(DataLoaderBase):
                     # TODO each rank-0-rank-w comm may take a while,
                     # subsequennt recvs should not timeout.
 
-                part0_np: np.ndarray = d[index]
+                part0_np: np.ndarray = d[index.to_slice()]
                 part0 = torch.from_numpy(part0_np)
                 return part0
 
         else:
-            shape = get_region_shape(self.shape, [index])
+            shape = (index.count,) + self.shape[1:]
             buffer = torch.empty(
                 shape, dtype=self.dtype, device=dist_env.comm_device
             )
