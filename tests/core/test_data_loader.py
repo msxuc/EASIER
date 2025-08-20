@@ -182,7 +182,7 @@ class TestCartesianProductDataLoader:
         idx = torch.arange(155, 162)
         assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
         
-        idx = torch.arange(300, 200, -5)
+        idx = torch.arange(383, 200, -5)
         assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
 
         assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), True))
