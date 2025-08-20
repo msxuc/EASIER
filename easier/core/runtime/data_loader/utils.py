@@ -2,10 +2,15 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
+from types import EllipsisType
 from typing import Callable, List, Literal, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING, overload
 
 import sympy
 import torch
+
+if TYPE_CHECKING:
+    from easier.core.runtime.data_loader.base import GeneralIndex
+
 
 _T = TypeVar('_T')
 
@@ -159,3 +164,25 @@ def get_strides(shape: Sequence[int]) -> torch.Tensor:
     strides = r_strides[:-1].flip(dims=[0])
     return strides
 
+
+class CopyingSlicer:
+    """
+    torch.Tensor does not support negative step or even from_numpy() on
+    a numpy.ndarray with negative strides.
+    Do the slicing with numpy then copy to make torch happy.
+
+    Usage:
+    ```
+    CopyingSlicer(tensor)[:, ::-2, 3]
+    ```
+    """
+    def __init__(self, tensor) -> None:
+        self.tensor = tensor
+
+    def __getitem__(self, index):
+        # Rely on __getitem__ protocol and [] syntax to ease writing slices.
+        if not isinstance(index, tuple):
+            index = (index,)
+        
+        # one index may be torch.Tensor, can be directly used to index ndarray.
+        return torch.from_numpy(self.tensor.numpy()[*index].copy())

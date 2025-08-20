@@ -9,7 +9,7 @@ import torch
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
-    get_overlapping_slice, get_strides
+    get_overlapping_slice, get_strides, CopyingSlicer
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env
@@ -19,7 +19,9 @@ from easier.core.runtime.utils import check_collective_equality
 
 class StridedDataLoader(DataLoaderBase):
     def __init__(
-        self, inner: DataLoaderBase, index: Sequence[Union[NormalizedSlice, int]]
+        self,
+        inner: DataLoaderBase,
+        index: Sequence[Union[NormalizedSlice, int]]
     ):
         super().__init__()
 
@@ -46,13 +48,20 @@ class StridedDataLoader(DataLoaderBase):
             else:
                 raise IndexError(f"Unexpected index {idx}")
 
-        self.index = index
+        self.norm_index = index
         self.inner = inner
 
+        self._first_slice_dim = len(index)
+        self._tensor_index: List[Union[int, slice]] = []
         shape = []
-        for idx in index:
+        for i, idx in enumerate(index):
             if isinstance(idx, NormalizedSlice):
                 shape.append(len(idx))
+                self._tensor_index.append(idx.to_slice())
+                self._first_slice_dim = min(self._first_slice_dim, i)
+            else:
+                self._tensor_index.append(idx)
+
         shape += list(self.inner.shape[len(index):])
 
         self.shape = tuple(shape)
@@ -66,10 +75,10 @@ class StridedDataLoader(DataLoaderBase):
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
 
-        check_collective_equality("index", self.index)
+        check_collective_equality("index", self.norm_index)
     
-    def _get_view_slice0(self) -> NormalizedSlice:
-        idx = self.index[0]
+    def _get_norm_slice0(self) -> NormalizedSlice:
+        idx = self.norm_index[0]
         if isinstance(idx, int):
             return NormalizedSlice(self.inner.shape[0], idx, 1, 1)
         elif isinstance(idx, NormalizedSlice):
@@ -78,59 +87,81 @@ class StridedDataLoader(DataLoaderBase):
             assert False, 'unreachable'
 
     
-    def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-        composed_idx = self._get_view_slice0().compose(index)
-        return self.minmax(composed_idx)
-
-    def count_unique(self, index: NormalizedSlice) -> int:
-        composed_idx = self._get_view_slice0().compose(index)
-        return self.count_unique(composed_idx)
+    # TODO because minmax/count_unique only take dim-0 index,
+    # but a StridedDataLoader may have n-d indices, we cannot simply dispatch
+    # to self.inner.minmax() -- but if we take a Seq[Slice] then we can.
+    # def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
+    #     composed_idx = self._get_view_slice0().compose(index)
+    #     return self.inner.minmax(composed_idx + self.index[1:])
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
-        bs_idx = self.index[0]
-        if isinstance(bs_idx, int):
-            idxed_inner = self.inner.partially_load_by_range(
-                self._get_view_slice0()
+        idx0 = self.norm_index[0]
+        tidx = list(self._tensor_index)
+
+        if isinstance(idx0, int):
+            subtensor = self.inner.partially_load_by_range(
+                self._get_norm_slice0()
             )
-            return idxed_inner[0, index.to_slice()]
-        elif isinstance(bs_idx, NormalizedSlice):
-            composed_idx = bs_idx.compose(index)
-            return self.inner.partially_load_by_range(composed_idx)
+            sub_idx0 = 0
+
+            norm_idx = cast(
+                NormalizedSlice, self.norm_index[self._first_slice_dim]
+            )
+            composed_idx = norm_idx.compose(index)
+            tidx[self._first_slice_dim] = composed_idx.to_slice()
+
+        elif isinstance(idx0, NormalizedSlice):
+            composed_idx0 = idx0.compose(index)
+            subtensor = self.inner.partially_load_by_range(composed_idx0)
+            sub_idx0 = Ellipsis
         else:
             assert False, 'unreachable'
+        
+        return CopyingSlicer(subtensor)[sub_idx0, *tidx[1:]]
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         # NOTE may dispatch to different inner.load_xxx methods,
         # it's conditioned by self.index attribute, which must be collectively
         # same to ensure the structure of call stack is collectively same too.
-        bs_idx = self.index[0]
-        if isinstance(bs_idx, int):
-            idxed_inner = self.inner.partially_load_by_range(
-                self._get_view_slice0()
+        idx0 = self.norm_index[0]
+        tidx: List[Union[int, slice, torch.Tensor]] = list(self._tensor_index)
+
+        if isinstance(idx0, int):
+            subtensor = self.inner.partially_load_by_range(
+                self._get_norm_slice0()
             )
-            return idxed_inner[0, index]
-        elif isinstance(bs_idx, NormalizedSlice):
-            composed_idx = bs_idx.start + bs_idx.step * index
-            return self.inner.partially_load_by_index(composed_idx)
+            sub_idx0 = 0
+
+            norm_idx = cast(
+                NormalizedSlice, self.norm_index[self._first_slice_dim]
+            )
+            composed_idx = norm_idx.start + norm_idx.step * index
+            tidx[self._first_slice_dim] = composed_idx
+
+        elif isinstance(idx0, NormalizedSlice):
+            composed_idx0 = idx0.start + idx0.step * index
+            subtensor = self.inner.partially_load_by_index(composed_idx0)
+            sub_idx0 = Ellipsis
         else:
             assert False, 'unreachable'
+
+        return CopyingSlicer(subtensor)[sub_idx0, *tidx[1:]]
 
     def fully_load(
         self, device: torch.device, replicated: bool
     ) -> torch.Tensor:
-        indices = []
-        for idx in self.index:
-            if isinstance(idx, int):
-                indices.append(idx)
-            elif isinstance(idx, NormalizedSlice):
-                indices.append(idx.to_slice())
-            else:
-                assert False, 'unreachable'
-        return self.inner.fully_load(device, replicated)[*indices]
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+        if replicated or rank == 0:
+            return CopyingSlicer(self.inner.fully_load(device, replicated))[
+                *self._tensor_index
+            ]
+        else:
+            return self.get_placeholder(device)
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}' \
-            f'(inner={self.inner}, index={self.index})'
+            f'(inner={self.inner}, index={self.norm_index})'
 
 
 class CartesianProductDataLoader(DataLoaderBase):
@@ -219,7 +250,7 @@ class CartesianProductDataLoader(DataLoaderBase):
 
                 stride_i = nd_strides[idl]
 
-                comp_idx = (index / stride_i) % comp_size
+                comp_idx = (index // stride_i) % comp_size
                 if nd_nchunks[idl] == 1:
                     # avoid calculating the mask.
                     ret[:, idl] = chunk[comp_idx]

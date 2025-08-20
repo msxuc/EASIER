@@ -224,8 +224,8 @@ class DataLoaderBase:
         """
         # Default implementation:
         part = self.partially_load_by_range(index)
-        _, c = part.unique(return_counts=True)
-        return c
+        u = part.unique()
+        return u.shape[0]
 
     def _pre_count_unique(self, index: NormalizedSlice):
         check_collective_equality('count unique index', index)

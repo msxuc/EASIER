@@ -18,7 +18,7 @@ import torch
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
-    get_strides
+    get_strides, CopyingSlicer
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
@@ -58,7 +58,7 @@ class InMemoryTensorLoader(DataLoaderBase):
         )
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
-        return self.tensor[index.to_slice()].clone()
+        return CopyingSlicer(self.tensor)[index.to_slice()]
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         return self.tensor[index]

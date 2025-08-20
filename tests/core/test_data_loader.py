@@ -13,10 +13,11 @@ import easier
 from easier.core.runtime.data_loader.factories import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledDataLoader, \
     ArangeDataLoader
-from easier.core.runtime.data_loader.ops import CartesianProductDataLoader, ConcatDataLoader
+from easier.core.runtime.data_loader.ops import CartesianProductDataLoader, ConcatDataLoader, StridedDataLoader
 from easier.core.runtime.data_loader.utils import \
-    NormalizedSlice, get_overlapping_slice
+    NormalizedSlice, get_overlapping_slice, CopyingSlicer
 
+from easier.core.runtime.dist_env import get_default_dist_env
 from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2, torchrun_spawn
 from easier.core.utils import get_random_str
 
@@ -100,6 +101,65 @@ class TestNormalizedSlice:
         ) == NormalizedSlice(100, 85, -12, 6)
 
 
+class TestStridedDataLoader:
+    @torchrun_spawn()
+    def worker__test_dim0_int(self):
+        _m = torch.arange(42).reshape(3, 2, 1, 7)
+        m = CopyingSlicer(_m)[2, 1, 0, 6:1:-2]
+
+        dl = InMemoryTensorLoader(_m)
+        sdl = dl[2, 1, 0, 6:1:-2]
+
+        assert sdl.shape == (3,)
+
+        ns1 = NormalizedSlice(3, 0, 1, 3)
+        assert sdl.minmax(ns1) == (37, 41)
+        assert sdl.count_unique(ns1) == 3
+        assert torch.equal(
+            m, sdl.partially_load_by_range(ns1)
+        )
+
+        ns2 = NormalizedSlice(3, 2, -1, 2)
+        assert sdl.minmax(ns2) == (37, 39)
+        assert sdl.count_unique(ns2) == 2
+        assert torch.equal(
+            m[[2, 1]], sdl.partially_load_by_range(ns2)
+        )
+
+        assert torch.equal(
+            m, sdl.fully_load(torch.device('cpu'), True)
+        )
+
+    @torchrun_spawn()
+    def worker__test_basic(self):
+        _m = torch.arange(35).reshape(5, 7)
+        m = torch.from_numpy(_m.numpy()[4::-2, 5::-2].copy())
+
+        dl = InMemoryTensorLoader(_m)
+        sdl = dl[4::-2, 5::-2]
+
+        assert sdl.shape == (3, 3)
+
+        ns1 = NormalizedSlice(3, 0, 1, 3)
+        assert sdl.minmax(ns1) == (1, 33)
+        assert sdl.count_unique(ns1) == 9
+        assert torch.equal(
+            m, sdl.partially_load_by_range(ns1)
+        )
+
+        ns2 = NormalizedSlice(3, 2, -1, 2)
+        assert sdl.minmax(ns2) == (1, 19)
+        assert sdl.count_unique(ns2) == 6
+        assert torch.equal(
+            m[[2, 1]], sdl.partially_load_by_range(ns2)
+        )
+
+        assert torch.equal(
+            m, sdl.fully_load(torch.device('cpu'), True)
+        )
+
+
+
 class TestCartesianProductDataLoader:
     @torchrun_spawn()
     def worker__test(self):
@@ -109,11 +169,25 @@ class TestCartesianProductDataLoader:
             easier.arange(100, 111),
         ])
 
-        cdl.partially_load_by_index(vec(1))
+        raw = torch.cartesian_prod(
+            torch.arange(0, 5),
+            torch.arange(50, 57),
+            torch.arange(100, 111),
+        )
 
-        assert cdl.fully_load(torch.device('cpu'), True).shape[0] == 5 * 7 * 11
+        idx = torch.arange(3, 11, 2)
+        assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
 
-    
+        idx = torch.arange(155, 162)
+        assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
+        
+        idx = torch.arange(300, 200, -5)
+        assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
+
+        assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), True))
+
+        if get_default_dist_env().rank == 0:
+            assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), False))
 
 class TestConcatDataLoader:
     @torchrun_spawn()
@@ -169,14 +243,14 @@ class TestConcatDataLoader:
             cdl.partially_load_by_index(vec(10, 13, 30, 40, 70, 80).flip(0))
         )
 
-        assert torch.equal(
-            torch.concat([
-                torch.arange(0, 20),
-                torch.arange(50, 80),
-                torch.arange(100, 150),
-            ]),
-            cdl.fully_load(torch.device('cpu'), True)
-        )
+        raw = torch.concat([
+            torch.arange(0, 20), torch.arange(50, 80), torch.arange(100, 150)
+        ])
+
+        assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), True))
+
+        if get_default_dist_env().rank == 0:
+            assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), False))
 
     @torchrun_spawn()
     def worker__test_descend(self):
