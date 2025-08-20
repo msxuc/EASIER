@@ -236,11 +236,13 @@ class CartesianProductDataLoader(DataLoaderBase):
     ) -> torch.Tensor:
         dist_env = get_default_dist_env()
         rank = dist_env.rank
+        
+        # nested fully_load are all collective calls
+        vectors = [
+            comp.fully_load(device, replicated) for comp in self.components
+        ]
+        
         if replicated or rank == 0:
-            vectors = []
-            for comp in self.components:
-                vector = comp.fully_load(device, replicated)
-                vectors.append(vector)
             return torch.cartesian_prod(*vectors)
         else:
             return self.get_placeholder(device)
@@ -297,18 +299,25 @@ class ConcatDataLoader(DataLoaderBase):
                 NormalizedSlice(self.shape[0], start, 1, end - start),
                 index
             )
-            comp_overlap = NormalizedSlice(
-                comp.shape[0],
-                concat_overlap.start - start,
-                concat_overlap.step,
-                len(concat_overlap)
-            )
+            if len(concat_overlap) == 0:
+                comp_overlap = NormalizedSlice(comp.shape[0], 0, 1, 0)
+            else:
+                comp_overlap = NormalizedSlice(
+                    comp.shape[0],
+                    concat_overlap.start - start,
+                    concat_overlap.step,
+                    len(concat_overlap)
+                )
             fn(comp, concat_overlap, comp_overlap)
 
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         aminmax = [math.inf, -math.inf]
-        def _minmax(comp: DataLoaderBase, concat_overlap: NormalizedSlice, comp_overlap: NormalizedSlice):
+        def _minmax(
+            comp: DataLoaderBase,
+            concat_overlap: NormalizedSlice,
+            comp_overlap: NormalizedSlice
+        ):
             if comp_overlap.count != 0:
                 comp_minmax = comp.minmax(comp_overlap)
                 aminmax[0] = min(comp_minmax[0], aminmax[0])
@@ -316,14 +325,16 @@ class ConcatDataLoader(DataLoaderBase):
 
         self._foreach_component(index, _minmax)
 
-        assert math.inf not in aminmax
-        assert -math.inf not in aminmax
         return tuple(aminmax)  # type: ignore
 
-    
+
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         parts = []
-        def _load_comp(comp: DataLoaderBase, concat_overlap: NormalizedSlice, comp_overlap: NormalizedSlice):
+        def _load_comp(
+            comp: DataLoaderBase,
+            concat_overlap: NormalizedSlice,
+            comp_overlap: NormalizedSlice
+        ):
             parts.append(comp.partially_load_by_range(comp_overlap))
 
         self._foreach_component(index, _load_comp)
@@ -352,7 +363,20 @@ class ConcatDataLoader(DataLoaderBase):
         return ret
 
     def fully_load(self, device: torch.device, replicated) -> torch.Tensor:
-        raise NotImplementedError()
+        dist_env = get_default_dist_env()
+        rank = dist_env.rank
+
+        # nested fully_load are all collective calls
+        parts = [
+            comp.fully_load(device, replicated) for comp in self.components
+        ]
+
+        if replicated or rank == 0:
+            return torch.concat(parts)
+        else:
+            # Discard parts even they are placeholders too, to avoid
+            # materializing the concat-ed memory.
+            return self.get_placeholder(device)
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(components={repr(self.components)})'

@@ -13,11 +13,11 @@ import easier
 from easier.core.runtime.data_loader.factories import \
     DataLoaderBase, InMemoryTensorLoader, H5DataLoader, FulledDataLoader, \
     ArangeDataLoader
-from easier.core.runtime.data_loader.ops import ConcatDataLoader
+from easier.core.runtime.data_loader.ops import CartesianProductDataLoader, ConcatDataLoader
 from easier.core.runtime.data_loader.utils import \
     NormalizedSlice, get_overlapping_slice
 
-from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2
+from tests.utils import torchrun_singlenode, have_cuda, when_ngpus_ge_2, torchrun_spawn
 from easier.core.utils import get_random_str
 
 def vec(*vs, dtype=torch.int64):
@@ -100,9 +100,24 @@ class TestNormalizedSlice:
         ) == NormalizedSlice(100, 85, -12, 6)
 
 
+class TestCartesianProductDataLoader:
+    @torchrun_spawn()
+    def worker__test(self):
+        cdl = CartesianProductDataLoader([
+            easier.arange(0, 5),
+            easier.arange(50, 57),
+            easier.arange(100, 111),
+        ])
+
+        cdl.partially_load_by_index(vec(1))
+
+        assert cdl.fully_load(torch.device('cpu'), True).shape[0] == 5 * 7 * 11
+
+    
 
 class TestConcatDataLoader:
-    def test_ascend(self):
+    @torchrun_spawn()
+    def worker__test_ascend(self):
         cdl = ConcatDataLoader([
             easier.arange(0, 20),
             easier.arange(50, 80),
@@ -131,6 +146,10 @@ class TestConcatDataLoader:
         ns = NormalizedSlice(100, 7, 3, 30)
         cdl._foreach_component(ns, _Ascend())
 
+        assert cdl.minmax(NormalizedSlice(100, 0, 1, 100)) == (0, 149)
+        assert cdl.minmax(NormalizedSlice(100, 10, 1, 5)) == (10, 14)
+        assert cdl.minmax(NormalizedSlice(100, 14, -1, 5)) == (10, 14)
+
         assert torch.equal(
             torch.concat([
                 torch.arange(7, 20, 3),
@@ -150,7 +169,17 @@ class TestConcatDataLoader:
             cdl.partially_load_by_index(vec(10, 13, 30, 40, 70, 80).flip(0))
         )
 
-    def test_descend(self):
+        assert torch.equal(
+            torch.concat([
+                torch.arange(0, 20),
+                torch.arange(50, 80),
+                torch.arange(100, 150),
+            ]),
+            cdl.fully_load(torch.device('cpu'), True)
+        )
+
+    @torchrun_spawn()
+    def worker__test_descend(self):
         cdl = ConcatDataLoader([
             easier.arange(0, 20),
             easier.arange(50, 80),

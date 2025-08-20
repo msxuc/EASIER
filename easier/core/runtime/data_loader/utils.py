@@ -2,11 +2,12 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from typing import List, Literal, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING, overload
+from typing import Callable, List, Literal, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING, overload
 
 import sympy
 import torch
 
+_T = TypeVar('_T')
 
 @dataclass
 class NormalizedSlice:
@@ -83,13 +84,11 @@ class NormalizedSlice:
         return slice(self.start, stop, self.step)
     
     @overload
-    def to_range(self, range_cls: range) -> range: ...
+    def to_range(self, range_cls: Type[_T]) -> _T: ...
     @overload
-    def to_range(self, range_cls: sympy.Range) -> sympy.Range: ...
-    @overload
-    def to_range(self, range_cls) -> object: ...
+    def to_range(self, range_cls: Callable) -> torch.Tensor: ...
 
-    def to_range(self, range_cls):
+    def to_range(self, range_cls=range):  # type: ignore
         stop = self.start + self.step * self.count
         return range_cls(self.start, stop, self.step)
     
@@ -136,7 +135,7 @@ def get_overlapping_slice(
     overlap = cast(sympy.Range, r_region.intersect(r_sel))
 
     if len(overlap) == 0:
-        assert isinstance(overlap, sympy.EmptySet)
+        # overlap is a sympy.EmptySet and does not have .start/step etc. fields
         return NormalizedSlice(region.dimlen, 0, selection.step, 0)
 
     # sympy.Range.intersect doesn't preserve the direction/sign-of-step,
