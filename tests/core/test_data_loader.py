@@ -168,6 +168,7 @@ class TestCartesianProductDataLoader:
             easier.arange(50, 57),
             easier.arange(100, 111),
         ])
+        cdl._chunk_size = 42
 
         raw = torch.cartesian_prod(
             torch.arange(0, 5),
