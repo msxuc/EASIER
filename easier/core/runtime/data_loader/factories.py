@@ -166,7 +166,7 @@ class H5DataLoader(DataLoaderBase):
                 # NOTE the result type of `astype` has no attr `.shape/dtype`.
                 d = d.astype(self._target_np_dtype)  # type: ignore
 
-            yield d
+            yield cast(h5py.Dataset, d)
     
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
@@ -174,6 +174,19 @@ class H5DataLoader(DataLoaderBase):
         rank = dist_env.rank
 
         idx_world = dist_env.gather_object_list(0, index)  # type: ignore
+
+        def _slice_may_flip(d: h5py.Dataset, ns: NormalizedSlice):
+            # h5py Dataset indexing by slice does not allow the step to be
+            # negative, therefore we first flip the slice then flip the data.
+            if ns.step < 0:
+                rns = ns.reverse()
+                part_np = d[rns.to_slice()]
+                part = torch.from_numpy(part_np)
+                part = part.flip(0)
+            else:
+                part_np = d[ns.to_slice()]
+                part = torch.from_numpy(part_np)
+            return part
 
         # To avoid OOM, we cannot load the whole dataset on rank-0 then
         # simply call dist.scatter.
@@ -183,9 +196,8 @@ class H5DataLoader(DataLoaderBase):
 
             with self._dataset_as_dtype() as d:
                 for w in range(1, dist_env.world_size):
-                    part_np: np.ndarray = d[idx_world[w].to_slice()]
-                    part: torch.Tensor = \
-                        torch.from_numpy(part_np).to(dist_env.comm_device)
+                    part = _slice_may_flip(d, idx_world[w])
+                    part = part.to(dist_env.comm_device)
                     isend = dist_env.def_isend(part, dst=w, tag=w)
                     for req in dist_env.batch_isend_irecv([isend]):
                         req.wait()
@@ -193,8 +205,7 @@ class H5DataLoader(DataLoaderBase):
                     # TODO each rank-0-rank-w comm may take a while,
                     # subsequennt recvs should not timeout.
 
-                part0_np: np.ndarray = d[index.to_slice()]
-                part0 = torch.from_numpy(part0_np)
+                part0 = _slice_may_flip(d, index)
                 return part0
 
         else:

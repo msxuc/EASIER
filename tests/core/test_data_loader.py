@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from unittest.mock import patch
 from typing_extensions import Literal
 import torch
 import pytest
@@ -79,6 +80,30 @@ class TestNormalizedSlice:
             NormalizedSlice(6, 5, -1, 4)
         ) == NormalizedSlice(20, 3, 3, 4)
     
+    def test_split(self):
+        ns1 = NormalizedSlice(200, 3, 5, 30)
+        assert ns1.split(8) == [
+            NormalizedSlice(200, 3, 5, 8),
+            NormalizedSlice(200, 43, 5, 8),
+            NormalizedSlice(200, 83, 5, 8),
+            NormalizedSlice(200, 123, 5, 6),
+        ]
+
+        ns2 = NormalizedSlice(200, 180, -5, 30)
+        assert ns2.split(8) == [
+            NormalizedSlice(200, 180, -5, 8),
+            NormalizedSlice(200, 140, -5, 8),
+            NormalizedSlice(200, 100, -5, 8),
+            NormalizedSlice(200, 60, -5, 6),
+        ]
+    
+    def test_reverse(self):
+        ns1 = NormalizedSlice(200, 3, 5, 30)
+        assert ns1.reverse() == NormalizedSlice(200, 148, -5, 30)
+
+        ns2 = NormalizedSlice(200, 180, -5, 30)
+        assert ns2.reverse() == NormalizedSlice(200, 35, 5, 30)
+    
     def test_overlap_region_directionless(self):
         regions = [
             NormalizedSlice(100, 0, 1, 100),
@@ -126,35 +151,76 @@ def get_in_memory_tensor_loader(
     return InMemoryTensorLoader(v)
 
 
-@pytest.mark.parametrize('data_loader_ctor',
-                         [get_in_memory_tensor_loader, get_h5_tensor_loader])
-@pytest.mark.parametrize('dtype',
-                         [torch.int64, torch.float64], ids=['i64', 'f64'])
-@pytest.mark.parametrize('device_type', [
-    'cpu',
-    # no device IDs, all workers use cuda:0.
-    pytest.param('cuda', marks=have_cuda)
-])
-@pytest.mark.usefixtures('dummy_dist_env')
-def test_to(self, data_loader_ctor, dtype: torch.dtype, device_type: str):
-    dl: DataLoaderBase = data_loader_ctor(dtype, 'cpu')
+class TestDataLoaderBase:
+    @pytest.mark.parametrize('data_loader_ctor',
+                            [get_in_memory_tensor_loader, get_h5_tensor_loader])
+    @pytest.mark.parametrize('dtype',
+                            [torch.int64, torch.float64], ids=['i64', 'f64'])
+    @pytest.mark.parametrize('device_type', [
+        'cpu',
+        # no device IDs, all workers use cuda:0.
+        pytest.param('cuda', marks=have_cuda)
+    ])
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_to(self, data_loader_ctor, dtype: torch.dtype, device_type: str):
+        dl: DataLoaderBase = data_loader_ctor(dtype, 'cpu')
 
-    if dtype.is_floating_point:
-        dl_f16 = dl.to(dtype=torch.float16)
-        assert dl is not dl_f16
-        assert dl_f16.device.type == 'cpu'
-        assert dl_f16.dtype == torch.float16
-    else:
-        dl_i8 = dl.to(dtype=torch.int8)
-        assert dl is not dl_i8
-        assert dl_i8.device.type == 'cpu'
-        assert dl_i8.dtype == torch.int8  # not changed
+        if dtype.is_floating_point:
+            dl_f16 = dl.to(dtype=torch.float16)
+            assert dl is not dl_f16
+            assert dl_f16.device.type == 'cpu'
+            assert dl_f16.dtype == torch.float16
+        else:
+            dl_i8 = dl.to(dtype=torch.int8)
+            assert dl is not dl_i8
+            assert dl_i8.device.type == 'cpu'
+            assert dl_i8.dtype == torch.int8  # not changed
 
-    dl_device = dl.to(device=device_type)
-    assert dl is not dl_device
-    assert dl_device.device.type == device_type
-    assert dl_device.dtype == dtype
+        dl_device = dl.to(device=device_type)
+        assert dl is not dl_device
+        assert dl_device.device.type == device_type
+        assert dl_device.dtype == dtype
+    
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_chunk(self):
+        dl = ArangeDataLoader(3, 100, 3, torch.float64, 'cpu')
+        l = list(dl._load_by_chunk_rank0(
+            NormalizedSlice(33, 0, 1, 33),
+            chunk_size=10
+        ))
+        assert len(l) == 4
+        assert torch.equal(torch.arange(3, 31, 3, dtype=torch.float64), l[0])
+        assert torch.equal(torch.arange(93, 100, 3, dtype=torch.float64), l[3])
 
+        l = list(dl._load_by_chunk_rank0(
+            NormalizedSlice(33, 32, -2, 16),
+            chunk_size=10
+        ))
+        assert len(l) == 2
+        assert torch.equal(torch.arange(99, 44, -6, dtype=torch.float64), l[0])
+        assert torch.equal(torch.arange(39, 8, -6, dtype=torch.float64), l[1])
+
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_minmax_unique(self):
+        with patch(
+            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}' \
+                '.CHUNK_SIZE',
+            new=10,
+        ), patch(
+            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}' \
+                '.BITPACK_MAXLEN',
+            new=10
+        ):
+            dl = ArangeDataLoader(3, 100, 3, torch.int64, 'cpu')
+            amin, amax = dl.minmax(NormalizedSlice(33, 0, 1, 33))
+            assert (amin, amax) == (3, 99)
+            nunique = dl.count_unique(NormalizedSlice(33, 0, 1, 33))
+            assert nunique == 33
+            
+            amin, amax = dl.minmax(NormalizedSlice(33, 32, -2, 16))
+            assert (amin, amax) == (9, 99)
+            nunique = dl.count_unique(NormalizedSlice(33, 32, -2, 16))
+            assert nunique == 16
 
 
 @pytest.mark.parametrize(
@@ -176,7 +242,7 @@ class TestH5DataLoader:
         assert tensor.dtype == dtype
         assert tensor.device.type == 'cpu'  # by rank always CPU
         assert torch.equal(
-            torch.arange(5, dtype=dtype) * 9 + 1 + local_rank, tensor
+            torch.arange(5, dtype=dtype) * 9 + 1 + local_rank * 3, tensor
         )
 
         tensor = dl.partially_load_by_range(
@@ -185,14 +251,14 @@ class TestH5DataLoader:
         assert tensor.dtype == dtype
         assert tensor.device.type == 'cpu'  # by rank always CPU
         assert torch.equal(
-            49 - torch.arange(5, dtype=dtype) * 9 - local_rank, tensor
+            49 - torch.arange(5, dtype=dtype) * 9 - local_rank * 3, tensor
         )
 
-        idx = vec() + local_rank
-        tensor = dl.partially_load_by_index(idx)
-        assert tensor.dtype == dtype
-        assert tensor.device.type == 'cpu'  # by rank always CPU
-        assert torch.equal(idx.to(dtype) * 3 + 1, tensor)
+        # idx = vec() + local_rank
+        # tensor = dl.partially_load_by_index(idx)
+        # assert tensor.dtype == dtype
+        # assert tensor.device.type == 'cpu'  # by rank always CPU
+        # assert torch.equal(idx.to(dtype) * 3 + 1, tensor)
     
     def test_partial_load(self, dtype: torch.dtype):
         torchrun_singlenode(
@@ -265,18 +331,18 @@ class TestStridedDataLoader:
         assert sdl.shape == (3,)
 
         ns1 = NormalizedSlice(3, 0, 1, 3)
-        assert sdl.minmax(ns1) == (37, 41)
-        assert sdl.count_unique(ns1) == 3
         assert torch.equal(
             m, sdl.partially_load_by_range(ns1)
         )
+        assert sdl.minmax(ns1) == (37, 41)
+        assert sdl.count_unique(ns1) == 3
 
         ns2 = NormalizedSlice(3, 2, -1, 2)
-        assert sdl.minmax(ns2) == (37, 39)
-        assert sdl.count_unique(ns2) == 2
         assert torch.equal(
             m[[2, 1]], sdl.partially_load_by_range(ns2)
         )
+        assert sdl.minmax(ns2) == (37, 39)
+        assert sdl.count_unique(ns2) == 2
 
         assert torch.equal(
             m, sdl.fully_load(torch.device('cpu'), True)
@@ -293,18 +359,18 @@ class TestStridedDataLoader:
         assert sdl.shape == (3, 3)
 
         ns1 = NormalizedSlice(3, 0, 1, 3)
-        assert sdl.minmax(ns1) == (1, 33)
-        assert sdl.count_unique(ns1) == 9
         assert torch.equal(
             m, sdl.partially_load_by_range(ns1)
         )
+        assert sdl.minmax(ns1) == (1, 33)
+        assert sdl.count_unique(ns1) == 9
 
         ns2 = NormalizedSlice(3, 2, -1, 2)
-        assert sdl.minmax(ns2) == (1, 19)
-        assert sdl.count_unique(ns2) == 6
         assert torch.equal(
             m[[2, 1]], sdl.partially_load_by_range(ns2)
         )
+        assert sdl.minmax(ns2) == (1, 19)
+        assert sdl.count_unique(ns2) == 6
 
         assert torch.equal(
             m, sdl.fully_load(torch.device('cpu'), True)

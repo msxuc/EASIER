@@ -124,6 +124,12 @@ class NormalizedSlice:
                 this_size)
             splits.append(ns)
         return splits
+    
+    def reverse(self) -> 'NormalizedSlice':
+        if self.count == 0:
+            return self
+        rstart = self.start + self.step * (self.count - 1)
+        return NormalizedSlice(self.dimlen, rstart, -self.step, self.count)
 
 
 def get_overlapping_slice(
