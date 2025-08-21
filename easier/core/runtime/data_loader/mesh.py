@@ -95,11 +95,14 @@ class _MeshIndex:
                 # TODO None -- which unsqueezes dimensions -- is not supported.
                 raise TypeError("Index must be int, slice or Ellipsis")
 
+        space_shape: List[int] = []
         dim_dls: List[DataLoaderBase] = []
         for dim, vdl in enumerate(self.mesh.vertices_vectors):
             nv = vdl.shape[0]
+            space_shape.append(nv)
+
             dim_dl = ArangeDataLoader(
-                0, nv, 1, dtype=torch.int64, device=self.mesh.device
+                0, 1, nv, dtype=torch.int64, device=self.mesh.device
             )
 
             if dim < len(indices):
@@ -108,7 +111,8 @@ class _MeshIndex:
 
             dim_dls.append(dim_dl)
 
-        return CartesianProductDataLoader(dim_dls)
+        nd_v_coords = CartesianProductDataLoader(dim_dls)
+        return _MeshIdsDataLoader(nd_v_coords, space_shape)
 
 
 # Make Mesh a nn.Module so that EASIER can look through to get DataLoaders
@@ -116,16 +120,11 @@ class _MeshIndex:
 class Mesh(torch.nn.Module):
     """
     Define a regular N-d mesh whose vertices are the cartesian product of
-    N input arrays, the i-th input array has the shape of `(L_i,) + DIMS_i`
-    (If original `DIM_i` is empty then it's treated as `(1,)`).
+    N input arrays, the i-th input array has the shape of `(L_i,)`.
 
-    The resultant shape will be like `( L_0*...*L_{N-1} ,) + DIMS`,
-    and `DIMS` is a tuple and its content depends on `form`.
-
-    Remarks:
-    -   In case of each input array carries different vertex properties,
-        the subtensors for vertices are always flattened firstly
-        i.e. `prod(DIMS_i)`.
+    The resultant shape will be like `(L_0*...*L_{N-1}, N)`,
+    and users could use `Mesh.indices[i0, ..., i_{N-1}]` attribute to convert
+    N indices to an 1-d index to apply on the resultant `Mesh.vertices` data.
     """
     def __init__(
         self,
@@ -216,7 +215,7 @@ class Mesh(torch.nn.Module):
                 ArangeDataLoader(0, 1, ncs[i] - 1, torch.int64, self.device)
                 for j in range(ndim)
             ])
-            upstream_cube_ids = _MeshOneDimHypercubeIdsDataLoader(
+            upstream_cube_ids = _MeshIdsDataLoader(
                 upstream_cube_coords, self._ncs
             )
 
@@ -226,7 +225,7 @@ class Mesh(torch.nn.Module):
                 ArangeDataLoader(1, 1, ncs[i] - 1, torch.int64, self.device)
                 for j in range(ndim)
             ])
-            downstream_cube_ids = _MeshOneDimHypercubeIdsDataLoader(
+            downstream_cube_ids = _MeshIdsDataLoader(
                 downstream_cube_coords, self._ncs
             )
 
@@ -240,25 +239,30 @@ class Mesh(torch.nn.Module):
         assert self.dst.shape == (self.ne,)
 
 
-class _MeshOneDimHypercubeIdsDataLoader(MappedDataLoaderBase):
+class _MeshIdsDataLoader(MappedDataLoaderBase):
+    """
+    Calculate 1-d IDs for a certain kind of elements in the mesh,
+    they may be hypercubes or vertices.
+    """
     def __init__(
-        self, cube_coordinates: CartesianProductDataLoader, ncs: Sequence[int]
+        self,
+        # N-d coordinates for (the subset of) the target kind of elements
+        # (nelem, N)
+        coordinates: DataLoaderBase,
+        # the shape of the N-d space for all such kind of elements
+        space_shape: Sequence[int]
     ):
-        assert len(cube_coordinates.shape) == 2
-        super().__init__(inner=cube_coordinates, subshape=())
-        self.strides: torch.Tensor = get_strides(ncs)
+        assert len(coordinates.shape) == 2
+        super().__init__(inner=coordinates, subshape=())
+        self.strides: torch.Tensor = get_strides(space_shape)
 
     def map(self, tensor: torch.Tensor) -> torch.Tensor:
-        # tensor, i.e. the facets, is a dim-0 slice from the Cartesian product
-        # tensor of shape (L_0*...*L_{N-1}, N) -- the last N is for dimensions.
+        # `tensor` is the distributed part of the subset of elements
         assert tensor.ndim == 2
         assert tensor.shape[1] == self.inner.shape[1]
         
         # (N,)
         strides = self.strides.to(tensor.device)
 
-        # maybe upstream or downstream cubes, depending whether the caller is
-        # vertices[:-1] or vertices[1:] on the specified one dimension
-        # (along which are we traversing the faces).
-        cubes = (tensor * strides).sum(dim=1)
-        return cubes
+        ids = (tensor * strides).sum(dim=1)
+        return ids

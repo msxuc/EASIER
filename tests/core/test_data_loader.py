@@ -621,6 +621,17 @@ class TestMesh:
             ], dim=0)
         )
 
+        idxdl = mesh.indices[:, :]
+        coords = torch.cartesian_prod(
+            torch.arange(4),
+            torch.arange(5)
+        )
+        idx = idxdl.fully_load(torch.device('cpu'), True)
+        assert torch.equal(
+            idx,
+            coords[:, 0] * 5 + coords[:, 1]
+        )
+
 
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_3d(self):
@@ -673,4 +684,16 @@ class TestMesh:
                 m[:, :, 1:].flatten(),
                 m[:, :, :-1].flatten(),
             ], dim=0)
+        )
+
+        idxdl = mesh.indices[:, :, :]
+        coords = torch.cartesian_prod(
+            torch.arange(4),
+            torch.arange(5),
+            torch.arange(6),
+        )
+        idx = idxdl.fully_load(torch.device('cpu'), True)
+        assert torch.equal(
+            idx,
+            coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
         )

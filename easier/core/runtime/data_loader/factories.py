@@ -433,6 +433,13 @@ class ArangeDataLoader(DataLoaderBase):
         )
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
+        if self.dtype.is_floating_point:
+            raise ValueError("Floating-point data is not expected")
+
+        # TODO although we have checked `not dtype.is_floating_point`, the
+        # start/step attributes may still be floats. The result should be
+        # casted to dtype
+        # TODO enforce result to be (int,int) only since this is for S/R.idx.
         idx1 = index.start
         idx2 = index.start + index.step * (index.count - 1)
 
