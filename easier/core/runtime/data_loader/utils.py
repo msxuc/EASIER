@@ -2,14 +2,10 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from types import EllipsisType
-from typing import Callable, List, Literal, Sequence, Tuple, Type, TypeVar, Union, cast, TYPE_CHECKING, overload
+from typing import Callable, List, Sequence, Type, TypeVar, cast, overload
 
 import sympy
 import torch
-
-if TYPE_CHECKING:
-    from easier.core.runtime.data_loader.base import GeneralIndex
 
 
 _T = TypeVar('_T')

@@ -2,28 +2,22 @@
 # Licensed under the MIT License.
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 import math
 import os
-from types import EllipsisType
-from typing import Iterator, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union, cast, overload
+from typing import List, Literal, Optional, Sequence, Tuple, Union, cast, overload
 import h5py
-import functools
-import copy
 
 import numpy as np
-import sympy
 import torch
 
 from easier.core.runtime.data_loader.base import \
     DataLoaderBase, NormalizedSlice, Num
 from easier.core.runtime.data_loader.utils import \
-    get_strides, CopyingSlicer
+    CopyingSlicer
 
 from easier.core.runtime.dist_env import \
     get_default_dist_env, get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
-from easier.core.utils import EasierJitException
 
 
 class InMemoryTensorLoader(DataLoaderBase):
@@ -386,41 +380,48 @@ class FulledDataLoader(DataLoaderBase):
 
 
 class ArangeDataLoader(DataLoaderBase):
+    """
+    The ArangeDataLoader may choose to store
+    start:float/step:float/count:int instead of
+    start:float/stop:float/step:float like torch.arange.
+
+    This is because we are building a descriptive representation of the
+    arange-like data distributedly, therefore even although
+    `easier.arange(start, stop, step)` API, we need to calculate
+    `length=(end-start)/step`.
+
+    However, such division may lead to rounding issue,
+    e.g. in Python with `easier.linspace(0, 1, 5)`, if we do the division,
+    we may get an extra, intermediate exclusive end
+    `end = 1/5*6 = 1.200...002`,
+    which may cause the lenghth to be 7 rather than 6.
+    So whenever possible, we favor direct `count` value instead of division.
+    """
     def __init__(
         self,
         start: Num,
-        end: Num,
         step: Num,
+        count: int,
         dtype: torch.dtype,
         device: Union[str, torch.device]
     ):
         super().__init__()
 
-        if step == 0:
-            raise ValueError("step must not be 0")
-        if math.isinf(start) or math.isinf(end):
-            raise ValueError(f"range cannot be {start} to {end}")
-
-        # # TODO torch.arange rejects (0, 10, -1) -- sign must be consistent
-        # # -- but numpy allows and returns empty list.
-        # if not (
-        #     (step > 0 and end >= start) or (step < 0 and end <= start)
-        # ):
-        #     raise ValueError("inconsistent step sign")
-
+        if math.isinf(start):
+            raise ValueError(f"start cannot be {start}")
+        if step == 0 or math.isinf(step):
+            raise ValueError(f"step must not be {step}")
+        if not (isinstance(count, int) and count >= 0):
+            raise ValueError(f"count must be non-negative int")
+        
         if dtype.is_complex:
             raise NotImplementedError("range cannot be complex")
 
         self._start = start
-        self._end = end
         self._step = step
+        self._count = count
 
-        # TODO both torch and numpy have very careful calculation for length,
-        # we need to reinforce this.
-        length = math.ceil((end - start) / step)
-        length = max(0, length)
-        
-        self.shape = (length,)
+        self.shape = (count,)
         self.dtype = dtype
         self.device = torch.device(device)
 
@@ -428,7 +429,7 @@ class ArangeDataLoader(DataLoaderBase):
         self.coll_check_dtype_shape_devicetype()
         check_collective_equality(
             f"arange of {self.easier_hint_name}",
-            [self._start, self._end, self._step]
+            [self._start, self._step, self._count]
         )
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
@@ -456,10 +457,9 @@ class ArangeDataLoader(DataLoaderBase):
         dist_env = get_default_dist_env()
         rank = dist_env.rank
         if replicated or rank == 0:
-            return torch.arange(
-                self._start, self._end, self._step,
-                dtype=self.dtype, device=device
-            )
+            return (
+                torch.arange(self._count) * self._step + self._start
+            ).to(dtype=self.dtype, device=device)
         else:
             return self.get_placeholder(device)
 
@@ -467,8 +467,8 @@ class ArangeDataLoader(DataLoaderBase):
         return ''.join([
             f'{self.__class__.__name__}(',
             f'start={self._start}, ',
-            f'end={self._end}, ',
             f'step={self._step}, ',
+            f'count={self._count}, ',
             f'dtype={self.dtype}',
             ')'
         ])
@@ -683,7 +683,13 @@ def arange(*args, **kwargs):
     if device is None:
         # TODO like torch.set_default_device()
         device = 'cpu'
-    return ArangeDataLoader(start, end, step, dtype, device)
+
+    # TODO for floating numbers the division may lead to unexpected rounding
+    # however this might be regarded as the nature of floating numbers.
+    count = math.ceil((end - start) / step)
+    count = max(0, count)
+
+    return ArangeDataLoader(start, step, count, dtype, device)
 
 
 def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
@@ -692,7 +698,7 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
             raise TypeError(
                 'argument to easier.linspace must be integer or floating-point'
             )
-    if isinstance(num, int) or num <= 0:
+    if not (isinstance(num, int) and num > 0):
         raise TypeError(
             'argument `num` to easier.linspace must be positive integer'
         )
@@ -700,14 +706,20 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
     if dtype is None:
         dtype = torch.float64
     
+    if not dtype.is_floating_point:
+        raise NotImplementedError("Not supporting ints yet")
+    
+    nstep = num
     if not endpoint:
-        num += 1
-    step = (stop - start) / (num - 1)
-    arange_end = start + step * num
+        nstep += 1
+    step = (stop - start) / (nstep - 1)
+
+    # TODO for floating numbers the division may lead to unexpected rounding
+    # causing the specified `stop` is not exactly included -- because the last
+    # element is calculated using `start+step*(num-1)`.
     
     if device is None:
         # TODO like torch.set_default_device()
         device = 'cpu'
-    return ArangeDataLoader(
-        start, arange_end, step, dtype=dtype, device=device
-    )
+
+    return ArangeDataLoader(start, step, num, dtype=dtype, device=device)

@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 import math
-from typing import List, Sequence, Tuple, Union, cast
+from typing import Callable, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 
@@ -343,20 +343,28 @@ class ConcatDataLoader(DataLoaderBase):
 
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-        aminmax = [math.inf, -math.inf]
+        amin, amax = None, None
+
+        def _opt_cmp(a: Optional[Num], c: Num, op: Callable[[Num, Num], Num]):
+            return c if a is None else op(a, c)
+
         def _minmax(
             comp: DataLoaderBase,
             concat_overlap: NormalizedSlice,
             comp_overlap: NormalizedSlice
         ):
             if comp_overlap.count != 0:
-                comp_minmax = comp.minmax(comp_overlap)
-                aminmax[0] = min(comp_minmax[0], aminmax[0])
-                aminmax[1] = max(comp_minmax[1], aminmax[1])
+                nonlocal amin, amax
+                comp_min, comp_max = comp.minmax(comp_overlap)
+                amin = _opt_cmp(amin, comp_min, min)
+                amax = _opt_cmp(amax, comp_max, max)
 
         self._foreach_component(index, _minmax)
 
-        return tuple(aminmax)  # type: ignore
+        assert amin is not None
+        assert amax is not None
+
+        return amin, amax
 
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
@@ -411,3 +419,52 @@ class ConcatDataLoader(DataLoaderBase):
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(components={repr(self.components)})'
+
+
+class MappedDataLoaderBase(DataLoaderBase):
+    def __init__(
+        self,
+        inner: DataLoaderBase,
+        subshape: Tuple[int, ...],
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+
+        self.shape = (inner.shape[0],) + subshape
+        self.dtype = dtype or inner.dtype
+        self.device = inner.device
+
+        self.inner = inner
+    
+    def map(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        The result is not necessarily on CPU, derived implementations
+        should check `tensor.device`.
+        """
+        raise NotImplementedError()
+    
+    def _map_and_check(self, tensor: torch.Tensor) -> torch.Tensor:
+        mapped = self.map(tensor)
+        assert mapped.shape[1:] == self.shape[1:]
+        assert mapped.dtype == self.dtype
+        return mapped
+
+    def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
+        tensor = self.inner.partially_load_by_range(index)
+        return self._map_and_check(tensor)
+
+    def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
+        tensor = self.inner.partially_load_by_index(index)
+        return self._map_and_check(tensor)
+
+    def fully_load(self, device: torch.device, replicated) -> torch.Tensor:
+        tensor = self.inner.fully_load(device, replicated)
+        if get_default_dist_env().rank == 0 or replicated:
+            return self._map_and_check(tensor)
+        else:
+            return self.get_placeholder()
+
+    def __repr__(self) -> str:
+        # TODO better repr?
+        return f'{self.__class__.__name__}' \
+            f'(inner={self.inner}, shape={self.shape}, dtype={self.dtype})'

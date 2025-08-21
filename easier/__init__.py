@@ -9,7 +9,8 @@ from .core.module import (
     sum, prod, norm, max, min,
 )
 from .core.runtime.data_loader.factories import (
-    hdf5, full, zeros, ones, full_like, zeros_like, ones_like, arange,
+    hdf5, full, zeros, ones, full_like, zeros_like, ones_like,
+    arange, linspace,
 )
 from .core.runtime.data_loader.mesh import Mesh
 from .core.jit import init, compile

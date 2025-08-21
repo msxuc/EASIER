@@ -183,7 +183,7 @@ class TestDataLoaderBase:
     
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_chunk(self):
-        dl = ArangeDataLoader(3, 100, 3, torch.float64, 'cpu')
+        dl = ArangeDataLoader(3, 3, 33, torch.float64, 'cpu')
         l = list(dl._load_by_chunk_rank0(
             NormalizedSlice(33, 0, 1, 33),
             chunk_size=10
@@ -211,7 +211,7 @@ class TestDataLoaderBase:
                 '.BITPACK_MAXLEN',
             new=10
         ):
-            dl = ArangeDataLoader(3, 100, 3, torch.int64, 'cpu')
+            dl = ArangeDataLoader(3, 3, 33, torch.int64, 'cpu')
             amin, amax = dl.minmax(NormalizedSlice(33, 0, 1, 33))
             assert (amin, amax) == (3, 99)
             nunique = dl.count_unique(NormalizedSlice(33, 0, 1, 33))
@@ -254,11 +254,11 @@ class TestH5DataLoader:
             49 - torch.arange(5, dtype=dtype) * 9 - local_rank * 3, tensor
         )
 
-        # idx = vec() + local_rank
-        # tensor = dl.partially_load_by_index(idx)
-        # assert tensor.dtype == dtype
-        # assert tensor.device.type == 'cpu'  # by rank always CPU
-        # assert torch.equal(idx.to(dtype) * 3 + 1, tensor)
+        idx = vec(1, 3, 9, 7, 5, 15, 11, 13) + local_rank
+        tensor = dl.partially_load_by_index(idx)
+        assert tensor.dtype == dtype
+        assert tensor.device.type == 'cpu'  # by rank always CPU
+        assert torch.equal(idx.to(dtype) * 3 + 1, tensor)
     
     def test_partial_load(self, dtype: torch.dtype):
         torchrun_singlenode(
@@ -316,8 +316,73 @@ class TestH5DataLoader:
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestArangeDataLoader:
-    def test(self):
-        1
+    def _test(self, t: torch.Tensor, dl: ArangeDataLoader, eq):
+        l = t.shape[0]
+
+        t2 = dl.fully_load(torch.device('cpu'), True)
+        assert t.shape == t2.shape
+        assert eq(t, t2)
+
+        t2 = dl.partially_load_by_range(NormalizedSlice(l, 0, 1, l))
+        assert t.shape == t2.shape
+        assert eq(t, t2)
+
+        ns = NormalizedSlice(l, l // 3, 2, l // 3)
+        t1 = CopyingSlicer(t)[ns.to_slice()]
+        t2 = dl.partially_load_by_range(ns)
+        assert eq(t1, t2)
+
+        ns = NormalizedSlice(l, l // 3, 2, l // 3).reverse()
+        t1 = CopyingSlicer(t)[ns.to_slice()]
+        t2 = dl.partially_load_by_range(ns)
+        assert eq(t1, t2)
+
+        idx = vec(1, 3, 7, 5)
+        t1 = t[idx]
+        t2 = dl.partially_load_by_index(idx)
+        assert eq(t1, t2)
+
+    def test_int(self):
+        for (start, step, count) in [
+            (1, 1, 10),
+            (2, 7, 20),
+            (99, -11, 9),
+        ]:
+            stop = start + step * count
+            t = torch.arange(start, stop, step, dtype=torch.int64)
+            dl = ArangeDataLoader(start, step, count, torch.int64, 'cpu')
+            self._test(t, dl, torch.equal)
+
+
+    def test_double(self):
+        for (start, step, count) in [
+            (1, 1, 10),
+            (2, 7, 20),
+            (99, -11, 9),
+            (1, 0.1, 30),
+            (1.5, 2.4, 17),
+            (21.5, -2.4, 10),
+        ]:
+            stop = start + step * count
+            t = torch.arange(start, stop, step, dtype=torch.float64)
+            dl = ArangeDataLoader(start, step, count, torch.float64, 'cpu')
+            self._test(t, dl, torch.allclose)
+    
+    def test_linspace(self):
+        import numpy
+        for (start, stop, num, ep) in [
+            (1, 2, 10, True),
+            (1, 2, 10, False),
+            (-5, -2, 10, True),
+            (-5, -2, 10, False),
+        ]:
+            t = torch.from_numpy(numpy.linspace(
+                start, stop, num, endpoint=ep, dtype=numpy.float64
+            ))
+            dl = easier.linspace(
+                start, stop, num, endpoint=ep, dtype=torch.float64
+            )
+            self._test(t, dl, torch.allclose)
 
 class TestStridedDataLoader:
     @torchrun_spawn()
@@ -509,3 +574,103 @@ class TestConcatDataLoader:
             cdl.partially_load_by_range(ns)
         )
 
+
+class TestMesh:
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_2d(self):
+        mesh = easier.Mesh(
+            easier.linspace(0, 1, 4),
+            easier.linspace(0, 1, 5),
+        )
+        assert mesh.nv == 20
+        assert mesh.ne == (3*4)*(2)*2 - (3 + 4)*2
+
+        v = mesh.vertices.fully_load(torch.device('cpu'), True)
+        src = mesh.src.fully_load(torch.device('cpu'), True)
+        dst = mesh.dst.fully_load(torch.device('cpu'), True)
+
+        assert torch.allclose(
+            v,
+            torch.cartesian_prod(
+                torch.linspace(0, 1, 4),
+                torch.linspace(0, 1, 5),
+            ).to(torch.float64)
+        )
+
+        m = torch.arange(12).reshape(3, 4)
+
+        assert torch.equal(
+            src,
+            torch.concat([
+                m[:-1, :].flatten(),
+                m[1:, :].flatten(),
+
+                m[:, :-1].flatten(),
+                m[:, 1:].flatten(),
+            ], dim=0)
+        )
+
+        assert torch.equal(
+            dst,
+            torch.concat([
+                m[1:, :].flatten(),
+                m[:-1, :].flatten(),
+
+                m[:, 1:].flatten(),
+                m[:, :-1].flatten(),
+            ], dim=0)
+        )
+
+
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_3d(self):
+        mesh = easier.Mesh(
+            easier.linspace(0, 1, 4),
+            easier.linspace(0, 1, 5),
+            easier.linspace(0, 1, 6),
+        )
+        assert mesh.nv == 120
+        assert mesh.ne == (3*4*5)*(3)*2 - (4*5 + 3*5 + 3*4)*2
+
+        v = mesh.vertices.fully_load(torch.device('cpu'), True)
+        src = mesh.src.fully_load(torch.device('cpu'), True)
+        dst = mesh.dst.fully_load(torch.device('cpu'), True)
+
+        assert torch.allclose(
+            v,
+            torch.cartesian_prod(
+                torch.linspace(0, 1, 4),
+                torch.linspace(0, 1, 5),
+                torch.linspace(0, 1, 6),
+            ).to(torch.float64)
+        )
+
+        m = torch.arange(60).reshape(3, 4, 5)
+
+        assert torch.equal(
+            src,
+            torch.concat([
+                m[:-1, :, :].flatten(),
+                m[1:, :, :].flatten(),
+
+                m[:, :-1, :].flatten(),
+                m[:, 1:, :].flatten(),
+
+                m[:, :, :-1].flatten(),
+                m[:, :, 1:].flatten(),
+            ], dim=0)
+        )
+
+        assert torch.equal(
+            dst,
+            torch.concat([
+                m[1:, :, :].flatten(),
+                m[:-1, :, :].flatten(),
+
+                m[:, 1:, :].flatten(),
+                m[:, :-1, :].flatten(),
+
+                m[:, :, 1:].flatten(),
+                m[:, :, :-1].flatten(),
+            ], dim=0)
+        )

@@ -1,16 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import math
 from types import EllipsisType
-from typing import Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union
+from typing import Callable, Iterator, List, Optional, Tuple, TypeAlias, Union
 import functools
 import copy
 
 import torch
 
 from easier.core.runtime.data_loader.utils import \
-    NormalizedSlice
+    NormalizedSlice, get_overlapping_slice
 from easier.core.runtime.dist_env import \
     get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -235,23 +234,28 @@ class DataLoaderBase:
         # TODO basically this is only used for idx, which are ints,
         # but if we want this to be a universal component, we need to
         # ensure float.NaN etc. work as expected.
-        amin, amax = None, None
+        tmin, tmax = None, None
 
-        def _opt_cmp(a: Optional[torch.Tensor], c: torch.Tensor, op):
+        def _opt_cmp(
+            a: Optional[torch.Tensor],
+            c: torch.Tensor,
+            op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        ):
             return c if a is None else op(a, c)
 
         for chunk in self._load_by_chunk_rank0(index):
             # Only on rank-0 we load real data
             if dist_env.rank == 0:
                 chunk_min, chunk_max = torch.aminmax(chunk)
-                amin = _opt_cmp(amin, chunk_min, min)
-                amax = _opt_cmp(amax, chunk_max, max)
-
-                amin, amax = amin.item(), amax.item()  # type: ignore
+                tmin = _opt_cmp(tmin, chunk_min, torch.minimum)
+                tmax = _opt_cmp(tmax, chunk_max, torch.maximum)
             else:
                 assert chunk.shape[0] == 0
-
+        
         if dist_env.rank == 0:
+            assert tmin is not None
+            assert tmax is not None
+            amin, amax = tmin.item(), tmax.item()
             dist_env.broadcast_object_list(0, [amin, amax])
         else:
             [amin, amax] = dist_env.broadcast_object_list(0)
@@ -260,6 +264,7 @@ class DataLoaderBase:
     
     def _pre_minmax(self, index: NormalizedSlice):
         assert index.count > 0, 'caller should handle empty cases separately'
+        assert index.dimlen == self.shape[0], 'index must be in-range'
         check_collective_equality('minmax index', index)
     
     def count_unique(self, index: NormalizedSlice) -> int:
@@ -329,6 +334,8 @@ class DataLoaderBase:
         return nunique
 
     def _pre_count_unique(self, index: NormalizedSlice):
+        # index.count==0 means ncount==0.
+        assert index.dimlen == self.shape[0], 'index must be in-range'
         check_collective_equality('count unique index', index)
     
 
