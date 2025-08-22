@@ -9,7 +9,7 @@ import copy
 import torch
 
 from easier.core.runtime.data_loader.utils import \
-    NormalizedSlice, get_overlapping_slice
+    NormalizedSlice
 from easier.core.runtime.dist_env import \
     get_runtime_dist_env
 from easier.core.runtime.utils import check_collective_equality
@@ -22,7 +22,7 @@ Num: TypeAlias = Union[int, float, bool]
 
 
 GeneralIndex: TypeAlias = Union[
-    int, slice, EllipsisType, # TODO None, torch.Tensor,
+    int, slice, EllipsisType,  # TODO None, torch.Tensor,
 ]
 
 
@@ -73,7 +73,7 @@ class DataLoaderBase:
     NOTE for subclasses:
     Subclasses should implement each method in a way that suits the use case,
     for example, to load a range we should avoid loading-all-then-slicing.
-    
+
     But this is not always possible, an extreme example may be:
     ```
     class RandomSamplerLoader(DataLoaderBase):
@@ -163,7 +163,7 @@ class DataLoaderBase:
 
     BITPACK_MAXLEN = 1024 * 1024 * 128
     CHUNK_SIZE = 1024 * 1024 * 128
-    
+
     def _load_by_chunk_rank0(
         self, index: NormalizedSlice, *, chunk_size=None
     ) -> Iterator[torch.Tensor]:
@@ -186,12 +186,11 @@ class DataLoaderBase:
             chunk = self.partially_load_by_range(s)
             yield chunk
 
-
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         """
         Get minimum and maximum value within the `index` range along dim-0
         of the data source.
-        
+
         `index` must be collectively same on all ranks.
         And must have `len(index)` > 0.
 
@@ -205,7 +204,7 @@ class DataLoaderBase:
             -   All contents are contained in the minmax/unique calculation,
                 despite the `index` parameter, it may still OOM on rank,
                 subclass implementation of these methods should do partition.
-        
+
         -   minmax/count_unique() may recursively call minmax/count_unique(),
             but as the call stack of minmax()s serve for analysis,
             at each callstack frame the input `index` must be collectively
@@ -220,7 +219,7 @@ class DataLoaderBase:
                 totally.
             -   ReshapeDataLoader receives dim-0 index (may be from outside
                 StridedDataLoader) and inner dim-0&1 are flattened.
-        
+
         TODO make all NormalizedSlice to Sequence[NormalizedSlice], then it's
         possible to partially load if some k-dim is extremely long --
         especially when Reshape-/Transpose-DataLoader are added.
@@ -251,7 +250,7 @@ class DataLoaderBase:
                 tmax = _opt_cmp(tmax, chunk_max, torch.maximum)
             else:
                 assert chunk.shape[0] == 0
-        
+
         if dist_env.rank == 0:
             assert tmin is not None
             assert tmax is not None
@@ -261,16 +260,16 @@ class DataLoaderBase:
             [amin, amax] = dist_env.broadcast_object_list(0)
 
         return amin, amax
-    
+
     def _pre_minmax(self, index: NormalizedSlice):
         assert index.count > 0, 'caller should handle empty cases separately'
         assert index.dimlen == self.shape[0], 'index must be in-range'
         check_collective_equality('minmax index', index)
-    
+
     def count_unique(self, index: NormalizedSlice) -> int:
         """
         Count unique elements in the exact `region` range of data source.
-        
+
         `index` must be collectively same on all ranks.
 
         Used by Reducer.set_fullness()
@@ -325,7 +324,7 @@ class DataLoaderBase:
 
             bitpack_nnz = int(torch.count_nonzero(bitpack))
             nunique += bitpack_nnz
-        
+
         if dist_env.rank == 0:
             dist_env.broadcast_object_list(0, [nunique])
         else:
@@ -337,7 +336,6 @@ class DataLoaderBase:
         # index.count==0 means ncount==0.
         assert index.dimlen == self.shape[0], 'index must be in-range'
         check_collective_equality('count unique index', index)
-    
 
     def to(
         self,
@@ -392,10 +390,9 @@ class DataLoaderBase:
             else:
                 # TODO support idx==None
                 raise IndexError(f"Unexpect index {idx}")
-        
+
         # TODO certain DataLoader stack can be reduced and simplified
         return StridedDataLoader(self, view_indices)
-
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         """
@@ -405,7 +402,7 @@ class DataLoaderBase:
 
         Callers should make the argument `index` have in-range, positive-int
         values regarding the callee DataLoader.
-            
+
         Args:
         -   index: NormalizedSlice
             Currently on dim-0 only
@@ -414,7 +411,6 @@ class DataLoaderBase:
         - torch.Tensor: the loaded part, always on CPU
         """
         raise NotImplementedError()
-
 
     def _post_partially_load_by_range(self, res, index):
         assert res.device.type == 'cpu'
@@ -550,8 +546,8 @@ being ordered to boost index calculation. The idx tensors are all originally
 loaded by DataLoaders.
 However, DataLoader internal methods currently return Tensors only,
 therefore we didn't recognize such properties in the 1st place.
-And the passes themselves maintain then discard the record objects that
-indicate such properties, without making a global effort to leverage it.
+And even the sparse_encoding etc. passes only use property objects locally,
+without making a global effort to leverage properties during the whole AOT.
 
 Given the data-oriented nature of EASIER AOT, we may make every subsystem in
 AOT return symbolic representation of data.
@@ -563,7 +559,11 @@ from thread id rather than loading arange-d data from memory.
 Nonetheless, CUDA acceleration, GC in AOT can also be handled by it, authors
 of passes can focus on compilation logic.
 
-That said, because of the need to balance computation costs for general cases
+P.S. Even without completely embracing symbolic methods, we can let DataLoaders
+return a limited set of property objects (just like Aranged, Ordered) or
+a collections of property objects (just like Concat).
+
+Nonetheless, because of the need to balance computation costs for general cases
 and the requirement of managing synchronization points of collective
 communication APIs,
 we may fallback to tensor calculation once when the "generalness" occur again

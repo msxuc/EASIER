@@ -17,12 +17,12 @@ from easier.core.runtime.data_loader.utils import \
     get_strides
 
 
-
 class _MeshIndex:
     """
     Syntactic sugar to convert N-D indices to 1-D DataLoader for
     `Selector/Reducer.idx`.
     """
+
     def __init__(self, mesh: 'Mesh') -> None:
         self.mesh = mesh
 
@@ -126,6 +126,7 @@ class Mesh(torch.nn.Module):
     and users could use `Mesh.indices[i0, ..., i_{N-1}]` attribute to convert
     N indices to an 1-d index to apply on the resultant `Mesh.vertices` data.
     """
+
     def __init__(
         self,
         *vertices_vectors: DataLoaderBase,
@@ -160,7 +161,7 @@ class Mesh(torch.nn.Module):
 
             nvs.append(dim_nv)
             ncs.append(dim_nv - 1)
-        
+
         self.vertices_vectors = vertices_vectors
         self._nvs = nvs
         self._ncs = ncs
@@ -231,7 +232,7 @@ class Mesh(torch.nn.Module):
 
             srcs.extend([upstream_cube_ids, downstream_cube_ids])
             dsts.extend([downstream_cube_ids, upstream_cube_ids])
-        
+
         # shape=(ne, ND)
         self.src = ConcatDataLoader(srcs)
         self.dst = ConcatDataLoader(dsts)
@@ -244,6 +245,7 @@ class _MeshIdsDataLoader(MappedDataLoaderBase):
     Calculate 1-d IDs for a certain kind of elements in the mesh,
     they may be hypercubes or vertices.
     """
+
     def __init__(
         self,
         # N-d coordinates for (the subset of) the target kind of elements
@@ -260,7 +262,7 @@ class _MeshIdsDataLoader(MappedDataLoaderBase):
         # `tensor` is the distributed part of the subset of elements
         assert tensor.ndim == 2
         assert tensor.shape[1] == self.inner.shape[1]
-        
+
         # (N,)
         strides = self.strides.to(tensor.device)
 

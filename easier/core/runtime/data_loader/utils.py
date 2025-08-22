@@ -10,6 +10,7 @@ import torch
 
 _T = TypeVar('_T')
 
+
 @dataclass
 class NormalizedSlice:
     """
@@ -50,7 +51,7 @@ class NormalizedSlice:
             raise ValueError("NormalizedSlice.step must be != 0")
         if not (self.count >= 0):
             raise ValueError("NormalizedSlice.count must be >= 0")
-        
+
         if self.count > 0:
             last_idx = self.start + (self.count - 1) * self.step
             if self.step > 0:
@@ -60,16 +61,15 @@ class NormalizedSlice:
                 if not (last_idx >= 0):
                     raise ValueError("NormalizedSlice is out of range")
 
-
     def __len__(self):
         return self.count
-    
+
     @staticmethod
     def from_slice(length: int, s: slice) -> 'NormalizedSlice':
         start, stop, step = s.indices(length)
         count = len(range(start, stop, step))
         return NormalizedSlice(length, start, step, count)
-            
+
     def to_slice(self) -> slice:
         """
         The resultant slice is only applicable to a sequence with
@@ -83,7 +83,7 @@ class NormalizedSlice:
             # equivalent given the negative step.
             stop = None
         return slice(self.start, stop, self.step)
-    
+
     @overload
     def to_range(self, range_cls: Type[_T]) -> _T: ...
     @overload
@@ -92,24 +92,24 @@ class NormalizedSlice:
     def to_range(self, range_cls=range):  # type: ignore
         stop = self.start + self.step * self.count
         return range_cls(self.start, stop, self.step)
-    
+
     def compose(self, next: 'NormalizedSlice') -> 'NormalizedSlice':
         if not (next.dimlen == self.count):
             raise ValueError(
                 'Derived DataLoader methods should maintain the alignment of'
                 ' shapes during the composition of DataLoaders'
             )
-        
+
         new_start = self.start + next.start * self.step
         new_step = self.step * next.step
         new_count = next.count
         return NormalizedSlice(self.dimlen, new_start, new_step, new_count)
-    
+
     def split(self, chunk_size: int) -> List['NormalizedSlice']:
         nchunk, remainder = divmod(self.count, chunk_size)
         if remainder > 0:
             nchunk += 1
-        
+
         splits = []
         for i in range(nchunk):
             this_size = min(self.count, chunk_size * (i + 1)) - i * chunk_size
@@ -120,7 +120,7 @@ class NormalizedSlice:
                 this_size)
             splits.append(ns)
         return splits
-    
+
     def reverse(self) -> 'NormalizedSlice':
         if self.count == 0:
             return self
@@ -149,11 +149,10 @@ def get_overlapping_slice(
     # so we need to reverse it if s.step < 0
     if selection.step < 0:
         overlap = overlap.reversed
-    
+
     return NormalizedSlice(
         region.dimlen, int(overlap.start), int(overlap.step), len(overlap)
     )
-
 
 
 def get_strides(shape: Sequence[int]) -> torch.Tensor:
@@ -178,6 +177,7 @@ class CopyingSlicer:
     CopyingSlicer(tensor)[:, ::-2, 3]
     ```
     """
+
     def __init__(self, tensor) -> None:
         self.tensor = tensor
 
@@ -185,6 +185,6 @@ class CopyingSlicer:
         # Rely on __getitem__ protocol and [] syntax to ease writing slices.
         if not isinstance(index, tuple):
             index = (index,)
-        
+
         # one index may be torch.Tensor, can be directly used to index ndarray.
         return torch.from_numpy(self.tensor.numpy()[*index].copy())

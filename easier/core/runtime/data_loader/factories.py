@@ -4,7 +4,7 @@
 from contextlib import contextmanager
 import math
 import os
-from typing import List, Literal, Optional, Sequence, Tuple, Union, cast, overload
+from typing import List, Optional, Sequence, Tuple, Union, cast, overload
 import h5py
 
 import numpy as np
@@ -163,7 +163,6 @@ class H5DataLoader(DataLoaderBase):
                 d = d.astype(self._target_np_dtype)  # type: ignore
 
             yield cast(h5py.Dataset, d)
-    
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         dist_env = get_runtime_dist_env()
@@ -214,7 +213,6 @@ class H5DataLoader(DataLoaderBase):
                 req.wait()
 
             return buffer.cpu()
-
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         """
@@ -399,6 +397,7 @@ class ArangeDataLoader(DataLoaderBase):
     which may cause the lenghth to be 7 rather than 6.
     So whenever possible, we favor direct `count` value instead of division.
     """
+
     def __init__(
         self,
         start: Num,
@@ -418,7 +417,8 @@ class ArangeDataLoader(DataLoaderBase):
         else:
             if not all(isinstance(arg, int) for arg in args):
                 raise ValueError("start/step must be int")
-
+        # TODO if we allow giving floats but dtype=int cases, we need to
+        # ensure the datatype cast is the same as torch/numpy.
 
         if math.isinf(start):
             raise ValueError(f"start cannot be {start}")
@@ -426,7 +426,7 @@ class ArangeDataLoader(DataLoaderBase):
             raise ValueError(f"step must not be {step}")
         if not (isinstance(count, int) and count >= 0):
             raise ValueError(f"count must be non-negative int")
-        
+
         self._start = start
         self._step = step
         self._count = count
@@ -485,7 +485,6 @@ class ArangeDataLoader(DataLoaderBase):
             f'dtype={self.dtype}',
             ')'
         ])
-
 
 
 def hdf5(
@@ -718,10 +717,10 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
 
     if dtype is None:
         dtype = torch.float64
-    
+
     if not dtype.is_floating_point:
         raise NotImplementedError("Not supporting ints yet")
-    
+
     nstep = num
     if not endpoint:
         nstep += 1
@@ -730,7 +729,7 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
     # TODO for floating numbers the division may lead to unexpected rounding
     # causing the specified `stop` is not exactly included -- because the last
     # element is calculated using `start+step*(num-1)`.
-    
+
     if device is None:
         # TODO like torch.set_default_device()
         device = 'cpu'

@@ -27,6 +27,7 @@ def _assert(node, defset: AbstractSet[EasierTensorDef], target):
     assert _grp_equals_defset(grp, defset)
     assert node.target == target
 
+
 @pytest.mark.usefixtures('dummy_dist_env')
 def test_tensor_grouping__simple():
     class M(esr.Module):

@@ -168,7 +168,6 @@ def multi_stage_zero_length_partition(
 
         return elemparts
 
-
     distpart_module = _metis.__module__
     tensor_partition_module = _sync_elempart.__module__
 

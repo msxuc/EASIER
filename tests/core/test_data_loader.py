@@ -39,7 +39,7 @@ class TestNormalizedSlice:
         ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
         assert ns == NormalizedSlice(length, 0, 2, 4)
         assert ns.to_slice() == slice(0, 8, 2)
-        
+
         length, start, stop, step = 10, -1, 2, -2
         ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
         assert ns == NormalizedSlice(length, 9, -2, 4)
@@ -54,32 +54,31 @@ class TestNormalizedSlice:
         ns = NormalizedSlice.from_slice(length, slice(start, stop, step))
         assert ns == NormalizedSlice(length, 8, -2, 5)
         assert ns.to_slice() == slice(8, None, -2)
-    
+
     def test_compose(self):
         ns1 = NormalizedSlice(20, 1, 2, 7)
 
         with pytest.raises(ValueError, match='maintain.*shapes'):
             ns1.compose(ns1)
-        
+
         assert ns1.compose(
             NormalizedSlice(7, 1, 2, 3)
         ) == NormalizedSlice(20, 3, 4, 3)
-    
+
         assert ns1.compose(
             NormalizedSlice(7, 6, -3, 2)
         ) == NormalizedSlice(20, 13, -6, 2)
 
-
         ns2 = NormalizedSlice(20, 18, -3, 6)
-        
+
         assert ns2.compose(
             NormalizedSlice(6, 1, 2, 3)
         ) == NormalizedSlice(20, 15, -6, 3)
-        
+
         assert ns2.compose(
             NormalizedSlice(6, 5, -1, 4)
         ) == NormalizedSlice(20, 3, 3, 4)
-    
+
     def test_split(self):
         ns1 = NormalizedSlice(200, 3, 5, 30)
         assert ns1.split(8) == [
@@ -96,14 +95,14 @@ class TestNormalizedSlice:
             NormalizedSlice(200, 100, -5, 8),
             NormalizedSlice(200, 60, -5, 6),
         ]
-    
+
     def test_reverse(self):
         ns1 = NormalizedSlice(200, 3, 5, 30)
         assert ns1.reverse() == NormalizedSlice(200, 148, -5, 30)
 
         ns2 = NormalizedSlice(200, 180, -5, 30)
         assert ns2.reverse() == NormalizedSlice(200, 35, 5, 30)
-    
+
     def test_overlap_region_directionless(self):
         regions = [
             NormalizedSlice(100, 0, 1, 100),
@@ -117,7 +116,7 @@ class TestNormalizedSlice:
         for r in regions:
             for s in selections:
                 assert get_overlapping_slice(r, s) == s
-    
+
     def test_overlap(self):
         assert get_overlapping_slice(
             NormalizedSlice(100, 7, 3, 30), NormalizedSlice(100, 11, 5, 15)
@@ -126,7 +125,6 @@ class TestNormalizedSlice:
         assert get_overlapping_slice(
             NormalizedSlice(100, 7, 3, 30), NormalizedSlice(100, 97, -4, 20)
         ) == NormalizedSlice(100, 85, -12, 6)
-
 
 
 def get_h5_tensor_loader(dtype: torch.dtype,
@@ -143,6 +141,7 @@ def get_h5_tensor_loader(dtype: torch.dtype,
 
     return H5DataLoader(fpath, "d", dtype=dtype, device=device_type)
 
+
 def get_in_memory_tensor_loader(
     dtype: torch.dtype, device_type: Literal['cpu', 'cuda']
 ):
@@ -153,9 +152,9 @@ def get_in_memory_tensor_loader(
 
 class TestDataLoaderBase:
     @pytest.mark.parametrize('data_loader_ctor',
-                            [get_in_memory_tensor_loader, get_h5_tensor_loader])
+                             [get_in_memory_tensor_loader, get_h5_tensor_loader])
     @pytest.mark.parametrize('dtype',
-                            [torch.int64, torch.float64], ids=['i64', 'f64'])
+                             [torch.int64, torch.float64], ids=['i64', 'f64'])
     @pytest.mark.parametrize('device_type', [
         'cpu',
         # no device IDs, all workers use cuda:0.
@@ -180,7 +179,7 @@ class TestDataLoaderBase:
         assert dl is not dl_device
         assert dl_device.device.type == device_type
         assert dl_device.dtype == dtype
-    
+
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_chunk(self):
         dl = ArangeDataLoader(3, 3, 33, torch.float64, 'cpu')
@@ -203,11 +202,11 @@ class TestDataLoaderBase:
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_minmax_unique(self):
         with patch(
-            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}' \
+            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}'
                 '.CHUNK_SIZE',
             new=10,
         ), patch(
-            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}' \
+            f'{DataLoaderBase.__module__}.{DataLoaderBase.__name__}'
                 '.BITPACK_MAXLEN',
             new=10
         ):
@@ -216,7 +215,7 @@ class TestDataLoaderBase:
             assert (amin, amax) == (3, 99)
             nunique = dl.count_unique(NormalizedSlice(33, 0, 1, 33))
             assert nunique == 33
-            
+
             amin, amax = dl.minmax(NormalizedSlice(33, 32, -2, 16))
             assert (amin, amax) == (9, 99)
             nunique = dl.count_unique(NormalizedSlice(33, 32, -2, 16))
@@ -259,20 +258,20 @@ class TestH5DataLoader:
         assert tensor.dtype == dtype
         assert tensor.device.type == 'cpu'  # by rank always CPU
         assert torch.equal(idx.to(dtype) * 3 + 1, tensor)
-    
+
     def test_partial_load(self, dtype: torch.dtype):
         torchrun_singlenode(
             2, self.worker__test_partial_load, (dtype,)
         )
-        
+
     def worker__test_fully_load(
-        self, local_rank: int, world_size: int, 
+        self, local_rank: int, world_size: int,
         dtype: torch.dtype, device_type: str, final_device_type: str
     ):
         dl = get_h5_tensor_loader(dtype, device_type)  # type: ignore
 
         final_device = torch.device(final_device_type, local_rank)
-        
+
         v = torch.arange(17) * 3 + 1
         v = v.to(dtype=dtype, device=final_device)
 
@@ -288,7 +287,7 @@ class TestH5DataLoader:
             assert torch.equal(v, tensor)
         else:
             assert not torch.equal(v, tensor)
-        
+
         tensor = dl.fully_load(final_device, replicated=True)
         assert tensor.dtype == dtype
         if final_device_type == 'cpu':
@@ -313,6 +312,7 @@ class TestH5DataLoader:
             2, self.worker__test_fully_load,
             (dtype, device_type, final_device_type)
         )
+
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestArangeDataLoader:
@@ -353,7 +353,6 @@ class TestArangeDataLoader:
             dl = ArangeDataLoader(start, step, count, torch.int64, 'cpu')
             self._test(t, dl, torch.equal)
 
-
     def test_double(self):
         for (start, step, count) in [
             (1, 1, 10),
@@ -367,7 +366,7 @@ class TestArangeDataLoader:
             t = torch.arange(start, stop, step, dtype=torch.float64)
             dl = ArangeDataLoader(start, step, count, torch.float64, 'cpu')
             self._test(t, dl, torch.allclose)
-    
+
     def test_linspace(self):
         import numpy
         for (start, stop, num, ep) in [
@@ -383,6 +382,7 @@ class TestArangeDataLoader:
                 start, stop, num, endpoint=ep, dtype=torch.float64
             )
             self._test(t, dl, torch.allclose)
+
 
 class TestStridedDataLoader:
     @torchrun_spawn()
@@ -442,7 +442,6 @@ class TestStridedDataLoader:
         )
 
 
-
 class TestCartesianProductDataLoader:
     @torchrun_spawn()
     def worker__test(self):
@@ -464,7 +463,7 @@ class TestCartesianProductDataLoader:
 
         idx = torch.arange(155, 162)
         assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
-        
+
         idx = torch.arange(383, 200, -5)
         assert torch.equal(cdl.partially_load_by_index(idx), raw[idx])
 
@@ -472,6 +471,7 @@ class TestCartesianProductDataLoader:
 
         if get_default_dist_env().rank == 0:
             assert torch.equal(raw, cdl.fully_load(torch.device('cpu'), False))
+
 
 class TestConcatDataLoader:
     @torchrun_spawn()
@@ -481,9 +481,11 @@ class TestConcatDataLoader:
             easier.arange(50, 80),
             easier.arange(100, 150),
         ])
+
         class _Ascend:
             def __init__(self) -> None:
                 self.call = 0
+
             def __call__(self, comp, concat_overlap, comp_overlap):
                 assert isinstance(comp, ArangeDataLoader)
                 if self.call == 0:
@@ -543,9 +545,11 @@ class TestConcatDataLoader:
             easier.arange(50, 80),
             easier.arange(100, 150),
         ])
+
         class _Descend:
             def __init__(self) -> None:
                 self.call = 0
+
             def __call__(self, comp, concat_overlap, comp_overlap):
                 if self.call == 0:
                     assert comp._start == 100
@@ -642,7 +646,6 @@ class TestMesh:
             idx,
             coords[:, 0] * 5 + coords[:, 1]
         )
-
 
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_3d(self):

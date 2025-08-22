@@ -16,7 +16,6 @@ from easier.core.runtime.dist_env import \
 from easier.core.runtime.utils import check_collective_equality
 
 
-
 class StridedDataLoader(DataLoaderBase):
     def __init__(
         self,
@@ -71,12 +70,12 @@ class StridedDataLoader(DataLoaderBase):
         # Given `self.index` may contain ints, the dimensions related to those
         # ints are discarded, i.e.:
         assert len(self.shape) <= len(self.inner.shape)
-    
+
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
 
         check_collective_equality("index", self.norm_index)
-    
+
     def _get_norm_slice0(self) -> NormalizedSlice:
         idx = self.norm_index[0]
         if isinstance(idx, int):
@@ -86,7 +85,6 @@ class StridedDataLoader(DataLoaderBase):
         else:
             assert False, 'unreachable'
 
-    
     # TODO because minmax/count_unique only take dim-0 index,
     # but a StridedDataLoader may have n-d indices, we cannot simply dispatch
     # to self.inner.minmax() -- but if we take a Seq[Slice] then we can.
@@ -116,7 +114,7 @@ class StridedDataLoader(DataLoaderBase):
             sub_idx0 = Ellipsis
         else:
             assert False, 'unreachable'
-        
+
         return CopyingSlicer(subtensor)[sub_idx0, *tidx[1:]]
 
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
@@ -171,6 +169,7 @@ class CartesianProductDataLoader(DataLoaderBase):
 
     The result shape is `(L_0*...*L_{N-1}, N)`.
     """
+
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
@@ -190,12 +189,12 @@ class CartesianProductDataLoader(DataLoaderBase):
 
             dtypes.append(dl.dtype)
             devices.append(dl.device)
-        
+
         if len(set(dtypes)) != 1:
             raise ValueError("Input dtypes must be the same")
         if len(set(devices)) != 1:
             raise ValueError("Input devices must be the same")
-        
+
         self.shape = (math.prod(nd_sizes), len(components))
         self.dtype = dtypes[0]
         self.device = devices[0]
@@ -204,7 +203,7 @@ class CartesianProductDataLoader(DataLoaderBase):
         self.components = list(components)
 
         self._chunk_size = 128 * 1024 * 1024
-    
+
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         idx_tensor = cast(torch.Tensor, index.to_range(torch.arange))
         return self.partially_load_by_index(idx_tensor)
@@ -259,7 +258,7 @@ class CartesianProductDataLoader(DataLoaderBase):
                         chunk_start <= comp_idx, comp_idx < chunk_end
                     )
                     ret[idx_mask, idl] = chunk[comp_idx[idx_mask]]
-        
+
         return ret
 
     def fully_load(
@@ -267,12 +266,12 @@ class CartesianProductDataLoader(DataLoaderBase):
     ) -> torch.Tensor:
         dist_env = get_default_dist_env()
         rank = dist_env.rank
-        
+
         # nested fully_load are all collective calls
         vectors = [
             comp.fully_load(device, replicated) for comp in self.components
         ]
-        
+
         if replicated or rank == 0:
             return torch.cartesian_prod(*vectors)
         else:
@@ -280,6 +279,7 @@ class CartesianProductDataLoader(DataLoaderBase):
 
     def __repr__(self) -> str:
         return f'{self.__class__.__name__}(components={repr(self.components)})'
+
 
 class ConcatDataLoader(DataLoaderBase):
     def __init__(
@@ -303,7 +303,6 @@ class ConcatDataLoader(DataLoaderBase):
         self.dtype = components[0].dtype
         self.device = components[0].device
 
-
     def _foreach_component(self, index: NormalizedSlice, fn):
         # fn: (DataLoaderBase, _SimpleIndex) -> None
         n = len(self.components)
@@ -321,7 +320,7 @@ class ConcatDataLoader(DataLoaderBase):
             components = reversed(self.components)
             starts = starts.flip(0)
             ends = ends.flip(0)
-            
+
         for i, comp in enumerate(components):
             start = int(starts[i])
             end = int(ends[i])
@@ -340,7 +339,6 @@ class ConcatDataLoader(DataLoaderBase):
                     len(concat_overlap)
                 )
             fn(comp, concat_overlap, comp_overlap)
-
 
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
         amin, amax = None, None
@@ -366,9 +364,9 @@ class ConcatDataLoader(DataLoaderBase):
 
         return amin, amax
 
-
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         parts = []
+
         def _load_comp(
             comp: DataLoaderBase,
             concat_overlap: NormalizedSlice,
@@ -380,7 +378,7 @@ class ConcatDataLoader(DataLoaderBase):
 
         # If region[0].step < 0, parts will be in reversed order
         return torch.concat(parts, dim=0)
-    
+
     def partially_load_by_index(self, index: torch.Tensor) -> torch.Tensor:
         ret = torch.empty(
             (index.shape[0],) + self.shape[1:], dtype=self.dtype, device='cpu'
@@ -398,7 +396,7 @@ class ConcatDataLoader(DataLoaderBase):
             ret[mask] = comp_slice
 
             _offset = comp_end
-        
+
         return ret
 
     def fully_load(self, device: torch.device, replicated) -> torch.Tensor:
@@ -435,14 +433,14 @@ class MappedDataLoaderBase(DataLoaderBase):
         self.device = inner.device
 
         self.inner = inner
-    
+
     def map(self, tensor: torch.Tensor) -> torch.Tensor:
         """
         The result is not necessarily on CPU, derived implementations
         should check `tensor.device`.
         """
         raise NotImplementedError()
-    
+
     def _map_and_check(self, tensor: torch.Tensor) -> torch.Tensor:
         mapped = self.map(tensor)
         assert mapped.shape[1:] == self.shape[1:]

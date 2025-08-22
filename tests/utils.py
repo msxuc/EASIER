@@ -157,13 +157,13 @@ class _DeferredBinderForSpawningWorkerMethod:
         self.public_name = public_name
         self.worker_func = worker_func
         self.spawner: _WorkerMethodSpawner = spawner
-    
+
     def __set_name__(self, owner, name):
         # Python protocol, gets called when the class definition is finalized
         self.spawner.test_cls_obj = owner
         setattr(owner, self.public_name, self.spawner.spawn)
         setattr(owner, self.worker_func.__name__, self.worker_func)
-    
+
     def __setattr__(self, name, value):
         if not all(
             n in self.__dict__ for n in
@@ -176,6 +176,7 @@ class _DeferredBinderForSpawningWorkerMethod:
                 f'{self.__class__}.__setattr__ is not expected to be called,' \
                 ' ensure @torchrun_spawn is the last decorator to apply'
 
+
 class _WorkerMethodSpawner:
     def __init__(self, nprocs: int, worker_func, init_type: str):
         self.nprocs = nprocs
@@ -183,7 +184,7 @@ class _WorkerMethodSpawner:
         self.init_type = init_type
 
         self.test_cls_obj = None
-    
+
     def spawn_target(self, world_size, local_rank):
         args = ()
         if self.test_cls_obj is not None:
@@ -195,6 +196,7 @@ class _WorkerMethodSpawner:
             self.nprocs, self.spawn_target, (), {},
             self.init_type  # type: ignore
         )
+
 
 def torchrun_spawn(  # type: ignore
     nprocs: int = 2,
@@ -242,7 +244,7 @@ def torchrun_spawn(  # type: ignore
             return _DeferredBinderForSpawningWorkerMethod(
                 public_name, func, spawner
             )
-    
+
     return wrapper
 
 

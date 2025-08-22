@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 from typing import \
-    Dict, List, Optional, Sequence, Tuple, Union, overload, TYPE_CHECKING
+    Dict, List, Optional, Tuple, Union, overload, TYPE_CHECKING
 from typing_extensions import TypeAlias, Self
 import os
 
