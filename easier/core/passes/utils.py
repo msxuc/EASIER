@@ -22,6 +22,7 @@ from torch.fx.node import Node, Argument
 from torch.fx.operator_schemas import normalize_function, ArgsKwargsPair
 
 import easier.core.module as esr
+from easier.core.runtime.data_loader.utils import NormalizedSlice
 from easier.core.runtime.dist_env import get_default_dist_env
 from easier.core.utils import EasierJitException
 
@@ -364,7 +365,7 @@ def get_selector_reducer_idx_partition(
             pend = pstart + per_worker_len
 
         partial_idx = module.easier_data_loader.partially_load_by_range(
-            [slice(pstart, pend)]
+            NormalizedSlice(dimlen, pstart, 1, pend - pstart)
         )
         module.idx = partial_idx
         module.easier_idx_part_range = (pstart, pend)

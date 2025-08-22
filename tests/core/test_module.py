@@ -23,7 +23,9 @@ def fully_load_data(t: easier.Tensor):
 
 def fully_load_idx(m: Union[easier.Selector, easier.Reducer]):
     assert m.easier_index_status == 'placeholder'
-    m.idx = m.easier_data_loader.fully_load(torch.device('cpu'))
+    m.idx = m.easier_data_loader.fully_load(
+        torch.device('cpu'), replicated=False
+    )
     m.easier_index_status = 'rewritten'
 
 

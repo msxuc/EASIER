@@ -68,6 +68,8 @@ class InMemoryTensorLoader(DataLoaderBase):
             return self.get_placeholder(device)
 
     def __repr__(self) -> str:
+        # TODO affected by torch print options, if the print options changed,
+        # may cause esr.load rejects to load a dump.
         return f'{self.__class__.__name__}(tensor={self.tensor})'
 
 
@@ -407,6 +409,17 @@ class ArangeDataLoader(DataLoaderBase):
     ):
         super().__init__()
 
+        if dtype.is_complex:
+            raise NotImplementedError("range cannot be complex")
+        args = [start, step]
+        if dtype.is_floating_point:
+            if not all(isinstance(arg, (float, int)) for arg in args):
+                raise ValueError("start/step must be number")
+        else:
+            if not all(isinstance(arg, int) for arg in args):
+                raise ValueError("start/step must be int")
+
+
         if math.isinf(start):
             raise ValueError(f"start cannot be {start}")
         if step == 0 or math.isinf(step):
@@ -414,9 +427,6 @@ class ArangeDataLoader(DataLoaderBase):
         if not (isinstance(count, int) and count >= 0):
             raise ValueError(f"count must be non-negative int")
         
-        if dtype.is_complex:
-            raise NotImplementedError("range cannot be complex")
-
         self._start = start
         self._step = step
         self._count = count
@@ -436,10 +446,6 @@ class ArangeDataLoader(DataLoaderBase):
         if self.dtype.is_floating_point:
             raise ValueError("Floating-point data is not expected")
 
-        # TODO although we have checked `not dtype.is_floating_point`, the
-        # start/step attributes may still be floats. The result should be
-        # casted to dtype
-        # TODO enforce result to be (int,int) only since this is for S/R.idx.
         idx1 = index.start
         idx2 = index.start + index.step * (index.count - 1)
 

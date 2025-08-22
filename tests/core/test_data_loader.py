@@ -708,3 +708,15 @@ class TestMesh:
             idx,
             coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
         )
+
+        idxdl = mesh.indices[1:4:2, :-1, 1:]
+        coords = torch.cartesian_prod(
+            torch.arange(4)[1:4:2],
+            torch.arange(5)[:-1],
+            torch.arange(6)[1:],
+        )
+        idx = idxdl.fully_load(torch.device('cpu'), True)
+        assert torch.equal(
+            idx,
+            coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
+        )

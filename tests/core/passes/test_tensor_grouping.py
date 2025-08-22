@@ -3,6 +3,7 @@
 
 import operator
 from typing import AbstractSet
+import pytest
 import torch
 
 
@@ -26,7 +27,7 @@ def _assert(node, defset: AbstractSet[EasierTensorDef], target):
     assert _grp_equals_defset(grp, defset)
     assert node.target == target
 
-
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_tensor_grouping__simple():
     class M(esr.Module):
         def __init__(self):
@@ -107,6 +108,7 @@ def test_tensor_grouping__simple():
     _assert(add_eII,    g3,     operator.add)
 
 
+@pytest.mark.usefixtures('dummy_dist_env')
 def test_tensor_grouping__cross_graph():
     v1 = esr.Tensor(torch.zeros(55, 66, 77), mode='partition')
     v2 = esr.Tensor(torch.zeros(55, 66, 77), mode='partition')
