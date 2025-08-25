@@ -204,6 +204,13 @@ class Mesh(torch.nn.Module):
 
         self.indices = _MeshIndex(vertices_vectors, self.device)
 
+        cell_ids = [
+            ArangeDataLoader(0, 1, nc, dtype=torch.int64, device=self.device)
+            for nc in ncs
+        ]
+        self.cell_indices = _MeshIndex(cell_ids, self.device)
+        self.nc = math.prod(ncs)
+
     def _build_face_indices(self):
         ncs = self._ncs
         ndim = len(ncs)
