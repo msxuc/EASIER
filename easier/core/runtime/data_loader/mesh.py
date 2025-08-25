@@ -23,8 +23,9 @@ class _MeshIndex:
     `Selector/Reducer.idx`.
     """
 
-    def __init__(self, mesh: 'Mesh') -> None:
-        self.mesh = mesh
+    def __init__(self, mesh_elem_lists: Sequence[DataLoaderBase], device: torch.device) -> None:
+        self.mesh_elem_lists = mesh_elem_lists
+        self.device = device
 
     def __getitem__(
         self,
@@ -85,7 +86,7 @@ class _MeshIndex:
         if not isinstance(indices, tuple):
             indices = (indices,)
 
-        if not (len(indices) <= len(self.mesh.vertices_vectors)):
+        if not (len(indices) <= len(self.mesh_elem_lists)):
             raise ValueError(
                 "Indices must not be more than dimensions of vertices"
             )
@@ -97,16 +98,23 @@ class _MeshIndex:
 
         space_shape: List[int] = []
         dim_dls: List[DataLoaderBase] = []
-        for dim, vdl in enumerate(self.mesh.vertices_vectors):
+        for dim, vdl in enumerate(self.mesh_elem_lists):
             nv = vdl.shape[0]
             space_shape.append(nv)
 
             dim_dl = ArangeDataLoader(
-                0, 1, nv, dtype=torch.int64, device=self.mesh.device
+                0, 1, nv, dtype=torch.int64, device=self.device
             )
 
             if dim < len(indices):
                 idx = indices[dim]
+
+                if isinstance(idx, int):
+                    # when converting N-d index to 1-d index, unsequeezing
+                    # this int-indexed dim makes it easier for following
+                    # cartesian product.
+                    idx = slice(idx, idx + 1, 1)
+
                 dim_dl = dim_dl[idx]  # StridedDataLoader
 
             dim_dls.append(dim_dl)
@@ -194,7 +202,7 @@ class Mesh(torch.nn.Module):
         vertices = CartesianProductDataLoader(vertices_vectors)
         self.vertices = vertices
 
-        self.indices = _MeshIndex(self)
+        self.indices = _MeshIndex(vertices_vectors, self.device)
 
     def _build_face_indices(self):
         ncs = self._ncs

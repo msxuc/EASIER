@@ -221,6 +221,27 @@ class TestDataLoaderBase:
             nunique = dl.count_unique(NormalizedSlice(33, 32, -2, 16))
             assert nunique == 16
 
+    
+    @pytest.mark.usefixtures('dummy_dist_env')
+    def test_getitem(self):
+        t = torch.rand(5, 4, 3)
+        dl = InMemoryTensorLoader(t)
+
+        view = dl[1]
+        data = view.fully_load(torch.device('cpu'), True)
+        assert view.shape == (4, 3)
+        assert torch.equal(data, t[1])
+
+        view = dl[1:]
+        data = view.fully_load(torch.device('cpu'), True)
+        assert view.shape == (4, 4, 3)
+        assert torch.equal(data, t[1:])
+
+        view = dl[-1:-3:-1, 2, :]
+        data = view.fully_load(torch.device('cpu'), True)
+        assert view.shape == (2, 3)
+        assert torch.equal(data, CopyingSlicer(t)[-1:-3:-1, 2, :])
+
 
 @pytest.mark.parametrize(
     'dtype', [torch.int64, torch.float64], ids=['i64', 'f64']
@@ -626,6 +647,7 @@ class TestMesh:
         )
 
         idxdl = mesh.indices[:, :]
+        assert idxdl.shape == (20,)
         coords = torch.cartesian_prod(
             torch.arange(4),
             torch.arange(5)
@@ -637,9 +659,22 @@ class TestMesh:
         )
 
         idxdl = mesh.indices[1:4:2, :-1]
+        assert idxdl.shape == (8,)
         coords = torch.cartesian_prod(
             torch.arange(4)[1:4:2],
             torch.arange(5)[:-1]
+        )
+        idx = idxdl.fully_load(torch.device('cpu'), True)
+        assert torch.equal(
+            idx,
+            coords[:, 0] * 5 + coords[:, 1]
+        )
+
+        idxdl = mesh.indices[3, 3]
+        assert idxdl.shape == (1,)
+        coords = torch.cartesian_prod(
+            torch.arange(4)[3:4],
+            torch.arange(5)[3:4]
         )
         idx = idxdl.fully_load(torch.device('cpu'), True)
         assert torch.equal(
@@ -701,6 +736,7 @@ class TestMesh:
         )
 
         idxdl = mesh.indices[:, :, :]
+        assert idxdl.shape == (120,)
         coords = torch.cartesian_prod(
             torch.arange(4),
             torch.arange(5),
@@ -712,11 +748,12 @@ class TestMesh:
             coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
         )
 
-        idxdl = mesh.indices[1:4:2, :-1, 1:]
+        idxdl = mesh.indices[1:4:2, :-1]
+        assert idxdl.shape == (48,)
         coords = torch.cartesian_prod(
             torch.arange(4)[1:4:2],
             torch.arange(5)[:-1],
-            torch.arange(6)[1:],
+            torch.arange(6),
         )
         idx = idxdl.fully_load(torch.device('cpu'), True)
         assert torch.equal(
