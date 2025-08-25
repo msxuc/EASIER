@@ -26,7 +26,6 @@ class PoissonMeshComponentsCollector(esr.Module):
         )
 
         ne = mesh.ne
-        # nbc = self.bpoints.shape[0]
 
         self.cells_p = torch.nn.ParameterList([
             esr.Tensor(
@@ -65,23 +64,28 @@ class PoissonInitializer(esr.Module):
     def __init__(self, poisson: str, scale: int, device='cpu'):
         super().__init__()
 
-        mesh = esr.Mesh(
+        vmesh = esr.Mesh(
             esr.linspace(0, 1, scale),
             esr.linspace(0, 1, scale)
         )
 
+        cmesh = esr.Mesh(
+            esr.arange(scale, dtype=torch.int64),
+            esr.arange(scale, dtype=torch.int64),
+        )
+
         self.points = esr.Tensor(
-            mesh.vertices,
+            vmesh.vertices,
             mode='partition'
         )
 
         self.reducer = esr.Reducer(
-            mesh.src,
-            mesh.nc
+            vmesh.src,
+            vmesh.nc
         )
 
-        nc = mesh.nc
-        ne = mesh.ne
+        nc = cmesh.nv
+        ne = vmesh.ne
 
         self.selector_src_p = torch.nn.ModuleList([
             esr.Selector(
@@ -98,19 +102,20 @@ class PoissonInitializer(esr.Module):
         self.selector_cells_p = torch.nn.ModuleList([
             esr.Selector(
                 [
-                    mesh.indices[:-1, :-1],
-                    mesh.indices[1:, :-1],
-                    mesh.indices[1:, 1:],
-                    mesh.indices[:-1, 1:],
+                    vmesh.indices[:-1, :-1],
+                    vmesh.indices[1:, :-1],
+                    vmesh.indices[1:, 1:],
+                    vmesh.indices[:-1, 1:],
                 ][i],
             ) for i in range(4)
         ])
 
+        # Corner cells are counted twice
         bcells = ConcatDataLoader([
-            mesh.cell_indices[0, :],
-            mesh.cell_indices[:, -1],
-            mesh.cell_indices[-1, :],
-            mesh.cell_indices[:, 0],
+            vmesh.cell_indices[0, :],
+            vmesh.cell_indices[:, -1],
+            vmesh.cell_indices[-1, :],
+            vmesh.cell_indices[:, 0],
         ])
         self.bselector = esr.Selector(bcells)
         self.breducer = esr.Reducer(bcells, nc)
@@ -119,16 +124,16 @@ class PoissonInitializer(esr.Module):
             esr.Selector(
                 [
                     ConcatDataLoader([
-                        mesh.indices[0, :-1],
-                        mesh.indices[:-1, -1],
-                        mesh.indices[-1, :-1],
-                        mesh.indices[:-1, 0]
+                        vmesh.indices[0, :-1],
+                        vmesh.indices[:-1, -1],
+                        vmesh.indices[-1, :-1],
+                        vmesh.indices[:-1, 0]
                     ]),
                     ConcatDataLoader([
-                        mesh.indices[0, 1:],
-                        mesh.indices[1:, -1],
-                        mesh.indices[-1, 1:],
-                        mesh.indices[1:, 0]
+                        vmesh.indices[0, 1:],
+                        vmesh.indices[1:, -1],
+                        vmesh.indices[-1, 1:],
+                        vmesh.indices[1:, 0]
                     ]),
                 ][i]
             ) for i in range(2)
@@ -185,7 +190,7 @@ class PoissonInitializer(esr.Module):
 
         dist = dst_cent - src_cent
 
-        norm01_x, norm01_y = self.get_face_norm(src_p2, src_p0, src_p1)
+        norm01_x, norm01_y = self.get_face_norm(src_p3, src_p0, src_p1)
         norm12_x, norm12_y = self.get_face_norm(src_p0, src_p1, src_p2)
         norm23_x, norm23_y = self.get_face_norm(src_p1, src_p2, src_p3)
         norm30_x, norm30_y = self.get_face_norm(src_p2, src_p3, src_p0)
