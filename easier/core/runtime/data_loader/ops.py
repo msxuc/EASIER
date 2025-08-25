@@ -87,10 +87,12 @@ class StridedDataLoader(DataLoaderBase):
 
     # TODO because minmax/count_unique only take dim-0 index,
     # but a StridedDataLoader may have n-d indices, we cannot simply dispatch
-    # to self.inner.minmax() -- but if we take a Seq[Slice] then we can.
-    # def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
-    #     composed_idx = self._get_view_slice0().compose(index)
-    #     return self.inner.minmax(composed_idx + self.index[1:])
+    # to self.inner.minmax() -- but if we take a Seq[NormSlice] then we can.
+    # def minmax(self, index: Seq[NormalizedSlice]) -> Tuple[Num, Num]:
+    #     composed_idx = [
+    #           self.tensor_index[i].compose(index[i]) for i ...
+    #     ]
+    #     return self.inner.minmax(composed_idx)
 
     def partially_load_by_range(self, index: NormalizedSlice) -> torch.Tensor:
         idx0 = self.norm_index[0]
@@ -163,13 +165,6 @@ class StridedDataLoader(DataLoaderBase):
 
 
 class CartesianProductDataLoader(DataLoaderBase):
-    """
-    Takes N input DataLoader component, the i-th component must have its
-    shape in form of `(L_i,)`, and all components must have the same dtype.
-
-    The result shape is `(L_0*...*L_{N-1}, N)`.
-    """
-
     def __init__(
         self,
         components: Sequence[DataLoaderBase],
@@ -420,6 +415,12 @@ class ConcatDataLoader(DataLoaderBase):
 
 
 class MappedDataLoaderBase(DataLoaderBase):
+    """
+    This is internal to DataLoader subsystem, and not exposed to users.
+
+    P.S. Users could define an easier.Module to do the mapped operation
+    and save the result to HDF5 file then use `easier.hdf5()` API.
+    """
     def __init__(
         self,
         inner: DataLoaderBase,
@@ -466,3 +467,27 @@ class MappedDataLoaderBase(DataLoaderBase):
         # TODO better repr?
         return f'{self.__class__.__name__}' \
             f'(inner={self.inner}, shape={self.shape}, dtype={self.dtype})'
+
+
+def cartesian_product(*input: DataLoaderBase) -> DataLoaderBase:
+    """
+    Takes N input DataLoader component, the i-th component must have its
+    shape in form of `(L_i,)`, and all components must have the same
+    dtype/device.
+
+    The result shape is `(L_0*...*L_{N-1}, N)`.
+    """
+    # TODO different k-dims and `form in ['flatten', 'stack']`
+    return CartesianProductDataLoader(input)
+
+
+def concat(inputs: Sequence[DataLoaderBase]) -> DataLoaderBase:
+    """
+    Takes N input DataLoader component, the i-th component must have its
+    shape in form of `(L_i, k)`, and all components must have the same
+    dtype/device.
+
+    The result shape is `(L_0+...+L_{N-1}, k)`.
+    """
+    # TODO along dim-0 only, support other dims.
+    return ConcatDataLoader(inputs)

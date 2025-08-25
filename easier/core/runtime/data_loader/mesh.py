@@ -19,12 +19,13 @@ from easier.core.runtime.data_loader.utils import \
 
 class _MeshIndex:
     """
-    Syntactic sugar to convert N-D indices to 1-D DataLoader for
-    `Selector/Reducer.idx`.
+    Syntactic sugar to convert N-D indices to 1-D DataLoader.
     """
 
-    def __init__(self, mesh_elem_lists: Sequence[DataLoaderBase], device: torch.device) -> None:
-        self.mesh_elem_lists = mesh_elem_lists
+    def __init__(
+        self, vectors: Sequence[DataLoaderBase], device: torch.device
+    ):
+        self.vectors = vectors
         self.device = device
 
     def __getitem__(
@@ -86,7 +87,7 @@ class _MeshIndex:
         if not isinstance(indices, tuple):
             indices = (indices,)
 
-        if not (len(indices) <= len(self.mesh_elem_lists)):
+        if not (len(indices) <= len(self.vectors)):
             raise ValueError(
                 "Indices must not be more than dimensions of vertices"
             )
@@ -98,7 +99,7 @@ class _MeshIndex:
 
         space_shape: List[int] = []
         dim_dls: List[DataLoaderBase] = []
-        for dim, vdl in enumerate(self.mesh_elem_lists):
+        for dim, vdl in enumerate(self.vectors):
             nv = vdl.shape[0]
             space_shape.append(nv)
 
@@ -139,13 +140,7 @@ class Mesh(torch.nn.Module):
         self,
         *vertices_vectors: DataLoaderBase,
         # TODO form: Literal['flatten', 'stack'] = 'flatten',
-        device: Union[torch.device, str, None] = None
     ):
-        if device is None:
-            # TODO like torch.set_default_device()
-            device = 'cpu'
-        self.device = torch.device(device)
-
         ndim = len(vertices_vectors)
         if ndim == 0:
             raise ValueError("Must have at least one input data")
@@ -154,13 +149,9 @@ class Mesh(torch.nn.Module):
         nvs: List[int] = []
         # number of hypercubes per dim
         ncs: List[int] = []
-        for dt in vertices_vectors:
-            if not isinstance(dt, (ArangeDataLoader, FulledDataLoader)):
-                # TODO support general DataLoader like H5 and InMemTensor.
-                raise NotImplementedError(
-                    "only support easier.arange/linspace/full/ones/zeros"
-                )
 
+        devices = set()
+        for dt in vertices_vectors:
             if not len(dt.shape) == 1:
                 raise ValueError("Input data must be 1-d")
             dim_nv = dt.shape[0]
@@ -169,8 +160,13 @@ class Mesh(torch.nn.Module):
 
             nvs.append(dim_nv)
             ncs.append(dim_nv - 1)
+            devices.add(dt.device)
 
-        self.vertices_vectors = vertices_vectors
+        if len(devices) > 1:
+            raise ValueError("Input devices must be the same")
+        self.device = devices.pop()
+
+        self._vectors = vertices_vectors
         self._nvs = nvs
         self._ncs = ncs
 
@@ -187,7 +183,7 @@ class Mesh(torch.nn.Module):
             $ 2N * \prod_i {L_i} - 2 * \sum_i { \prod_{j!=i}{ L_j } } $
             (the calculate below)
 
-            or $ 2 * \sum_i { (L_i - 1) * \prod_{j!=i}{ L_j } }$
+            or $ 2 * \sum_i { (L_i - 1) * \prod_{j!=i}{ L_j } } $
         """
         nfaces = 2 * ndim * math.prod(ncs)
         nboundaryfaces = 2 * sum(
@@ -199,10 +195,9 @@ class Mesh(torch.nn.Module):
 
         # flattened cartesian product of all arg dataloaders.
         # shape=(nv, ND)
-        vertices = CartesianProductDataLoader(vertices_vectors)
-        self.vertices = vertices
+        self.vertices = CartesianProductDataLoader(self._vectors)
 
-        self.indices = _MeshIndex(vertices_vectors, self.device)
+        self.indices = _MeshIndex(self._vectors, self.device)
 
     def _build_face_indices(self):
         ncs = self._ncs
@@ -253,7 +248,6 @@ class _MeshIdsDataLoader(MappedDataLoaderBase):
     Calculate 1-d IDs for a certain kind of elements in the mesh,
     they may be hypercubes or vertices.
     """
-
     def __init__(
         self,
         # N-d coordinates for (the subset of) the target kind of elements
