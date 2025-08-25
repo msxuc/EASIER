@@ -28,6 +28,17 @@ class _MeshIndex:
         self.vectors = vectors
         self.device = device
 
+    """
+    TODO Looks a bit rigid that users must define so many idx/selector
+    fields. How about allowing directly indexing batch dim using
+    DataLoaders? If detected we can insert Selector for it (and can share
+    Selector instances).
+    TODO arguably Reducer won't be symmetrically benefited from syntactic
+    sugar like this, as Reducer is more configureable and there seems no
+    torch ops for Reducer as concise as getitem for Selector.
+    (torch.index_reduce_ seems to exactly match Reducer)
+    """
+
     def __getitem__(
         self,
         indices: Union[
@@ -38,7 +49,7 @@ class _MeshIndex:
             ]
         ]
     ) -> DataLoaderBase:
-        """
+        R"""
         Since EASIER requires vertices in a mesh to be organized as 1-d list,
         user can call `mesh.get_index(*IDX)` to get an index data for
         EASIER program to reconstruct indexing using coordinates in
@@ -50,8 +61,9 @@ class _MeshIndex:
         # equals to
         ndarray = torch.cartesian_prod(
                 d0, ..., d{N-1}
-            ).reshape(L0, ..., L{N-1}, -1)  # L{i} = d{i}.shape[0]
+            ).reshape(L0, ..., L{N-1}, N)  # L{i} = d{i}.shape[0]
         vdata = ndarray[idx_0, ..., idx_{N-1}]
+        vdata = vdata.reshape(-1, N)
         ```
 
         For example, to calculate the distances between vertices along dim-2:
@@ -74,16 +86,8 @@ class _MeshIndex:
         Remarkably, the dimensions for vertex data in all source lists
         are not supported by this method. Users have to manually index on those
         dimensions in addition to the index of vertex coordinates.
-
-        TODO Looks a bit rigid that users must define so many idx/selector
-        fields. How about allowing directly indexing batch dim using
-        DataLoaders? If detected we can insert Selector for it (and can share
-        Selector instances).
-        TODO arguably Reducer won't be symmetrically benefited from syntactic
-        sugar like this, as Reducer is more configureable and there seems no
-        torch ops for Reducer as concise as getitem for Selector.
-        (torch.index_reduce_ seems to exactly match Reducer)
         """
+
         if not isinstance(indices, tuple):
             indices = (indices,)
 
