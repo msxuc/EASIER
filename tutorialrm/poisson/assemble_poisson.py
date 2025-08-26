@@ -5,7 +5,6 @@ import argparse
 import torch
 
 import easier as esr
-from easier.core.runtime.data_loader.ops import ConcatDataLoader
 
 
 class PoissonMeshComponentsCollector(esr.Module):
@@ -13,8 +12,8 @@ class PoissonMeshComponentsCollector(esr.Module):
         super().__init__()
 
         mesh = esr.Mesh(
-            esr.linspace(0, 1, scale),
-            esr.linspace(0, 1, scale)
+            esr.linspace(0, 1, scale + 1),
+            esr.linspace(0, 1, scale * 2 + 1)
         )
 
 
@@ -65,14 +64,17 @@ class PoissonInitializer(esr.Module):
         super().__init__()
 
         vmesh = esr.Mesh(
-            esr.linspace(0, 1, scale),
-            esr.linspace(0, 1, scale)
+            esr.linspace(0, 1, scale + 1),
+            esr.linspace(0, 1, scale * 2 + 1)
         )
 
         cmesh = esr.Mesh(
             esr.arange(scale, dtype=torch.int64),
-            esr.arange(scale, dtype=torch.int64),
+            esr.arange(scale * 2, dtype=torch.int64),
         )
+
+        nc = cmesh.nv
+        ne = vmesh.ne
 
         self.points = esr.Tensor(
             vmesh.vertices,
@@ -81,11 +83,8 @@ class PoissonInitializer(esr.Module):
 
         self.reducer = esr.Reducer(
             vmesh.src,
-            vmesh.nc
+            nc
         )
-
-        nc = cmesh.nv
-        ne = vmesh.ne
 
         self.selector_src_p = torch.nn.ModuleList([
             esr.Selector(
@@ -111,11 +110,11 @@ class PoissonInitializer(esr.Module):
         ])
 
         # Corner cells are counted twice
-        bcells = ConcatDataLoader([
-            vmesh.cell_indices[0, :],
-            vmesh.cell_indices[:, -1],
-            vmesh.cell_indices[-1, :],
-            vmesh.cell_indices[:, 0],
+        bcells = esr.concat([
+            cmesh.indices[0, :],
+            cmesh.indices[:, -1],
+            cmesh.indices[-1, ::-1],
+            cmesh.indices[::-1, 0],
         ])
         self.bselector = esr.Selector(bcells)
         self.breducer = esr.Reducer(bcells, nc)
@@ -123,17 +122,17 @@ class PoissonInitializer(esr.Module):
         self.selector_bp = torch.nn.ModuleList([
             esr.Selector(
                 [
-                    ConcatDataLoader([
+                    esr.concat([
                         vmesh.indices[0, :-1],
                         vmesh.indices[:-1, -1],
-                        vmesh.indices[-1, :-1],
-                        vmesh.indices[:-1, 0]
+                        vmesh.indices[-1, -1:0:-1],
+                        vmesh.indices[-1:0:-1, 0]
                     ]),
-                    ConcatDataLoader([
+                    esr.concat([
                         vmesh.indices[0, 1:],
                         vmesh.indices[1:, -1],
-                        vmesh.indices[-1, 1:],
-                        vmesh.indices[1:, 0]
+                        vmesh.indices[-1, -2::-1],
+                        vmesh.indices[-2::-1, 0]
                     ]),
                 ][i]
             ) for i in range(2)

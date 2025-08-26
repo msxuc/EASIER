@@ -17,15 +17,19 @@ class Poisson(esr.Module):
     def __init__(self, scale: int, poisson: str, device='cpu', x=None) -> None:
         super().__init__()
 
-        mesh = esr.Mesh(
-            esr.linspace(0, 1, scale),
-            esr.linspace(0, 1, scale),
+        vmesh = esr.Mesh(
+            esr.linspace(0, 1, scale + 1),
+            esr.linspace(0, 1, scale * 2 + 1),
+        )
+        cmesh = esr.Mesh(
+            esr.arange(scale, dtype=torch.int64),
+            esr.arange(scale * 2, dtype=torch.int64),
         )
 
-        self.nc = mesh.nc
+        self.nc = cmesh.nv
 
-        self.reducer = esr.Reducer(mesh.src, self.nc)
-        self.selector = esr.Selector(mesh.dst)
+        self.reducer = esr.Reducer(vmesh.src, self.nc)
+        self.selector = esr.Selector(vmesh.dst)
 
         self.x = esr.Tensor(
             esr.zeros((self.nc,), dtype=torch.double), mode='partition'
