@@ -705,14 +705,15 @@ def arange(*args, **kwargs):
 
 
 def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
+    # TODO numpy.linspace support array-like arguments.
     for arg in [start, stop]:
         if not isinstance(arg, (int, float)):
             raise TypeError(
                 'argument to easier.linspace must be integer or floating-point'
             )
-    if not (isinstance(num, int) and num > 0):
+    if not (isinstance(num, int) and num >= 0):
         raise TypeError(
-            'argument `num` to easier.linspace must be positive integer'
+            'argument `num` to easier.linspace must be >= 0'
         )
 
     if dtype is None:
@@ -721,17 +722,37 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
     if not dtype.is_floating_point:
         raise NotImplementedError("Not supporting ints yet")
 
+    if device is None:
+        # TODO like torch.set_default_device()
+        device = 'cpu'
+
+    if num == 0 or num == 1:
+        return FulledDataLoader(start, shape=[num], dtype=dtype, device=device)
+
     nstep = num
     if not endpoint:
         nstep += 1
     step = (stop - start) / (nstep - 1)
 
-    # TODO for floating numbers the division may lead to unexpected rounding
-    # causing the specified `stop` is not exactly included -- because the last
-    # element is calculated using `start+step*(num-1)`.
+    if step == 0:
+        return FulledDataLoader(start, shape=[num], dtype=dtype, device=device)
 
-    if device is None:
-        # TODO like torch.set_default_device()
-        device = 'cpu'
+    if endpoint and num > 1:
+        # NOTE For floating numbers the division above may cause rounding issue
+        # and the specified `stop` is not bytewise included -- because the last
+        # element is calculated using `start+step*(num-1)`.
+        #
+        # For such cases numpy directly set the y[-1] = stop, in EASIER
+        # we can make it piecewise and concat.
+        from easier.core.runtime.data_loader.ops import ConcatDataLoader
+        ys = ArangeDataLoader(start, step, num - 1, dtype=dtype, device=device)
+        y = ArangeDataLoader(stop, step, 1, dtype=dtype, device=device)
+        return ConcatDataLoader([ys, y])
 
-    return ArangeDataLoader(start, step, num, dtype=dtype, device=device)
+        # TODO numpy.linspace ensure `stop` bytewise precise by setting y[-1],
+        # however, torch.linspace ensure `stop` by generating from two
+        # directions: [start, start+step,...] + reverse([stop, stop-step, ...])
+
+    else:
+        return ArangeDataLoader(start, step, num, dtype=dtype, device=device)
+

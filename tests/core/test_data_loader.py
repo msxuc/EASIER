@@ -337,7 +337,7 @@ class TestH5DataLoader:
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestArangeDataLoader:
-    def _test(self, t: torch.Tensor, dl: ArangeDataLoader, eq):
+    def _test(self, t: torch.Tensor, dl: DataLoaderBase, eq):
         l = t.shape[0]
 
         t2 = dl.fully_load(torch.device('cpu'), True)
@@ -390,19 +390,58 @@ class TestArangeDataLoader:
 
     def test_linspace(self):
         import numpy
-        for (start, stop, num, ep) in [
+        for (start, stop, num, endpoint) in [
             (1, 2, 10, True),
             (1, 2, 10, False),
             (-5, -2, 10, True),
             (-5, -2, 10, False),
         ]:
             t = torch.from_numpy(numpy.linspace(
-                start, stop, num, endpoint=ep, dtype=numpy.float64
+                start, stop, num, endpoint=endpoint, dtype=numpy.float64
             ))
             dl = easier.linspace(
-                start, stop, num, endpoint=ep, dtype=torch.float64
+                start, stop, num, endpoint=endpoint, dtype=torch.float64
             )
             self._test(t, dl, torch.allclose)
+
+    def test_linspace__special_cases(self):
+        import numpy
+        for (start, stop, num, endpoint) in [
+            (1, 2, 0, True),
+            (1, 2, 0, False),
+            (1, 2, 1, True),
+            (1, 2, 1, False),
+        ]:
+            t = torch.from_numpy(numpy.linspace(
+                start, stop, num, endpoint=endpoint, dtype=numpy.float64
+            ))
+            dl = easier.linspace(
+                start, stop, num, endpoint=endpoint, dtype=torch.float64
+            )
+
+            t2 = dl.fully_load(torch.device('cpu'), True)
+            assert t.shape == t2.shape
+            assert torch.equal(t, t2)
+
+    def test_linspace__stop_rounding(self):
+        import numpy
+        for (start, stop, nintervals) in [
+            (0, 1, 107)
+        ]:
+            assert (stop - start) / nintervals * nintervals != (stop - start)
+
+            num = nintervals + 1
+            t = torch.from_numpy(numpy.linspace(
+                start, stop, num, endpoint=True, dtype=numpy.float64
+            ))
+            dl = easier.linspace(
+                start, stop, num, endpoint=True, dtype=torch.float64
+            )
+            self._test(t, dl, torch.allclose)
+
+            t2 = dl.fully_load(torch.device('cpu'), True)
+            assert t2[0] == start
+            assert t2[-1] == stop
 
 
 class TestStridedDataLoader:
