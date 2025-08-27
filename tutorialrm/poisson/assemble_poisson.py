@@ -13,7 +13,7 @@ class PoissonMeshComponentsCollector(esr.Module):
 
         mesh = esr.Mesh(
             esr.linspace(0, 1, scale + 1),
-            esr.linspace(0, 1, scale * 2 + 1)
+            esr.linspace(0, 1, scale + 1)
         )
 
 
@@ -65,12 +65,12 @@ class PoissonInitializer(esr.Module):
 
         vmesh = esr.Mesh(
             esr.linspace(0, 1, scale + 1),
-            esr.linspace(0, 1, scale * 2 + 1)
+            esr.linspace(0, 1, scale + 1)
         )
 
         cmesh = esr.Mesh(
             esr.arange(scale, dtype=torch.int64),
-            esr.arange(scale * 2, dtype=torch.int64),
+            esr.arange(scale, dtype=torch.int64),
         )
 
         nc = cmesh.nv
