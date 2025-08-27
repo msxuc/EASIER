@@ -2,7 +2,8 @@
 # Licensed under the MIT License.
 
 from types import EllipsisType
-from typing import Callable, Iterator, List, Optional, Tuple, TypeAlias, Union
+from typing import \
+    Callable, Iterator, List, Optional, Sequence, Tuple, TypeAlias, Union
 import functools
 import copy
 
@@ -54,6 +55,10 @@ class DerivedDataLoader(DataLoaderBase):
         raise NotImplementedError()
     
     # overridable:
+    def enumerate_children_data_loaders_and_postfixes(
+        self
+    ) -> Tuple[Sequence['DataLoaderBase'], Sequence[str]]:
+        return super().enumerate_children_data_loaders_and_postfixes()
     def collective_init(self) -> None:
         return super().collective_init()
     def minmax(self, index: NormalizedSlice) -> Tuple[Num, Num]:
@@ -108,6 +113,9 @@ class DataLoaderBase:
         # This device configuration only take effect with "torch" JIT backend.
         self.device: torch.device
 
+        # Convention field to put any nested DataLoaders.
+        self.components: Sequence[DataLoaderBase]
+
         # e.g. "(Module).(a.b.c:Selector).idx"
         # Decided during `esr.compile()`
         self.easier_hint_name: str
@@ -135,6 +143,30 @@ class DataLoaderBase:
                     cls, member_name,
                     _wrap_function(pre_hook, post_hook, member)
                 )
+
+    def enumerate_children_data_loaders_and_postfixes(
+        self
+    ) -> Tuple[Sequence['DataLoaderBase'], Sequence[str]]:
+        """
+        A derived DataLoader should return its immediate children DataLoaders
+        with suitable postfixs, such as ".components[0]".
+
+        The postfixes will be concat-ed to form the `.easier_hint_name` field
+        for the DataLoader instance.
+
+        This method makes all nested DataLoaders accessible to EASIER
+        collective initialization pass and logging system.
+        """
+        # TODO May not be robust enough to be default impl -- if subclass
+        # does not follow the convention of "components" field and not properly
+        # override, e.g. use ".inner" field, its children DataLoaders will
+        # not be properly tracked by EASIER.
+        if hasattr(self, 'components'):
+            n = len(self.components)
+            postfixes = [f'.components[{i}]' for i in range(n)]
+            return (self.components, postfixes)
+        else:
+            return ([], [])
 
     def coll_check_dtype_shape_devicetype(self):
         check_collective_equality(

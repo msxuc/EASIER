@@ -71,6 +71,11 @@ class StridedDataLoader(DataLoaderBase):
         # ints are discarded, i.e.:
         assert len(self.shape) <= len(self.inner.shape)
 
+    def enumerate_children_data_loaders_and_postfixes(
+        self
+    ) -> Tuple[Sequence['DataLoaderBase'], Sequence[str]]:
+        return ([self.inner], ['.inner'])
+
     def collective_init(self) -> None:
         self.coll_check_dtype_shape_devicetype()
 
@@ -434,6 +439,11 @@ class MappedDataLoaderBase(DataLoaderBase):
         self.device = inner.device
 
         self.inner = inner
+
+    def enumerate_children_data_loaders_and_postfixes(
+        self
+    ) -> Tuple[Sequence['DataLoaderBase'], Sequence[str]]:
+        return ([self.inner], ['.inner'])
 
     def map(self, tensor: torch.Tensor) -> torch.Tensor:
         """
