@@ -16,7 +16,7 @@ from easier.core.runtime.data_loader.factories import \
 from easier.core.runtime.data_loader.ops import \
     CartesianProductDataLoader, ConcatDataLoader
 from easier.core.runtime.data_loader.utils import \
-    NormalizedSlice, get_overlapping_slice, CopyingSlicer
+    NormalizedSlice, get_overlapping_slice, CopyingSlicer, get_strides
 
 from easier.core.runtime.dist_env import get_default_dist_env
 from easier.core.utils import get_random_str
@@ -640,6 +640,33 @@ class TestConcatDataLoader:
 
 
 class TestMesh:
+    class _IndicesTester:
+        def __init__(self, mesh: easier.Mesh, full_coords_dims: list) -> None:
+            self.mesh = mesh
+            self.full_coords_dims = full_coords_dims
+        def __getitem__(self, indices: tuple):
+            idxdl = self.mesh.indices[*indices]
+
+            coords_dims = []
+            for full_coords_dim, index in zip(self.full_coords_dims, indices):
+                coords_dim = CopyingSlicer(full_coords_dim)[index]
+                if isinstance(index, int):
+                    assert coords_dim.shape == ()
+                    coords_dim = coords_dim[None]
+                assert len(coords_dim.shape) == 1
+                coords_dims.append(coords_dim)
+
+            if len(indices) < len(self.full_coords_dims):
+                coords_dims.extend(self.full_coords_dims[len(indices):])
+
+            coords = torch.cartesian_prod(*coords_dims)
+
+            assert idxdl.shape == (coords.shape[0],)
+            idx = idxdl.fully_load(torch.device('cpu'), True)
+
+            strides = get_strides(self.mesh._nvs)
+            assert torch.equal(idx, (coords * strides).sum(dim=1))
+        
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_2d(self):
         mesh = easier.Mesh(
@@ -685,41 +712,15 @@ class TestMesh:
             ], dim=0)
         )
 
-        idxdl = mesh.indices[:, :]
-        assert idxdl.shape == (20,)
-        coords = torch.cartesian_prod(
+        tester = TestMesh._IndicesTester(mesh, [
             torch.arange(4),
             torch.arange(5)
-        )
-        idx = idxdl.fully_load(torch.device('cpu'), True)
-        assert torch.equal(
-            idx,
-            coords[:, 0] * 5 + coords[:, 1]
-        )
+        ])
 
-        idxdl = mesh.indices[1:4:2, :-1]
-        assert idxdl.shape == (8,)
-        coords = torch.cartesian_prod(
-            torch.arange(4)[1:4:2],
-            torch.arange(5)[:-1]
-        )
-        idx = idxdl.fully_load(torch.device('cpu'), True)
-        assert torch.equal(
-            idx,
-            coords[:, 0] * 5 + coords[:, 1]
-        )
-
-        idxdl = mesh.indices[3, 3]
-        assert idxdl.shape == (1,)
-        coords = torch.cartesian_prod(
-            torch.arange(4)[3:4],
-            torch.arange(5)[3:4]
-        )
-        idx = idxdl.fully_load(torch.device('cpu'), True)
-        assert torch.equal(
-            idx,
-            coords[:, 0] * 5 + coords[:, 1]
-        )
+        tester[:, :]
+        tester[1:4:2, :-1]
+        tester[3, 3]
+        tester[-2, -2]
 
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_3d(self):
@@ -774,28 +775,13 @@ class TestMesh:
             ], dim=0)
         )
 
-        idxdl = mesh.indices[:, :, :]
-        assert idxdl.shape == (120,)
-        coords = torch.cartesian_prod(
+        tester = TestMesh._IndicesTester(mesh, [
             torch.arange(4),
             torch.arange(5),
             torch.arange(6),
-        )
-        idx = idxdl.fully_load(torch.device('cpu'), True)
-        assert torch.equal(
-            idx,
-            coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
-        )
+        ])
 
-        idxdl = mesh.indices[1:4:2, :-1]
-        assert idxdl.shape == (48,)
-        coords = torch.cartesian_prod(
-            torch.arange(4)[1:4:2],
-            torch.arange(5)[:-1],
-            torch.arange(6),
-        )
-        idx = idxdl.fully_load(torch.device('cpu'), True)
-        assert torch.equal(
-            idx,
-            coords[:, 0] * 30 + coords[:, 1] * 6 + coords[:, 2]
-        )
+        tester[:, :, :]
+        tester[1:4:2, :-1]
+        tester[:, 1, -1]
+        tester[-1, -1:0:-1]

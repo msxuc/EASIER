@@ -118,6 +118,8 @@ class _MeshIndex:
                     # when converting N-d index to 1-d index, unsequeezing
                     # this int-indexed dim makes it easier for following
                     # cartesian product.
+                    if idx < 0:
+                        idx = nv + idx
                     idx = slice(idx, idx + 1, 1)
 
                 dim_dl = dim_dl[idx]  # StridedDataLoader

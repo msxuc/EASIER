@@ -187,4 +187,12 @@ class CopyingSlicer:
             index = (index,)
 
         # one index may be torch.Tensor, can be directly used to index ndarray.
-        return torch.from_numpy(self.tensor.numpy()[*index].copy())
+        np_v = self.tensor.numpy()[*index].copy()
+
+        if np_v.shape == ():
+            # such indexing in NumPy results in np.int64 etc. object, which
+            # is esstentially a scalar, unlike in PyTorch we get 0-d tensor.
+            import numpy
+            np_v = numpy.array(np_v)
+        
+        return torch.from_numpy(np_v)
