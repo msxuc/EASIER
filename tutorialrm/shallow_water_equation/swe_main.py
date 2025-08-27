@@ -11,38 +11,40 @@ import easier as esr
 
 
 class ShallowWaterEquation(esr.Module):
-    def __init__(self, mesh_path: str, sw_path: str, dt=0.005, device='cpu') -> None:
+    def __init__(self, scale: int, sw_path: str, dt=0.005, device='cpu') -> None:
         super().__init__()
 
         self.dt = dt
-        # src (torch.LongTensor): src cell indices, with shape `(ne,)`
-        self.src = esr.hdf5(mesh_path, 'src', dtype=torch.long)
-        # dst (torch.LongTensor): dst cell indices, with shape `(ne,)`
-        self.dst = esr.hdf5(mesh_path, 'dst', dtype=torch.long)
-        self.ne = self.src.shape[0]
 
-        # cells (torch.LongTensor): three point indices for each triangle
-        #   cells, with shape `(nc, 3)`, `nc` means number of cells
-        self.cells = esr.hdf5(mesh_path, 'cells', dtype=torch.long)
-        self.nc = self.cells.shape[0]
+        vmesh = esr.Mesh(
+            esr.linspace(0, 1, scale + 1),
+            esr.linspace(0, 1, scale + 1),
+        )
+        cmesh = esr.Mesh(
+            esr.arange(scale, dtype=torch.int64),
+            esr.arange(scale, dtype=torch.int64),
+        )
 
-        # points (torch.DoubleTensor): point coordinates on a plane,
-        #   with shape `(np, 2)`, `np` means number of points
-        self.points = esr.hdf5(mesh_path, 'points', dtype=torch.long)
-        self.np = self.points.shape[0]
+        self.nc = cmesh.nv
+
+        self.reducer = esr.Reducer(vmesh.src, self.nc)
+        self.selector = esr.Selector(vmesh.dst)
+
+        self.ne = vmesh.ne
 
         # bcells (torch.LongTensor): boundary cell indices, with shape `(nbc,)`,
         #   `nbc` means number of boundary cell
-        self.bcells = esr.hdf5(mesh_path, 'bcells', dtype=torch.long)
+        self.bcells = esr.concat([
+            cmesh.indices[0, :],
+            cmesh.indices[:, -1],
+            cmesh.indices[-1, ::-1],
+            cmesh.indices[::-1, 0],
+        ])
         self.nbc = self.bcells.shape[0]
 
-        # bpoints (torch.LongTensor): boundary points indices in each boundary
-        #   cell, with shape `(nbc, 2)`, `nbc` means number of boundary cell
-        self.bpoints = esr.hdf5(mesh_path, 'bpoints', dtype=torch.long)
-
-        self.scatter = esr.Reducer(self.dst, self.nc)
-        self.gather_src = esr.Selector(self.src)
-        self.gather_dst = esr.Selector(self.dst)
+        self.scatter = esr.Reducer(vmesh.dst, self.nc)
+        self.gather_src = esr.Selector(vmesh.src)
+        self.gather_dst = esr.Selector(vmesh.dst)
         self.scatter_b = esr.Reducer(self.bcells, self.nc)
         self.gather_b = esr.Selector(self.bcells)
 
@@ -164,14 +166,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--output", type=str)
-    parser.add_argument("mesh", type=str)
+    parser.add_argument("scale", type=int)
     parser.add_argument("shallow_water", type=str)
     args = parser.parse_args()
 
     esr.init(args.comm_backend)
 
     eqn = ShallowWaterEquation(
-        args.mesh, args.shallow_water, args.dt, args.device
+        args.scale, args.shallow_water, args.dt, args.device
     )
     [eqn] = esr.compile([eqn], args.backend)
 
