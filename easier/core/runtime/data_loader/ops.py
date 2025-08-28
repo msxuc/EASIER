@@ -426,6 +426,7 @@ class MappedDataLoaderBase(DataLoaderBase):
     P.S. Users could define an easier.Module to do the mapped operation
     and save the result to HDF5 file then use `easier.hdf5()` API.
     """
+
     def __init__(
         self,
         inner: DataLoaderBase,

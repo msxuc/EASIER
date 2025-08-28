@@ -755,4 +755,3 @@ def linspace(start, stop, num, endpoint=True, dtype=None, device=None):
 
     else:
         return ArangeDataLoader(start, step, num, dtype=dtype, device=device)
-

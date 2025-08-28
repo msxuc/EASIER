@@ -221,7 +221,6 @@ class TestDataLoaderBase:
             nunique = dl.count_unique(NormalizedSlice(33, 32, -2, 16))
             assert nunique == 16
 
-    
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_getitem(self):
         t = torch.rand(5, 4, 3)
@@ -387,6 +386,11 @@ class TestArangeDataLoader:
             t = torch.arange(start, stop, step, dtype=torch.float64)
             dl = ArangeDataLoader(start, step, count, torch.float64, 'cpu')
             self._test(t, dl, torch.allclose)
+
+    def test_arange__overloading(self):
+        assert easier.arange(10).shape == (10,)
+        assert easier.arange(5, 10).shape == (5,)
+        assert easier.arange(5, 10, 2).shape == (3,)
 
     def test_linspace(self):
         import numpy
@@ -644,6 +648,7 @@ class TestMesh:
         def __init__(self, mesh: easier.Mesh, full_coords_dims: list) -> None:
             self.mesh = mesh
             self.full_coords_dims = full_coords_dims
+
         def __getitem__(self, indices: tuple):
             idxdl = self.mesh.indices[*indices]
 
@@ -666,7 +671,7 @@ class TestMesh:
 
             strides = get_strides(self.mesh._nvs)
             assert torch.equal(idx, (coords * strides).sum(dim=1))
-        
+
     @pytest.mark.usefixtures('dummy_dist_env')
     def test_2d(self):
         mesh = easier.Mesh(

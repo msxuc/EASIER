@@ -194,5 +194,5 @@ class CopyingSlicer:
             # is esstentially a scalar, unlike in PyTorch we get 0-d tensor.
             import numpy
             np_v = numpy.array(np_v)
-        
+
         return torch.from_numpy(np_v)

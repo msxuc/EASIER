@@ -254,6 +254,7 @@ class _MeshIdsDataLoader(MappedDataLoaderBase):
     Calculate 1-d IDs for a certain kind of elements in the mesh,
     they may be hypercubes or vertices.
     """
+
     def __init__(
         self,
         # N-d coordinates for (the subset of) the target kind of elements
