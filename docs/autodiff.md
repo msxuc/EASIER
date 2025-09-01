@@ -76,8 +76,10 @@ easier.jvp(
 > Another way to see this is we first do an inclusion $\iota: E \hookrightarrow T_x R^{shp1++...++shpN}$
 > then we get $Df \circ \iota: E \to T_y R^{shp1++...++shpN}$
 
-> Tangent space on $y$ is isomorphic to tangent space on $x$? Probably because we haven't strictly
-> divided esr.Tensors into domain/codomain in a math function way?
+> ~~Tangent space on $y$ is isomorphic to tangent space on $x$? Probably because we haven't strictly
+> divided esr.Tensors into domain/codomain in a math function way?~~
+>
+> easier.Tensor has ctor parameter `require_grad`, we could only treat them as the real-and-only inputs, also ouputs.
 
 ### Forward-mode Jacobian
 ```
