@@ -64,6 +64,25 @@
 ```
 easier.jvp(
     module: easier.Module,
+    formal_inputs: Sequence[easier.Tensor]
+) -> ?????
+```
+
+> Since all easier.Tensors in module do have concrete values to begin with,
+> we can extraly select a subset of formal_inputs, and other easier.Tensors become
+> _free variables_ -- when we switching from description to arbitrary evaluation,
+> values of those free variables may _change_.
+
+> Another way to see this is we first do an inclusion $\iota: E \hookrightarrow T_x R^{shp1++...++shpN}$
+> then we get $Df \circ \iota: E \to T_y R^{shp1++...++shpN}$
+
+> Tangent space on $y$ is isomorphic to tangent space on $x$? Probably because we haven't strictly
+> divided esr.Tensors into domain/codomain in a math function way?
+
+### Forward-mode Jacobian
+```
+easier.jacobian(
+    module: easier.Module,
     inputs: Sequence[easier.Tensor]
 ) -> ?????
 ```
