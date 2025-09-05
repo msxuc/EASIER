@@ -2,13 +2,15 @@
 
 ## Open questions
 
-1.  Will AD in EASIER escalate to $\#O << \#I$ cases, like taking gradient for loss in DL training?
+1.  Will AD in EASIER escalate to $nO << nI$ cases, like taking gradient for loss in DL training?
 
-    Otherwise, even for $\#O \simeq \#I$, forward-mode AD suffices.
+    Otherwise, even for $nO \simeq nI$, forward-mode AD suffices.
 
 1.  EASIER aggregators get involved in AD
 
 1.  Stop gradient/derivatives.
+
+    > Optional to stop on aggregators, make JVP even more sparse.
 
 1.  Ensure AD coworks with distribution.
 
@@ -76,7 +78,7 @@ def easier.jvp(
 Represents:
 -   Jacobian-vector product
 
--   Pushforward in
+-   _Pushforward_ in
     $$
     \bigoplus_i \left( T_{(X_i)} \mathbb{R}^{S_i} \right)
     \to
@@ -100,7 +102,7 @@ Returns:
 -   New input tangent `easier.Tensor`, whose values are read when any resultant `easier.Module` is executed
 -   New output tangent `easier.Tensor`, which are written when any resultant `easier.Module` is executed
 
-    (All tangents are read/written, maybe simply for initialization)
+    > All tangents are read/written, maybe solely for initialization.
 
 Usage:
 ```python
@@ -109,16 +111,17 @@ m = Module()
 [jvp_m], [tg_x], [tg_y] = easier.jvp([m], [m.x], [m.y])
 assert jvp_m is not m
 
+# Use tangent easier.Tensor in other easier.Modules
+m2 = AnotherModule(tg_y)
+
 [jvp_m] = easier.compile([jvp_m], backend='torch')
 
 for i in range(10):
     jvp_m()
 
+    # Use ry, ty with outside PyTorch tangent `torch.Tensor`s
     ry = m.y.collect()
     ty = tg_y.collect()
-
-    # use ry, ty with outside PyTorch tangent `torch.Tensor`s
-
     # TODO how to fill distributed `m.x, tg_x: easier.Tensor` if there is
     # outside computation that is NOT replicated easier.Module?
 ```
@@ -127,8 +130,12 @@ for i in range(10):
 > This is essentially another representation of Jacobian matrix:
 > - resultant Modules encode the linear map of _matmul with Jacobian matrix_
 > - Jacobian matrix is likely sparse
-> - **TODO** How to explicitly encode $\oplus_i T_{X_i} \mathbb{R}^{S_i}$
+
+> **TODO**
+> - How to explicitly encode $\oplus_i T_{X_i} \mathbb{R}^{S_i}$
 >   above into domain of the linear map?
+> - How to compress the `.idx` (maybe data, too) for computational structure
+>   into nested DataLoaders?
 
 > Since all easier.Tensors in module do have concrete values to begin with,
 > we can extraly select a subset of `get_easier_objects(modules)`, and other easier.Tensors excepts `inputs @ outputs` become
@@ -149,6 +156,7 @@ def easier.jacobian(
 
 **TODO**:
 -   it seems impossible for users to inspect the S/R.idx in LinSys,
+    because it's somehow compressed,
     the idx will be somehow on concat-ed TensorGroups whose layout is EASIER-internal.
 
 ## References
