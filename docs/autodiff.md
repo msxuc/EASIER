@@ -59,39 +59,97 @@
 
 ## EASIER AD APIs
 
-### Forward-mode {directional derivative}???
+### Forward-mode (directional derivative)
 
+```python
+def easier.jvp(
+    modules: Sequence[easier.Module],
+    inputs: Sequence[easier.Tensor],
+    outputs: Sequence[easier.Tensor],
+) -> Tuple[
+    Sequence[easier.Module],
+    Sequence[easier.Tensor],
+    Sequence[easier.Tensor]
+]: ...
 ```
-easier.jvp(
-    module: easier.Module,
-    formal_inputs: Sequence[easier.Tensor]
-) -> ?????
+
+Represents:
+-   Jacobian-vector product
+
+-   Pushforward in
+    $$
+    \bigoplus_i \left( T_{(X_i)} \mathbb{R}^{S_i} \right)
+    \to
+    \bigoplus_i \left( T_{(Y_j)} \mathbb{R}^{U_j} \right)
+    $$
+
+    where $X_i$, $Y_j$ mean values of `inputs[i]`, `outputs[j]`,
+    and $S_i$, $U_j$ mean shapes of `inputs[i]`, `outputs[j]`,
+    and $T_x M$ means the tangent space of space $M$ at $x\in M$
+    (especially, $T_x\mathbb{R^n}$ is isomorphic to $\mathbb{R}^n$).
+
+
+Arguments:
+-   `inputs/outputs`: `easier.Tensor` included in `modules`
+
+Returns:
+-   New `easier.Module`s:
+    -   Inherit all original `easier.Tensor`s
+    -   After execution, all original `easier.Tensor`s are filled with _primal results_
+    -   After execution, new output tangent  `easier.Tensor`s are filled Jacobian-vector product results
+-   New input tangent `easier.Tensor`, whose values are read when any resultant `easier.Module` is executed
+-   New output tangent `easier.Tensor`, which are written when any resultant `easier.Module` is executed
+
+    (All tangents are read/written, maybe simply for initialization)
+
+Usage:
+```python
+m = Module()
+
+[jvp_m], [tg_x], [tg_y] = easier.jvp([m], [m.x], [m.y])
+assert jvp_m is not m
+
+[jvp_m] = easier.compile([jvp_m], backend='torch')
+
+for i in range(10):
+    jvp_m()
+
+    ry = m.y.collect()
+    ty = tg_y.collect()
+
+    # use ry, ty with outside PyTorch tangent `torch.Tensor`s
+
+    # TODO how to fill distributed `m.x, tg_x: easier.Tensor` if there is
+    # outside computation that is NOT replicated easier.Module?
 ```
+
+
+> This is essentially another representation of Jacobian matrix:
+> - resultant Modules encode the linear map of _matmul with Jacobian matrix_
+> - Jacobian matrix is likely sparse
+> - **TODO** How to explicitly encode $\oplus_i T_{X_i} \mathbb{R}^{S_i}$
+>   above into domain of the linear map?
 
 > Since all easier.Tensors in module do have concrete values to begin with,
-> we can extraly select a subset of formal_inputs, and other easier.Tensors become
+> we can extraly select a subset of `get_easier_objects(modules)`, and other easier.Tensors excepts `inputs @ outputs` become
 > _free variables_ -- when we switching from description to arbitrary evaluation,
 > values of those free variables may _change_.
 
-> Another way to see this is we first do an inclusion $\iota: E \hookrightarrow T_x R^{shp1++...++shpN}$
-> then we get $Df \circ \iota: E \to T_y R^{shp1++...++shpN}$
+> easier.Tensor has ctor parameter `require_grad`, emphasizing _gradients_ which are not in this case,
+> we could only treat them as the real-and-only inputs, also ouputs.
 
-> ~~Tangent space on $y$ is isomorphic to tangent space on $x$? Probably because we haven't strictly
-> divided esr.Tensors into domain/codomain in a math function way?~~
->
-> easier.Tensor has ctor parameter `require_grad`, we could only treat them as the real-and-only inputs, also ouputs.
-
-### Forward-mode Jacobian
-```
-easier.jacobian(
-    module: easier.Module,
-    inputs: Sequence[easier.Tensor]
-) -> ?????
+### Forward-mode (Jacobian matrix)
+```python
+def easier.jacobian(
+    modules: Sequence[easier.Module],
+    inputs: Sequence[easier.Tensor],
+    outputs: Sequence[easier.Tensor],
+) -> linsys.LinSys: ... # ?????
 ```
 
-Arguments:
--   `module`
--   `inputs`: a subset of `easier.Tensor`s contained by `module`
+**TODO**:
+-   it seems impossible for users to inspect the S/R.idx in LinSys,
+    the idx will be somehow on concat-ed TensorGroups whose layout is EASIER-internal.
 
 ## References
 
