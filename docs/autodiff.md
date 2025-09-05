@@ -42,14 +42,17 @@
 
     -   ```
         torch.autograd.forward_ad.make_dual(
-            tensor: torch.Tensor, tangent: torch.Tensor
+            tensor: torch.Tensor,
+            tangent: torch.Tensor
         ) -> _DualTensor
         ```
         for users to manually pack dual numbers;
 
     -   ```
         torch.autograd.functional.jvp(
-            func, inputs: Sequence[torch.Tensor]
+            func,
+            inputs: Sequence[torch.Tensor],
+            v: torch.Tensor
         ) -> Tuple[
             Sequence[torch.Tensor],  # equal to func(inputs)
             Sequence[torch.Tensor]   # Jacobian-vector product
