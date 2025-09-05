@@ -36,7 +36,8 @@
         # many other parameters
     ) -> Sequence[torch.Tensor]
     ```
-    where all `torch.Tensor`s are nodes in PyTorch internal computational graph.
+    where all `torch.Tensor`s are nodes in PyTorch's built-up-at-runtime
+    computational graph.
 
     For forward-mode AD, `autograd` provides two styles:
 
@@ -60,7 +61,8 @@
         ```
         which is more functional-style and concise.
     
-    However, both ways for forward-mode AD do not seem directly adaptable to EASIER primitives.
+    However, `autograd` APIs do not seem directly adaptable to EASIER,
+    as `autograd` relies on value-based `torch.Tensor`.
 
 ## EASIER AD APIs
 
