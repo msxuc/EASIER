@@ -14,16 +14,15 @@
 
 1.  Ensure AD coworks with distribution.
 
-1.  Assess compatibility with Hessian etc.
+1.  Ensure recursive AD for higher order derivatives works.
 
 1.  Assess the use scenarios e.g. with Python-world control flow.
 
 1.  Interconnectability to PyTorch AD APIs or the interconnectability with jacobian/derivative/graident from PyTorch AD.
 
-## Design principles
+## Related APIs
 
-1.  Given the descriptive nature of `easier.Module` and `easier.Tensor` (before entering `easier.compile`),
-    EASIER AD style is more like the graph-style `autograd` APIs of PyTorch.
+1.
 
     `autograd` is famous for its backward-mode AD APIs, e.g.:
     ```
