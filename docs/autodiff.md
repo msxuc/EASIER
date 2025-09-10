@@ -20,11 +20,10 @@
 
 1.  Interconnectability to PyTorch AD APIs or the interconnectability with jacobian/derivative/graident from PyTorch AD.
 
-## Related APIs
+## Related work
 
-1.
+1.  `torch.autograd` is famous for its backward-mode AD APIs, e.g.:
 
-    `autograd` is famous for its backward-mode AD APIs, e.g.:
     ```
     torch.autograd.grad(
         outputs: Sequence[torch.Tensor],
@@ -62,6 +61,33 @@
     
     However, `autograd` APIs do not seem directly adaptable to EASIER,
     as `autograd` relies on value-based `torch.Tensor`.
+
+1.  Solution to memory consumption during backward propagation:
+
+    Checkpoint primal values and recompute during backprop, e.g.
+
+    ```
+    o------>o------>o------>o------>o
+                            x<------x
+                    o------>o
+                    x<------x
+            o------>o
+            x<------x
+    o------>o
+    x<------x
+    ```
+
+    where point `o` means primal checkpoint, `o-->` means computation of primal
+    values, and `x<--x` means backprop between checkpoints.
+
+1.  Sparsity of Jacobian matrix:
+
+    "Non-interleaving" basis vectors
+    (evaluation of JVP on basis vectors form columns of the Jacobian matrix)
+    can be colored and grouped, so that a linear combination of basis vectors
+    can be processed in a simultaneous manner.
+
+1.  _Duality_ between pushforward and pullback.
 
 ## EASIER AD APIs
 
