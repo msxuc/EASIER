@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, Final, List, Tuple, cast, Optional
+from typing import Callable, Dict, Final, List, Tuple, TypeVar, cast, Optional
 
 import torch
 from torch.fx.node import Node
@@ -12,7 +12,7 @@ from easier.core import passes
 from easier.core import module as _EsrMod
 from easier.core.passes.life_range_analysis import get_nodes_end_at
 from easier.core.passes.utils import \
-    FX, tree_map, normalize_reducer_call_into_args, \
+    FX, OrderedSet, tree_map, normalize_reducer_call_into_args, \
     get_called_module, get_attr_value, get_easier_tensors
 from easier.core.utils import EasierJitException
 from easier.core.runtime.dist_env import \
@@ -22,7 +22,7 @@ from easier.core.runtime.metadata import \
     RuntimeTensorMeta, StructuredTensorMeta, Role, ViewSrc, \
     get_node_meta, set_node_meta, get_runtime_metadata_from_scalar, \
     StructuredViewSrc, set_node_view_src, get_node_view_src, \
-    IndexedAddr, StructuredIndexedAddr, collect_meta
+    IndexedAddr, StructuredIndexedAddr, collect_meta, is_node_skipped
 from easier.core.runtime.jit_engine.handlers import \
     NodeHandlerBase, PreprocessDecision
 from easier.core.runtime.jit_engine.values import \
@@ -45,42 +45,46 @@ jit_skipped_meta = RuntimeTensorMeta(
 )
 
 
-def get_value_runtime_metadata(
-    node: Node, role: Role, val,
+_T = TypeVar('_T')
+
+
+def get_value_runtime_info(
+    root: esr.Module, node: Node, val,
+    meta_ctor: Callable[[Tuple[int, ...], torch.dtype], _T],
     *,
     _rec_depth=0  # debug-only
-) -> StructuredTensorMeta:
+):
     """
     Recursive call.
 
-    Get a probably nested RuntimeTensorMeta structure for some runtime value.
-    Such a value is normally the result of evaluating `current_node`
-    or jit_skipped.
+    Get a probably nested runtime info structure, e.g. RuntimeTensorMeta,
+    for some runtime value.
+    Such a value is normally about the result of evaluating `current_node`
+    or about jit_skipped.
 
     Args:
     -   node
-    -   role:
-            the statically inferred role for this Node
     -   val:
             the runtime value, will be recursively inspected if there is a
             nested structure.
+    -   meta_ctor:
+            a callable, inputs are (shape, dtype), the result is the
+            target runtime info object.
     """
     if isinstance(val, torch.Tensor):
-        tensor_runtime_meta = RuntimeTensorMeta(
-            role, tuple(val.shape), val.dtype
-        )
+        tensor_runtime_meta = meta_ctor(tuple(val.shape), val.dtype)
         return tensor_runtime_meta
 
     elif val is None:
         # TODO assert _rec_depth == 0  # possible?
 
         # nested esr.Module calls may return None
-        return replica_none_meta
+        return meta_ctor(replica_none_meta.shape, replica_none_meta.dtype)
 
     elif val is jit_skipped:
         assert _rec_depth == 0, "jit_skipped is always not nested"
 
-        return jit_skipped_meta
+        return meta_ctor(jit_skipped_meta.shape, jit_skipped_meta.dtype)
 
     elif isinstance(val, (tuple, list)):
         n_items = len(val)
@@ -96,14 +100,13 @@ def get_value_runtime_metadata(
 
         for i in range(n_items):
             item = val[i]
-            item_meta = get_value_runtime_metadata(
-                node, role, item,
+            item_meta = get_value_runtime_info(
+                root, node, item, meta_ctor,
                 _rec_depth=_rec_depth+1
             )
 
             # assume being only one level nested.
             assert isinstance(item, torch.Tensor)
-            assert isinstance(item_meta, RuntimeTensorMeta)
 
             item_metas.append(item_meta)
 
@@ -113,7 +116,8 @@ def get_value_runtime_metadata(
     else:
         # Scalar cases may happen for `t.item()` that returns the scalar
         # Python object for singleton tensors.
-        return get_runtime_metadata_from_scalar(val)
+        scalar_meta = get_runtime_metadata_from_scalar(val)
+        return meta_ctor(scalar_meta.shape, scalar_meta.dtype)
 
 
 def get_meta_role_size(meta: StructuredTensorMeta) -> Tuple[Role, int]:
@@ -159,11 +163,12 @@ class StackframeManager(NodeHandlerBase):
     -   Original function scopes of users' EASIER Python programs are totally
         inlined, due to FX tracing mechanism.
         Function-scope GC is no longer achievable.
-    
+
     -   The timing when to release a value relies on the calculation of
         life_range_analysis AOT pass, which would be more aggressive than
         Python-built-in function-scope GC.
     """
+
     def preprocess(
         self,
         current_node: Node,
@@ -269,9 +274,10 @@ class ViewSrcTrackerBase(NodeHandlerBase):
         _rec_depth=0  # debug-only
     ) -> StructuredIndexedAddr:
         """
-        Each resultant item tuple is:
-        an addr int with either a) None, b) an index within multi-result.
+        An IndexedAddr is an addr int with either
+        a) None, b) an index within multi-result.
 
+        A typical use case is:
         When the ref count is increased 0 -> 1, we know the addr is allocated
         by current_node, and we map
         IndexedAddr(addr:int, index:int|None) |-> ViewSrc(current_node, index)
@@ -282,8 +288,16 @@ class ViewSrcTrackerBase(NodeHandlerBase):
         Args:
         -   iaddr_node: The Node whose items' addresses will be checked,
                 not necessary to be `current_node`
-        -   val: The RuntimeValue bound to `iaddr_node`,
-                not necessary to be `res` arg of `postprocess()`
+        -   val: A RuntimeValue that's possiby a Tensor,
+                not necessary to be `res` arg of `postprocess()`,
+                may be an item in `args` too.
+
+        Returns:
+        -   A structure of possibly nested IndexAddr, e.g.
+            `IndexAddr(addr, index=None)` or `None`,
+
+        -   When it's really nested, its leaf item can be None, e.g.
+            `[None, IndexAddr(addr, index=1), None]`
         """
         if isinstance(val, torch.Tensor):
             item_iaddr = val.untyped_storage().data_ptr()
@@ -291,6 +305,10 @@ class ViewSrcTrackerBase(NodeHandlerBase):
 
         elif isinstance(val, (tuple, list)):
             if _rec_depth > 0:
+                # TODO there exist multi-res torch ops whose rec_depth > 1, e.g.
+                # `torch.histogramdd() -> (Tensor, Tensor[])`
+                # for which we may change IndexedAddr.index to List[int].
+                # And this would simplify handling of the args list.
                 raise EasierJitException(
                     "Unexpected nested result with nested depth > 1 from"
                     f" {iaddr_node.format_node()}"
@@ -309,6 +327,7 @@ class ViewSrcTrackerBase(NodeHandlerBase):
                     assert item_iaddr.index is None
                     indexed_addr = IndexedAddr(item_iaddr.addr, i)
                 else:
+                    assert item_iaddr is None
                     indexed_addr = None
 
                 indexed_addrs.append(indexed_addr)
@@ -316,12 +335,18 @@ class ViewSrcTrackerBase(NodeHandlerBase):
             return indexed_addrs
 
         elif val is None:
-            # TODO assert _rec_depth == 0  # possible?
+            # Besides resultant None of esr.Module calls, None can also be used
+            # as tensor index e.g. `getitem(x, [:, 1, None])` to unsqueeze dims.
             return None
 
-        elif val is jit_skipped or isinstance(val, (int, float, bool)):
-            assert _rec_depth == 0, \
-                "Scalars and jit_skipped are always not nested"
+        elif val is jit_skipped:
+            assert _rec_depth == 0, "jit_skipped is always not nested"
+            return None
+
+        elif val is Ellipsis or isinstance(val, (int, float, bool, str, slice)):
+            # rec_depth can > 0
+            # e.g. in `getitem(input=x, position=[:, slice, 5, tensoridx])`
+            # argument `position` will result in `[None, None, None, IndexAddr()]`
             return None
 
         else:
@@ -455,14 +480,19 @@ class ViewSrcValidation(ViewSrcTrackerBase):
             )
 
 
-class MetadataValidation(NodeHandlerBase):
+class ShapeDtypeValidation(NodeHandlerBase):
     """
     Postprocess-only.
 
-    This validates if the shape/dtype/view_info of immediate results
+    This validates if the shape/dtype of immediate results
     are *strictly equal* (current requirement) during all forward() calls. 
 
-    Generally, this should be the last postprocess in runtime.
+    We don't validate role, because with only runtime value,
+    we can no longer infer role.
+    Then it's meaningless to just assume role does not change.
+
+    P.S. After fusion a GraphModule may return DIST and REPLICA, so the
+    resultant roles are even not unique.
     """
 
     def __init__(
@@ -477,20 +507,15 @@ class MetadataValidation(NodeHandlerBase):
     ) -> RuntimeValue:
         prev_meta = get_node_meta(current_node)
 
-        def _get_dist_role(x: RuntimeTensorMeta):
-            return x.role
-        dist_roles = set(collect_meta(
-            prev_meta, _get_dist_role, sentinel=Role.REPLICATED
-        ))
+        def _get_shape_dtype(x):
+            if isinstance(x, RuntimeTensorMeta):
+                return x.shape, x.dtype
+            else:
+                return x
+        prev_s_d = tree_map(prev_meta, _get_shape_dtype)
 
-        assert len(dist_roles) <= 1
-        if len(dist_roles) == 1:
-            role = Role.DISTRIBUTED
-        else:
-            role = Role.REPLICATED
-
-        result_meta = get_value_runtime_metadata(
-            current_node, role, res
+        result_s_d = get_value_runtime_info(
+            self.current_module, current_node, res, (lambda s, d: (s, d))
         )
 
         # TODO if we support meta changes on the fly, we can just check
@@ -499,11 +524,11 @@ class MetadataValidation(NodeHandlerBase):
         # becomes an allocator Node, as long as it does not break the dep edges
         # of data-dep-analysis. Currently by simply equating two Metas we are
         # enforcing that the view info must be exactly the same.
-        if prev_meta != result_meta:
+        if prev_s_d != result_s_d:
             raise EasierJitException(
-                "The properties of the result value of the operation"
+                "The shape/dtype of the result value of the operation"
                 f" '{current_node.target}' changes:"
-                f" {prev_meta} => {result_meta}"
+                f" {prev_s_d} => {result_s_d}"
             )
 
         return res
@@ -525,25 +550,10 @@ class SkipZeroLengthNonHalo(NodeHandlerBase):
     def preprocess(
         self, current_node: Node, args, kwargs
     ) -> PreprocessDecision:
-        if current_node.op == FX.CALL_MODULE:
-            submod = get_called_module(self.current_module, current_node)
-            if isinstance(submod, HaloExchanger):
-                return PreprocessDecision.CONTINUE
-
-        meta = get_node_meta(current_node)
-
-        def _get_dist_bs(x: RuntimeTensorMeta):
-            if x.role == Role.DISTRIBUTED:
-                return x.shape[0]
-            else:
-                return None
-        dist_sizes = set(collect_meta(meta, _get_dist_bs, sentinel=None))
-        if len(dist_sizes) == 1:
-            dist_size = dist_sizes.pop()
-            if dist_size == 0:
-                return PreprocessDecision.SKIP_EVAL
-
-        return PreprocessDecision.CONTINUE
+        if is_node_skipped(self.current_module, current_node):
+            return PreprocessDecision.SKIP_EVAL
+        else:
+            return PreprocessDecision.CONTINUE
 
 
 class MetadataPropagation(NodeHandlerBase):
@@ -692,9 +702,18 @@ class MetadataPropagation(NodeHandlerBase):
         Validate Role and batch size consistency between the inferred info
         and runtime, possibly nested, data.
         """
+        # During 1st run, TensorMetas of each Node (may be multi-res)
+        # have a unique role.
         role = self.expected_role_size[0]
-        runtime_meta = get_value_runtime_metadata(
-            current_node, role, res
+
+        # During 1st run, without analysis involving types of Selector/Reducer
+        # (e.g. passes.tensor_grouping) we cannot **infer** the role,
+        # what we do here is only to reuse the role inferred in AOT passes.
+        def _meta_from_shape_dtype(shape, dtype):
+            return RuntimeTensorMeta(role, shape, dtype)
+
+        runtime_meta = get_value_runtime_info(
+            self.current_module, current_node, res, _meta_from_shape_dtype
         )
 
         # TODO wrong! releasing Node or releasing the tensor don't mean
@@ -758,6 +777,27 @@ class AggregatorMetadataPropagation(NodeHandlerBase):
     """
     Specific propagation for metadata of EASIER aggregators
     in addition to the general FirstRunMetadataPropagation.
+
+    A user program call to EASIER aggregator e.g. `r = esr.sum(x)`
+    in AOT is converted to:
+    ```
+    r1 = esr.sum(x)
+    r2 = runtime.all_gather_into_tensor(r1)
+    r = torch.sum(r2, dim=0, keepdim=True)
+    ```
+
+    `r1 = esr.sum(x)` is special:
+    -   it does NOT do communication.
+        (`r2 = runtime.all_gather_into_tensor(r1)` is purely replicated and
+        doing collective communication)
+
+    -   its input is distributed, its output is replicated;
+
+    -   on some ranks the input `x` to `esr.sum(x)` are skipped, but since
+        its output is replicated and given the overall design of JitEngine
+        that replica Nodes are not skipped, we have to hook on `esr.sum` Node
+        and inject a valid input tensor for it -- the value will be neutral
+        value of the corresponding aggregator.
     """
 
     def preprocess_call_function(
@@ -884,11 +924,18 @@ class AggregatorNeutralInputPreparation(NodeHandlerBase):
     Remarks:
     Instead of directly allocate the neutral tensor to be the result
     like not-full local Reducer,
+    we allocate the INPUT and still RUN the aggregator.
+
     Because PyTorch has the style of converting int32 to int64
     to avoid overflow, unless dtype is explicitly specified.
     So, we allocate the input and run the aggregator to get the real result
     dtype, and in the first run we all set the real result dtype in
     FirstRunAggregatorMetaProp.postprocess().
+
+    TODO consider enforce esr.aggegator to not auto promote dtype like int32,
+    also enforce distpass to insert allgather and replicated sum etc.
+    to use the same non-promoted dtype.
+    By so we can SKPI_EVAL and directly allocate the neutral OUTPUT.
     """
 
     def preprocess_call_function(
@@ -1032,6 +1079,24 @@ class JitEngine:
 
         self.run_count = 0
 
+        # ======
+        # Fields for Handlers to setup
+
+        # CommunicationPrimitiveRecorder:
+        #
+        # Whether this Module or nested Modules called communication primitives
+        # like AllReduce/HaloExchanger(P2P).
+        self.called_comm_primitive: bool
+
+        # AttrTensorAccessRecorder:
+        #
+        # esr.Tensors this Module/JitEngine and its all nested Modules
+        # read/write.
+        # NOTE a nested esr.Tensor may be not referenced in this Module
+        # i.e. not used, or, isn't an attribute at all.
+        self.read_tensors: OrderedSet[esr.Tensor]
+        self.write_tensors: OrderedSet[esr.Tensor]
+
     def create_first_run_handlers(self, stackframe: Dict[Node, RuntimeValue]):
         first_run_handlers: List[NodeHandlerBase] = [
             # -> Load values from stackframe
@@ -1081,8 +1146,8 @@ class JitEngine:
             ViewSrcValidation(self.module, stackframe),
 
             # ->
-            # <- Validates metadata and asserts no changes
-            MetadataValidation(self.module, stackframe),
+            # <- Validates shape/dtype and asserts no changes
+            ShapeDtypeValidation(self.module, stackframe),
 
             # -> if any dist input is zero-length: SKIP_EVAL --\--------
             # <____ res=jit_skipped ___________________________/
@@ -1103,10 +1168,21 @@ class JitEngine:
         return runtime_handlers
 
     def compile_after_first_run(self):
+        """
+        Generally, transformations and validations can be organized as passes
+        here, if:
+        -   They need runtime information like Tensor.storage();
+        -   They are run only once.
+        """
         ms, gs = [self.module], [self.graph]
 
+        # passes.analyze_data_dependency() must be run after the 1st run,
+        # as it generates info of nested esr.Module calls for outer JIT runs.
         ms, gs = passes.analyze_data_dependency(ms, gs)
-        # ms, gs = passes.fuse(ms, gs)
+
+        ms, gs = passes.fuse_dataflow(ms, gs)
+        ms, gs = passes.analyze_life_range(ms, gs)
+
         # ms, gs = passes.codegen(ms, gs)
 
         [self.module], [self.graph] = ms, gs
