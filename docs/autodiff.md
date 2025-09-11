@@ -96,14 +96,39 @@
 ```python
 def easier.jvp(
     modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],
-    outputs: Sequence[easier.Tensor],
+    inputs: Sequence[easier.Tensor],   # x
+    outputs: Sequence[easier.Tensor],  # y
 ) -> Tuple[
-    Sequence[easier.Module],
-    Sequence[easier.Tensor],
-    Sequence[easier.Tensor]
+    Sequence[easier.Module],  # jvp_m
+    Sequence[easier.Tensor],  # tangent_x
+    Sequence[easier.Tensor]   # tangent_y
 ]: ...
 ```
+
+**TODO**:
+-   Aren't esr.Modules returned by `easier.jvp` already `_Pushforward`s?
+-   It seems not suitable to call it `jvp` anymore,
+    since we don't evaluate the _product_ of Jacobian and vector immediately,
+    or even have (the value of) $v$ immediately.
+
+    Alternative names:
+    1.  `jacobian`:
+        This API returns actually a subprocedure equivalent to Jacobian matrix.
+        But the problem may be we don't have a term in this way for "vjp"
+        -- `jacobian_tranpose`? (might it emphasize too much the nature of being matrix while it's not?)
+
+    1.  `pushforward`:
+        Too uncommon? But the dual API could be `pullback`.
+
+    1.  `tangent_map` and `cotangent_map`
+    1.  `forward_map` and `backward_map`
+
+    1.  `derivative/differential` and `adjoint`: in a sense of e.g. "differential operator".
+
+    Remarkably, `jacfwd/jacrev` APIs in JAX, `torch.func` etc. do not reflect
+    the duality here. They both calculate the Jacobian (pushforward) only
+    but in different ways.
+
 
 Represents:
 -   Jacobian-vector product
@@ -125,7 +150,7 @@ Arguments:
 -   `inputs/outputs`: `easier.Tensor` included in `modules`
 
 Returns:
--   New `easier.Module`s:
+-   New `easier.Module`s (`easier._Pushforward`s ??):
     -   Inherit all original `easier.Tensor`s
     -   After execution, all original `easier.Tensor`s are filled with _primal results_
     -   After execution, new output tangent  `easier.Tensor`s are filled Jacobian-vector product results
@@ -177,17 +202,88 @@ for i in range(10):
 
 ### Forward-mode (Jacobian matrix)
 ```python
+class _Pushforward(easier.Module):
+    ...
+
+    # def dual(self) -> _Pullback: ...
+    # TODO where to get cot_y, cot_x for the resultant pullback?
+    # users can simply call easier.vjp, passing the same arguments?
+
 def easier.jacobian(
     modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],
-    outputs: Sequence[easier.Tensor],
-) -> linsys.LinSys: ... # ?????
+    inputs: Sequence[easier.Tensor],   # x
+    outputs: Sequence[easier.Tensor],  # y
+) -> Tuple[
+    Sequence[_Pushforward],   # pushforward
+    Sequence[easier.Tensor],  # tangent_x
+    Sequence[easier.Tensor]   # tangent_y
+]: ...
 ```
 
-**TODO**:
--   it seems impossible for users to inspect the S/R.idx in LinSys,
-    because it's somehow compressed,
-    the idx will be somehow on concat-ed TensorGroups whose layout is EASIER-internal.
+
+#### Open question: About sparsity in Jacobian and linear combination of direction bases
+
+Such properties may be leverage to calculate gradient _using forward AD_, where
+backward AD is theoretically better given $nI >> nO = 1$ but comes at the cost
+of memory consumption.
+
+For example, given
+$f\in \mathbb{R}^n \to \mathbb{R}$,
+the pushforward at $x\in\mathbb{R}^n$ is
+$df_x\in \mathbb{R}^n \to \mathbb{R}$ too (up to isomorphism).
+We may need to call $df_x(e_i)$ for all bases $e_i$ to get the components of
+gradient vector.
+
+However, if Jacobian matrix has sparsity (an extreme case is map-then-sum),
+we may have an operator $\mathcal{V}$ to convert (e.g. "vmap")
+$df_x\in \mathbb{R}^n \to \mathbb{R}$
+to
+$\mathcal{V}(df_x) \in \mathbb{R}^n \to \mathbb{R}^n$.
+
+Then we can call $\mathcal{V}(df_x)(\sum_i e_i)$ of some proper linear combination.
+
+And this may be extended to general sparsity (e.g. `Selector/Reducer`) and
+general pullback.
+
+Open questions:
+
+-   The algorithm correctness
+-   Given a `_Pushforward`, `easier.jvp/jacobian` returns
+    a single (sequence of) tangent `easier.Tensor`, it may not be flexible
+    enough to carry the linear combination of bases given the arbitrariness
+    of the Jacobian sparsity.
+
+
+### Backward-mode
+```python
+class _Pullback(easier.Module):
+    ...
+
+#     def dual(self) -> _Pushforward: ...
+# [pushforward], [tg_x], [tg_y] = easier.jvp()
+# pullback = pushforward.dual()
+# TODO where to get cot_y, cot_x ?
+
+def easier.vjp(
+    modules: Sequence[easier.Module],
+    inputs: Sequence[easier.Tensor],   # x
+    outputs: Sequence[easier.Tensor],  # y
+) -> Tuple[
+    Sequence[easier.Module],  # vjp_m  : _Pullback???
+    Sequence[easier.Tensor],  # cotangent_y
+    Sequence[easier.Tensor]   # cotangent_x
+]: ...
+
+def easier.grad(
+    modules: Sequence[easier.Module],
+    inputs: Sequence[easier.Tensor],  # x
+    output: easier.Tensor,            # y
+) -> Tuple[
+    Sequence[easier.Module],  # grad_m
+    Sequence[easier.Tensor],  # grad_x
+]: ...
+```
+
 
 ## References
 
