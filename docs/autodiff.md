@@ -283,6 +283,12 @@ Open questions:
     enough to carry the linear combination of bases given the arbitrariness
     of the Jacobian sparsity.
 
+-   We may provide `_Pushforward.dual(): _Pullback` only and specifically to
+    serve as $\mathcal{V}$, generalized for general pullbacks,
+    and such a pullback is numerically equivalent to pullback from `easier.vjp`
+    but implementation-wise different: using forward AD v.s. backward AD.
+    
+
 
 ### Backward-mode
 ```python
