@@ -100,13 +100,43 @@ def easier.jvp(
     outputs: Sequence[easier.Tensor],  # y
 ) -> Tuple[
     Sequence[easier.Module],  # jvp_m
-    Sequence[easier.Tensor],  # tangent_x
-    Sequence[easier.Tensor]   # tangent_y
+    Sequence[easier.Tensor],  # tangents_x
+    Sequence[easier.Tensor]   # tangents_y
 ]: ...
 ```
 
 **TODO**:
 -   Aren't esr.Modules returned by `easier.jvp` already `_Pushforward`s?
+
+-   When `tangent_x: easier.Tensor` is distributed, how can user set its value?
+
+    NOTE if like `jax.jvp` and treat `tangent_x` as value-immediately-ready,
+    this API becomes traditional `jvp` and we'll inevitably provide `jacobian` API.
+
+-   Should the input/output Modules not be a collection, but a single Module?
+    I.e. can different Modules run in arbitrary order, perhaps interleavedly?
+
+    If we take only one Module,
+    we may encapsulate the related descriptive `easier.Tensor`s into the class:
+    ```python
+    class _Pushforward(easier.Module):
+        tangents_x: Sequence[easier.Tensor]
+        tangents_y: Sequence[easier.Tensor]
+        ...
+
+    def easier.jvp(module: easier.Module, inputs, outputs):
+        class _PushforwardInstance(_Pushforward):
+            # Instantiate the class as `forward()` method is bound to class
+            ...
+        return _PushforwardInstance(m)
+    
+    pushforward = easier.jvp(m, [m.x], [m.y])
+    [tg_x] = pushforward.tangents_x  # impossible to mix positions in tuple
+    ```
+    This may make the API code / user code more self-documentary and
+    less error-prone, especially dealing with "tangent" "cotangent"
+    in the same system.
+
 -   It seems not suitable to call it `jvp` anymore,
     since we don't evaluate the _product_ of Jacobian and vector immediately,
     or even have (the value of) $v$ immediately.
@@ -123,7 +153,7 @@ def easier.jvp(
     1.  `tangent_map` and `cotangent_map`
     1.  `forward_map` and `backward_map`
 
-    1.  `derivative/differential` and `adjoint`: in a sense of e.g. "differential operator".
+    1.  `derivative/differential` and `adjoint`: in a sense of e.g. "differential operator" and "adjoint operator"
 
     Remarkably, `jacfwd/jacrev` APIs in JAX, `torch.func` etc. do not reflect
     the duality here. They both calculate the Jacobian (pushforward) only
