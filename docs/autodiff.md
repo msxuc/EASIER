@@ -133,13 +133,20 @@
     ```
 
 
-1.  https://github.com/mfschubert/sparsejac/blob/main/src/sparsejac/sparsejac.py
+1.  Automatic Sparse Differentiation
 
-    Basically replace the `jax.eye(x.size)` above to a matrix whose rows are
-    linear combinations of basis vectors of the tangent space for `x`,
-    leveraging the predefined sparsity of Jacobian matrix.
+    -   JAX version with predefined sparsity in Jacobian matrix (given as BCOO matrix)
+        https://github.com/mfschubert/sparsejac/blob/main/src/sparsejac/sparsejac.py
+        
+        Basically replace the `jax.eye(x.size)` above to a matrix whose rows are
+        linear combinations of basis vectors of the tangent space for `x`,
+        leveraging the predefined sparsity of Jacobian matrix.
+    
+    -   Sparser, Better, Faster, Stronger: Sparsity Detection for Efficient Automatic Differentiation
+        https://arxiv.org/abs/2501.17737v2
+        that use operator overloading to propagate and detect Jacobian sparsity in general machine learning context.
 
-    The algorithm:
+    The ASD algorithm:
 
     1. Jacbobian sparsity
 
@@ -162,7 +169,9 @@
 
     For EASIER:
 
-    1.  Track the connectivity between input scalars through all intermediate
+    1.  Sparsity of Jacobian matrix in EASIER is relatively determinable.
+    
+        We track the connectivity between input scalars through all intermediate
         results in the target `easier.Module`, so that each element in
         the intermediate tensor carries a union of IDs of connected input scalars
 
@@ -180,8 +189,11 @@
         And finally for each union of IDs, and for every two IDs in that union,
         add an edge to the graph for coloring.
 
-    1.  **Challenge**: the connectivity info may be scattered among workers,
-        this cause the coloring to be distributed.
+    1.  **Challenge**:
+        -   the connectivity info may be scattered among workers,
+            this cause the coloring to be distributed.
+
+        -   aggregators may discard the sparsity and suppress this method.
 
 1.  Hyper-dual number
 
