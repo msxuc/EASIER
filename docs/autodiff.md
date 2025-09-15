@@ -29,7 +29,7 @@
     The function definition will be (JAX-JIT-compiled and) evaluated when it meets input arrays for the first time.
 
     `jax.jacfwd` $\in (R^n \to R^m) \to R^n \to R^{m\times n}$
-    and internally it calls `jax.jvp`:
+    and internally it relies on `jax.jvp`:
 
     ```python
     def jacfwd(fun):
@@ -180,10 +180,18 @@
         And finally for each union of IDs, and for every two IDs in that union,
         add an edge to the graph for coloring.
 
+    1.  **Challenge**: the connectivity info may be scattered among workers,
+        this cause the coloring to be distributed.
+
 1.  Hyper-dual number
 
     A theoretical framework that extends the algebra for dual number and differential rules,
-    so that more than one basis tangent vectors can be encoded.
+    so that more than one basis tangent vectors can be encoded:
+
+    -   $\epsilon_i ^2 = 0$
+
+    -   $\epsilon_i \epsilon_j = 0$ for $i \ne j$
+        > This is optional in hyper-dual number. Having this property it will discard second-order derivatives.
 
     Given $\dot x_k \in \mathbb{R}^n$:
     $$
@@ -203,7 +211,14 @@
     It shows the application of differential rule (multiplication of Jacobian matrix)
     is done in a batch manner on dual parts $\{\epsilon_k\}$.
 
-    
+    For EASIER:
+
+    1.  We can allocate $O(N)$ cells to store the dual coefficients,
+        then call Selector on the primal scalars,
+        then apply differential rules as mapped operations.
+
+    1.  This can be used together with the connectivity-graph-coloring method
+        and reduce the number of cells for dual coefficients to $O(C)$.
 
 1.  `torch.autograd` is famous for its backward-mode AD APIs, e.g.:
 
@@ -378,11 +393,10 @@ Open questions about `jacfwd`:
     Consequently, if input values are runtime values, the `easier.jacfwd` must work as
     `easier.compile() + easier.Module.forward()`.
     
-    > Challenge: we may need to dynamically re-layout distributed tensors.
+    **Challenge**: we may need to dynamically re-layout distributed tensors.
 
 
-
-### Open questions
+## Open questions about AD
 
 1.  Dense Jacobian matrix for optimization problems
 
@@ -395,6 +409,8 @@ Open questions about `jacfwd`:
     ```python
     def easier.jacrev(...)
     ```
+
+## ~~Edit history~~
 
 ### ~~Forward-mode (directional derivative)~~
 
