@@ -20,296 +20,319 @@
 
 1.  Interconnectability to PyTorch AD APIs or the interconnectability with jacobian/derivative/graident from PyTorch AD.
 
+## Background
+
+Section 3.1 in work
+[1] https://www.jmlr.org/papers/volume18/17-468/17-468.pdf
+is focused on forward mode AD.
+
+Work [2] https://arxiv.org/abs/1411.0583
+views AutoDiff from many perspectives.
+Particularly, section 6 is about Taylor series.
+
 ## Related work
 
-1. JAX AD: `jvp` and `jacfwd`
+### JAX AD: `jvp` and `jacfwd`
 
-    JAX AD APIs are all dealing with functionals (function definitions in JAX IR),
-    therefore recursively application of JAX AD APIs is essentially function composition.
-    The function definition will be (JAX-JIT-compiled and) evaluated when it meets input arrays for the first time.
-
-    `jax.jacfwd` $\in (R^n \to R^m) \to R^n \to R^{m\times n}$
-    and internally it relies on `jax.jvp`:
-
-    ```python
-    def jacfwd(fun):
-        def jacfun(x):
-            # jvp returns (primals, tangents)
-            pushfwd = lambda tg_x: jax.jvp(fun, x, tg_x)
-            y, J = jax.vmap(
-                pushfwd,
-                # dont vmap primals;
-                # vmap along 2nd dim of tangents (n in mxn)
-                out_axes=(None, -1)
-            )(jax.eye(x.size))
-            return J
-        return jacfun
-
-    x: jax.Array
-    J: jax.Array = jacfwd(f)(x)
-    ```
-
-    > As an implementation detail, although the call to `jax.jvp` is delayed, encapsulated in
-    a lambda function and passed in `jax.vmap` -- another JAX transformation of functional,
-    the AD transformation in `jax.jvp` will still be fully realized before the
-    vectorization transformation.
-    >
-    > So, `jacfwd` can be seen purely as an additional transformation to `jvp`.
-    >
-    > And the implementation of `jax.vmap` is not very relevant, as JAX vectorization is designed
-    to respect operator-level vectorization rule, instead of the data sparsity
-    like we can tell from a CSR matrix instance.
-
-    `jax.jvp` evaluates a single pushed-forward tangent vector.
-    If the input tangent vector is basis vector of the vector space for `x`,
-    i.e. for **one scalar in `x`**, the result tangent vector will be a **column**
-    in the corresponding Jacobian matrix.
-
-    `jax.jacfwd` evaluates the whole Jacobian matrix by equivalently evaluates
-    all columns. However, instead of doing a Python loop
-    `for i in range(x.size): jax.jvp(fun, x, jax.eye(x.size)[i, :])`,
-    it utilizes `jax.vmap` to vectorize the push forward functional first, so that all
-    basis vectors -- the `eye(x.size)` -- can be pushed forward in a batch.
-
-    `jax.jvp` does the AD transformation using _tracer_ approach, similar to
-    `torch.fx` traces the `torch.nn.Module`:
-
-    ```python
-    x: jax.Array
-    tg_x: jax.Array
-
-    trace = jax.JVPTrace()  # similar to fx.Tracer
-    in_tracer = jax.JVPTracer(trace, x, tg_x)  # similar to fx.Proxy
-    ans = original_fun(in_tracer)
-
-    # For the sake of simplicity, the code snippet assumes primitive to have a single parameter
-    class JVPTrace:
-        def process_primitive(self, primitive, tracers):
-            primals_in = [tracer.primal for tracer in tracers] 
-            tangents_in = [tracer.tangent for tracer in tracers] 
-
-            # primitive_jvps is a global registry for JAX operators
-            jvp = primitive_jvps.get(primitive)
-            # type: (List[jax.Array], List[jax.Array]) -> (List[jax.Array], List[jax.Array])
-
-            with jax.core.set_current_trace(self.parent_trace):
-                # Normally, switch to EvalTrace
-                primals_out, tangents_out = jvp(primals_in, tangents_in)
-
-            return [
-                JVPTracer(primal_out, tangent_out) for primal_out, tangent_out
-                in zip(primals_out, tangents_out)
-            ]
-    
-    # For JAX operators whose differential rules are highly dataflow-like:
-    mul_prim: jax.Primitive
-    jax.ad.defjvp(
-        mul_prim,
-        lambda xdot, x, y: jax.mul(xdot, y),
-        lambda ydot, x, y: jax.mul(x, ydot),
-    )
-    # What API jax.mul looks like:
-    def jax.mul(x, y):
-        # When without special Trace set, use EvalTrace to evalute values.
-        return mul_prim.bind(x, y)
-
-    def defjvp(primitive, *jvprules):
-        def jvp(primals, tangents):
-
-            # Primitive itself is for hooking into the tracing process,
-            # Primitive.bind() will evaluate using the Trace in the context.
-            #
-            # The `set_current_trace(self.parent_trace)` in JVPTrace has
-            # switched this evaluation to use EvalTrace -- the tangent values
-            # will be calculated on the fly.
-            val_out = primitive.bind(*primals)
-            tangents_out = [
-                rule(tg, *primals) for rule, tg
-                in zip(jvprules, tangents)
-            ]
-            return val_out, functools.reduce(jax.add, tangents_out)
-
-        primitive_jvps[primitive] = jvp  
-    ```
-
-    > In contrast to the case that only `jax.jvp` is called where tangent values
-    are computed on the fly,
-    other JAX functional transformations may need full IR of the given functional, one typical example is
-    `jax.jit` which optimizes and lowers IR to XLA, its `JitTracer` may trace
-    the given function into a `Jaxpr` IR graph.
-
-    For EASIER:
-
-    1.  mapped operators: computation for their differential rules are also mapped operations
-
-    1.  Selector: select dual cofficients using the same `idx`
-
-    1.  Reducer:
-    
-        -   using the differential rules for `Reducer.reduce: Literal['sum', 'prod', ...]`
-
-        -   for 'prod', the primal scalars will be involved, casuing extra operations
-            that take both intermediate tensors for primals and tangents as arguments.
+JAX official documents about AD APIs:
+-   https://docs.jax.dev/en/latest/notebooks/autodiff_cookbook.html
+-   https://docs.jax.dev/en/latest/advanced-autodiff.html
 
 
-1.  Automatic Sparse Differentiation
+JAX AD APIs are all dealing with functionals (function definitions in JAX IR),
+therefore recursively application of JAX AD APIs is essentially function composition.
+The function definition will be (JAX-JIT-compiled and) evaluated when it meets input arrays for the first time.
 
-    -   JAX version with predefined sparsity in Jacobian matrix (given as BCOO matrix)
-        https://github.com/mfschubert/sparsejac/blob/main/src/sparsejac/sparsejac.py
-        
-        Basically replace the `jax.eye(x.size)` above to a matrix whose rows are
-        linear combinations of basis vectors of the tangent space for `x`,
-        leveraging the predefined sparsity of Jacobian matrix.
-    
-    -   Sparser, Better, Faster, Stronger: Sparsity Detection for Efficient Automatic Differentiation
-        https://arxiv.org/abs/2501.17737v2
-        that use operator overloading to propagate and detect Jacobian sparsity in general machine learning context.
+`jax.jacfwd` $\in (R^n \to R^m) \to R^n \to R^{m\times n}$
+and internally it relies on `jax.jvp`:
 
-    The ASD algorithm:
+```python
+def jacfwd(fun):
+    def jacfun(x):
+        # jvp returns (primals, tangents)
+        pushfwd = lambda tg_x: jax.jvp(fun, x, tg_x)
+        y, J = jax.vmap(
+            pushfwd,
+            # dont vmap primals;
+            # vmap along 2nd dim of tangents (n in mxn)
+            out_axes=(None, -1)
+        )(jax.eye(x.size))
+        return J
+    return jacfun
 
-    1. Jacbobian sparsity
+x: jax.Array
+J: jax.Array = jacfwd(f)(x)
+```
 
-        Consider all input scalars are vertices of a graph, and the target
-        function to be a composition of many subfunctions.
-        Any variables being arguments to the same subfunction are connected
-        in the graph.
-        The connectivity is propagated, e.g. `f2(f1(x, y), z)` leads to edges
-        `x-y, y-z, z-x`.
+> As an implementation detail, although the call to `jax.jvp` is delayed, encapsulated in
+a lambda function and passed in `jax.vmap` -- another JAX transformation of functional,
+the AD transformation in `jax.jvp` will still be fully realized before the
+vectorization transformation.
+>
+> So, `jacfwd` can be seen purely as an additional transformation to `jvp`.
+>
+> And the implementation of `jax.vmap` is not very relevant, as JAX vectorization is designed
+to respect operator-level vectorization rule, instead of the data sparsity
+like we can tell from a CSR matrix instance.
 
-        (in the above code, the sparsity is given by a parameter BCOO matrix).
+`jax.jvp` evaluates a single pushed-forward tangent vector.
+If the input tangent vector is basis vector of the vector space for `x`,
+i.e. for **one scalar in `x`**, the result tangent vector will be a **column**
+in the corresponding Jacobian matrix.
 
-    1.  Color the graph so that no adjacent vertices have the same color
-        and minimize the number of colors $C$.
+`jax.jacfwd` evaluates the whole Jacobian matrix by equivalently evaluates
+all columns. However, instead of doing a Python loop
+`for i in range(x.size): jax.jvp(fun, x, jax.eye(x.size)[i, :])`,
+it utilizes `jax.vmap` to vectorize the push forward functional first, so that all
+basis vectors -- the `eye(x.size)` -- can be pushed forward in a batch.
 
-    1.  For each color, we can add basis tangent vectors of those input scalars
-        and call `jvp` with that linear combination tangent vector.
+`jax.jvp` does the AD transformation using _tracer_ approach, similar to
+`torch.fx` traces the `torch.nn.Module`:
 
-        But for all colors, we still need to call `jvp` $C$ times.
+```python
+x: jax.Array
+tg_x: jax.Array
 
-    For EASIER:
+trace = jax.JVPTrace()  # similar to fx.Tracer
+in_tracer = jax.JVPTracer(trace, x, tg_x)  # similar to fx.Proxy
+ans = original_fun(in_tracer)
 
-    1.  Sparsity of Jacobian matrix in EASIER is relatively determinable.
-    
-        We track the connectivity between input scalars through all intermediate
-        results in the target `easier.Module`, so that each element in
-        the intermediate tensor carries a union of IDs of connected input scalars
+# For the sake of simplicity, the code snippet assumes primitive to have a single parameter
+class JVPTrace:
+    def process_primitive(self, primitive, tracers):
+        primals_in = [tracer.primal for tracer in tracers] 
+        tangents_in = [tracer.tangent for tracer in tracers] 
 
-        > Reamrkably, it's each intermediate **tensor**,
-        > not each intermediate TensorGroup.
+        # primitive_jvps is a global registry for JAX operators
+        jvp = primitive_jvps.get(primitive)
+        # type: (List[jax.Array], List[jax.Array]) -> (List[jax.Array], List[jax.Array])
 
-        regarding:
+        with jax.core.set_current_trace(self.parent_trace):
+            # Normally, switch to EvalTrace
+            primals_out, tangents_out = jvp(primals_in, tangents_in)
 
-        -   mapped operators: union remains unchanged
-
-        -   Selector: copy unions
-
-        -   Reducer: union unions that are reduced into the same output element
-
-        And finally for each union of IDs, and for every two IDs in that union,
-        add an edge to the graph for coloring.
-
-    1.  **Challenge**:
-        -   the connectivity info may be scattered among workers,
-            this cause the coloring to be distributed.
-
-        -   aggregators may discard the sparsity and suppress this method.
-
-1.  Hyper-dual number
-
-    A theoretical framework that extends the algebra for dual number and differential rules,
-    so that more than one basis tangent vectors can be encoded:
-
-    -   $\epsilon_i ^2 = 0$
-
-    -   $\epsilon_i \epsilon_j = 0$ for $i \ne j$
-        > This is optional in hyper-dual number. Having this property it will discard second-order derivatives.
-
-    Given $\dot x_k \in \mathbb{R}^n$:
-    $$
-    \hat x = x + \sum_{k<N} \epsilon_k \dot x_k
-    $$
-
-    $$
-    f(\hat x) = f(x) + \sum_{k<N} \epsilon_k \left( J_f(x) \dot x_k \right)
-    $$
-
-    Differential rule for multiplication as an example:
-
-    $$
-    \hat a \hat b = ab + \sum_{k<N} \epsilon_k \left(a \dot b_k+\dot a_k b \right)
-    $$
-
-    It shows the application of differential rule (multiplication of Jacobian matrix)
-    is done in a batch manner on dual parts $\{\epsilon_k\}$.
-
-    For EASIER:
-
-    1.  We can allocate $O(N)$ cells to store the dual coefficients,
-        then call Selector on the primal scalars,
-        then apply differential rules as mapped operations.
-
-    1.  This can be used together with the connectivity-graph-coloring method
-        and reduce the number of cells for dual coefficients to $O(C)$.
-
-1.  `torch.autograd` is famous for its backward-mode AD APIs, e.g.:
-
-    ```
-    torch.autograd.grad(
-        outputs: Sequence[torch.Tensor],
-        inputs: Sequence[torch.Tensor],
-        grad_outputs: Sequence[torch.Tensor] = None,
-        retain_graph=None,
-        create_graph=False,
-        # many other parameters
-    ) -> Sequence[torch.Tensor]
-    ```
-    where all `torch.Tensor`s are nodes in PyTorch's built-up-at-runtime
-    computational graph.
-
-    For forward-mode AD, `autograd` provides two styles:
-
-    -   ```
-        torch.autograd.forward_ad.make_dual(
-            tensor: torch.Tensor,
-            tangent: torch.Tensor
-        ) -> _DualTensor
-        ```
-        for users to manually pack dual numbers;
-
-    -   ```
-        torch.autograd.functional.jvp(
-            func,
-            inputs: Sequence[torch.Tensor],
-            v: torch.Tensor
-        ) -> Tuple[
-            Sequence[torch.Tensor],  # equal to func(inputs)
-            Sequence[torch.Tensor]   # Jacobian-vector product
+        return [
+            JVPTracer(primal_out, tangent_out) for primal_out, tangent_out
+            in zip(primals_out, tangents_out)
         ]
-        ```
-        which is more functional-style and concise.
+
+# For JAX operators whose differential rules are highly dataflow-like:
+mul_prim: jax.Primitive
+jax.ad.defjvp(
+    mul_prim,
+    lambda xdot, x, y: jax.mul(xdot, y),
+    lambda ydot, x, y: jax.mul(x, ydot),
+)
+# What API jax.mul looks like:
+def jax.mul(x, y):
+    # When without special Trace set, use EvalTrace to evalute values.
+    return mul_prim.bind(x, y)
+
+def defjvp(primitive, *jvprules):
+    def jvp(primals, tangents):
+
+        # Primitive itself is for hooking into the tracing process,
+        # Primitive.bind() will evaluate using the Trace in the context.
+        #
+        # The `set_current_trace(self.parent_trace)` in JVPTrace has
+        # switched this evaluation to use EvalTrace -- the tangent values
+        # will be calculated on the fly.
+        val_out = primitive.bind(*primals)
+        tangents_out = [
+            rule(tg, *primals) for rule, tg
+            in zip(jvprules, tangents)
+        ]
+        return val_out, functools.reduce(jax.add, tangents_out)
+
+    primitive_jvps[primitive] = jvp  
+```
+
+> In contrast to the case that only `jax.jvp` is called where tangent values
+are computed on the fly,
+other JAX functional transformations may need full IR of the given functional, one typical example is
+`jax.jit` which optimizes and lowers IR to XLA, its `JitTracer` may trace
+the given function into a `Jaxpr` IR graph.
+
+For EASIER:
+
+1.  mapped operators: computation for their differential rules are also mapped operations
+
+1.  Selector: select dual cofficients using the same `idx`
+
+1.  Reducer:
+
+    -   using the differential rules for `Reducer.reduce: Literal['sum', 'prod', ...]`
+
+    -   for 'prod', the primal scalars will be involved, casuing extra operations
+        that take both intermediate tensors for primals and tangents as arguments.
+
+
+### Automatic Sparse Differentiation
+
+-   Refinement to JAX `jacfwd` with predefined sparsity in Jacobian matrix (given as BCOO matrix)
+    https://github.com/mfschubert/sparsejac/blob/main/src/sparsejac/sparsejac.py
     
-    However, `autograd` APIs do not seem directly adaptable to EASIER,
-    as `autograd` relies on value-based `torch.Tensor`.
+    Basically replace the `jax.eye(x.size)` above to a matrix whose rows are
+    linear combinations of basis vectors of the tangent space for `x`,
+    leveraging the predefined sparsity of Jacobian matrix.
 
-1.  ~~Solution to memory consumption during backward propagation:~~
+-   [4] https://arxiv.org/abs/2501.17737v2
+    uses operator overloading to propagate and detect Jacobian sparsity in general machine learning context.
 
-    Checkpoint primal values and recompute during backprop, e.g.
+-   The book [3] https://dl.acm.org/doi/book/10.5555/1455489
+    also covers this topic, by dynamic detection and matrix compression.
 
+The ASD algorithm:
+
+1. Jacbobian sparsity
+
+    Consider all input scalars are vertices of a graph, and the target
+    function to be a composition of many subfunctions.
+    Any variables being arguments to the same subfunction are connected
+    in the graph.
+    The connectivity is propagated, e.g. `f2(f1(x, y), z)` leads to edges
+    `x-y, y-z, z-x`.
+
+    (in the above code, the sparsity is given by a parameter BCOO matrix).
+
+1.  Color the graph so that no adjacent vertices have the same color
+    and minimize the number of colors $C$.
+
+1.  For each color, we can add basis tangent vectors of those input scalars
+    and call `jvp` with that linear combination tangent vector.
+
+    But for all colors, we still need to call `jvp` $C$ times.
+
+For EASIER:
+
+1.  Sparsity of Jacobian matrix in EASIER is relatively determinable.
+
+    We track the connectivity between input scalars through all intermediate
+    results in the target `easier.Module`, so that each element in
+    the intermediate tensor carries a union of IDs of connected input scalars
+
+    > Reamrkably, it's each intermediate **tensor**,
+    > not each intermediate TensorGroup.
+
+    regarding:
+
+    -   mapped operators: union remains unchanged
+
+    -   Selector: copy unions
+
+    -   Reducer: union unions that are reduced into the same output element
+
+    And finally for each union of IDs, and for every two IDs in that union,
+    add an edge to the graph for coloring.
+
+1.  **Challenge**:
+    -   the connectivity info may be scattered among workers,
+        this cause the coloring to be distributed.
+
+    -   aggregators may discard the sparsity and suppress this method.
+
+### Hyper-dual number
+
+A theoretical framework that extends the algebra for dual number and differential rules,
+so that more than one basis tangent vectors can be encoded:
+
+-   $\epsilon_i ^2 = 0$
+
+-   $\epsilon_i \epsilon_j = 0$ for $i \ne j$
+    > This is optional in hyper-dual number. Having this property it will discard second-order derivatives.
+
+Given $\dot x_k \in \mathbb{R}^n$:
+$$
+\hat x = x + \sum_{k<N} \epsilon_k \dot x_k
+$$
+
+$$
+f(\hat x) = f(x) + \sum_{k<N} \epsilon_k \left( J_f(x) \dot x_k \right)
+$$
+
+Differential rule for multiplication as an example:
+
+$$
+\hat a \hat b = ab + \sum_{k<N} \epsilon_k \left(a \dot b_k+\dot a_k b \right)
+$$
+
+It shows the application of differential rule (multiplication of Jacobian matrix)
+is done in a batch manner on dual parts $\{\epsilon_k\}$.
+
+For EASIER:
+
+1.  We can allocate $O(N)$ cells to store the dual coefficients,
+    then call Selector on the primal scalars,
+    then apply differential rules as mapped operations.
+
+1.  This can be used together with the connectivity-graph-coloring method
+    and reduce the number of cells for dual coefficients to $O(C)$.
+
+### `torch.autograd` AD APIs
+
+https://docs.pytorch.org/docs/stable/autograd.html  
+
+```
+torch.autograd.grad(
+    outputs: Sequence[torch.Tensor],
+    inputs: Sequence[torch.Tensor],
+    grad_outputs: Sequence[torch.Tensor] = None,
+    retain_graph=None,
+    create_graph=False,
+    # many other parameters
+) -> Sequence[torch.Tensor]
+```
+where all `torch.Tensor`s are nodes in PyTorch's built-up-at-runtime
+computational graph.
+
+For forward-mode AD, `autograd` provides two styles:
+
+-   ```
+    torch.autograd.forward_ad.make_dual(
+        tensor: torch.Tensor,
+        tangent: torch.Tensor
+    ) -> _DualTensor
     ```
-    o------>o------>o------>o------>o
-                            x<------x
-                    o------>o
-                    x<------x
-            o------>o
-            x<------x
-    o------>o
-    x<------x
+    for users to manually pack dual numbers;
+
+-   ```
+    torch.autograd.functional.jvp(
+        func,
+        inputs: Sequence[torch.Tensor],
+        v: torch.Tensor
+    ) -> Tuple[
+        Sequence[torch.Tensor],  # equal to func(inputs)
+        Sequence[torch.Tensor]   # Jacobian-vector product
+    ]
     ```
+    which is more functional-style and concise.
 
-    where point `o` means primal checkpoint, `o-->` means computation of primal
-    values, and `x<--x` means backprop between checkpoints.
+However, `autograd` APIs do not seem directly adaptable to EASIER,
+as `autograd` relies on value-based `torch.Tensor`.
 
-1.  ~~_Duality_ between pushforward and pullback~~.
+### PyTorch functional AD APIs
+
+https://docs.pytorch.org/docs/stable/func.api.html
+
+Basically the same as JAX functional AD APIs.
+
+### ~~Solution to memory consumption during backward propagation:~~
+
+Checkpoint primal values and recompute during backprop, e.g.
+
+```
+o------>o------>o------>o------>o
+                        x<------x
+                o------>o
+                x<------x
+        o------>o
+        x<------x
+o------>o
+x<------x
+```
+
+where point `o` means primal checkpoint, `o-->` means computation of primal
+values, and `x<--x` means backprop between checkpoints.
 
 ## EASIER AD APIs
 
@@ -529,8 +552,18 @@ for i in range(10):
 
 ## References
 
-1.  PyTorch AD APIs (graph style and functional style):
-    https://docs.pytorch.org/docs/stable/autograd.html  
+[1]: Atilim Gunes Baydin and Barak A. Pearlmutter and Alexey Andreyevich Radul and Jeffrey Mark Siskind. (2018).
+    Automatic Differentiation in Machine Learning: a Survey.
+    https://www.jmlr.org/papers/volume18/17-468/17-468.pdf
 
-1.  PyTorch AD APIs (functional style):
-    https://docs.pytorch.org/docs/stable/func.api.html
+[2]: Philipp H. W. Hoffmann.
+    A Hitchhiker's Guide to Automatic Differentiation. (2014).
+    https://arxiv.org/abs/1411.0583
+
+[3]: Griewank, Andreas and Walther, Andrea.
+    Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation. (2008).
+    https://dl.acm.org/doi/book/10.5555/1455489
+
+[4]: Adrian Hill, Guillaume Dalle.
+    Sparser, Better, Faster, Stronger: Sparsity Detection for Efficient Automatic Differentiation. (2025).
+    https://arxiv.org/abs/2501.17737v2
