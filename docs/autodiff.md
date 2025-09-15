@@ -22,6 +22,189 @@
 
 ## Related work
 
+1. JAX AD: `jvp` and `jacfwd`
+
+    JAX AD APIs are all dealing with functionals (function definitions in JAX IR),
+    therefore recursively application of JAX AD APIs is essentially function composition.
+    The function definition will be (JAX-JIT-compiled and) evaluated when it meets input arrays for the first time.
+
+    `jax.jacfwd` $\in (R^n \to R^m) \to R^n \to R^{m\times n}$
+    and internally it calls `jax.jvp`:
+
+    ```python
+    def jacfwd(fun):
+        def jacfun(x):
+            # jvp returns (primals, tangents)
+            pushfwd = lambda tg_x: jax.jvp(fun, x, tg_x)
+            y, J = jax.vmap(
+                pushfwd,
+                # dont vmap primals;
+                # vmap along 2nd dim of tangents (n in mxn)
+                out_axes=(None, -1)
+            )(jax.eye(x.size))
+            return J
+        return jacfun
+
+    x: jax.Array
+    J: jax.Array = jacfwd(f)(x)
+    ```
+
+    > As an implementation detail, although the call to `jax.jvp` is delayed, encapsulated in
+    a lambda function and passed in `jax.vmap` -- another JAX transformation of functional,
+    the AD transformation in `jax.jvp` will still be fully realized before the
+    vectorization transformation.
+    >
+    > So, `jacfwd` can be seen purely as an additional transformation to `jvp`.
+    >
+    > And the implementation of `jax.vmap` is not very relevant, as JAX vectorization is designed
+    to respect operator-level vectorization rule, instead of the data sparsity
+    like we can tell from a CSR matrix instance.
+
+    `jax.jvp` evaluates a single pushed-forward tangent vector.
+    If the input tangent vector is basis vector of the vector space for `x`,
+    i.e. for **one scalar in `x`**, the result tangent vector will be a **column**
+    in the corresponding Jacobian matrix.
+
+    `jax.jacfwd` evaluates the whole Jacobian matrix by equivalently evaluates
+    all columns. However, instead of doing a Python loop
+    `for i in range(x.size): jax.jvp(fun, x, jax.eye(x.size)[i, :])`,
+    it utilizes `jax.vmap` to vectorize the push forward functional first, so that all
+    basis vectors -- the `eye(x.size)` -- can be pushed forward in a batch.
+
+    `jax.jvp` does the AD transformation using _tracer_ approach, similar to
+    `torch.fx` traces the `torch.nn.Module`:
+
+    ```python
+    x: jax.Array
+    tg_x: jax.Array
+
+    trace = jax.JVPTrace()  # similar to fx.Tracer
+    in_tracer = jax.JVPTracer(trace, x, tg_x)  # similar to fx.Proxy
+    ans = original_fun(in_tracer)
+
+    # For the sake of simplicity, the code snippet assumes primitive to have a single parameter
+    class JVPTrace:
+        def process_primitive(self, primitive, tracers):
+            primals_in = [tracer.primal for tracer in tracers] 
+            tangents_in = [tracer.tangent for tracer in tracers] 
+
+            # primitive_jvps is a global registry for JAX operators
+            jvp = primitive_jvps.get(primitive)
+            # type: (List[jax.Array], List[jax.Array]) -> (List[jax.Array], List[jax.Array])
+
+            with jax.core.set_current_trace(self.parent_trace):
+                # Normally, switch to EvalTrace
+                primals_out, tangents_out = jvp(primals_in, tangents_in)
+
+            return [
+                JVPTracer(primal_out, tangent_out) for primal_out, tangent_out
+                in zip(primals_out, tangents_out)
+            ]
+    
+    # For JAX operators whose differential rules are highly dataflow-like:
+    mul_prim: jax.Primitive
+    jax.ad.defjvp(
+        mul_prim,
+        lambda xdot, x, y: jax.mul(xdot, y),
+        lambda ydot, x, y: jax.mul(x, ydot),
+    )
+    # What API jax.mul looks like:
+    def jax.mul(x, y):
+        # When without special Trace set, use EvalTrace to evalute values.
+        return mul_prim.bind(x, y)
+
+    def defjvp(primitive, *jvprules):
+        def jvp(primals, tangents):
+
+            # Primitive itself is for hooking into the tracing process,
+            # Primitive.bind() will evaluate using the Trace in the context.
+            #
+            # The `set_current_trace(self.parent_trace)` in JVPTrace has
+            # switched this evaluation to use EvalTrace -- the tangent values
+            # will be calculated on the fly.
+            val_out = primitive.bind(*primals)
+            tangents_out = [
+                rule(tg, *primals) for rule, tg
+                in zip(jvprules, tangents)
+            ]
+            return val_out, functools.reduce(jax.add, tangents_out)
+
+        primitive_jvps[primitive] = jvp  
+    ```
+
+
+1.  https://github.com/mfschubert/sparsejac/blob/main/src/sparsejac/sparsejac.py
+
+    Basically replace the `jax.eye(x.size)` above to a matrix whose rows are
+    linear combinations of basis vectors of the tangent space for `x`,
+    leveraging the predefined sparsity of Jacobian matrix.
+
+    The algorithm:
+
+    1. Jacbobian sparsity
+
+        Consider all input scalars are vertices of a graph, and the target
+        function to be a composition of many subfunctions.
+        Any variables being arguments to the same subfunction are connected
+        in the graph.
+        The connectivity is propagated, e.g. `f2(f1(x, y), z)` leads to edges
+        `x-y, y-z, z-x`.
+
+        (in the above code, the sparsity is given by a parameter BCOO matrix).
+
+    1.  Color the graph so that no adjacent vertices have the same color
+        and minimize the number of colors $C$.
+
+    1.  For each color, we can add basis tangent vectors of those input scalars
+        and call `jvp` with that linear combination tangent vector.
+
+        But for all colors, we still need to call `jvp` $C$ times.
+
+    For EASIER:
+
+    1.  Track the connectivity between input scalars through all intermediate
+        results in the target `easier.Module`, so that each element in
+        the intermediate tensor carries a union of IDs of connected input scalars
+
+        > Reamrkably, it's each intermediate **tensor**,
+        > not each intermediate TensorGroup.
+
+        regarding:
+
+        -   mapped operators: union remains unchanged
+
+        -   Selector: copy unions
+
+        -   Reducer: union unions that are reduced into the same output element
+
+        And finally for each union of IDs, and for every two IDs in that union,
+        add an edge to the graph for coloring.
+
+1.  Hyper-dual number
+
+    A theoretical framework that extends the algebra for dual number and differential rules,
+    so that more than one basis tangent vectors can be encoded.
+
+    Given $\dot x_k \in \mathbb{R}^n$:
+    $$
+    \hat x = x + \sum_{k<N} \epsilon_k \dot x_k
+    $$
+
+    $$
+    f(\hat x) = f(x) + \sum_{k<N} \epsilon_k \left( J_f(x) \dot x_k \right)
+    $$
+
+    Differential rule for multiplication as an example:
+
+    $$
+    \hat a \hat b = ab + \sum_{k<N} \epsilon_k \left(a \dot b_k+\dot a_k b \right)
+    $$
+
+    It shows the application of differential rule (multiplication of Jacobian matrix)
+    is done in a batch manner on dual parts $\{\epsilon_k\}$.
+
+    
+
 1.  `torch.autograd` is famous for its backward-mode AD APIs, e.g.:
 
     ```
@@ -62,7 +245,7 @@
     However, `autograd` APIs do not seem directly adaptable to EASIER,
     as `autograd` relies on value-based `torch.Tensor`.
 
-1.  Solution to memory consumption during backward propagation:
+1.  ~~Solution to memory consumption during backward propagation:~~
 
     Checkpoint primal values and recompute during backprop, e.g.
 
@@ -80,85 +263,152 @@
     where point `o` means primal checkpoint, `o-->` means computation of primal
     values, and `x<--x` means backprop between checkpoints.
 
-1.  Sparsity of Jacobian matrix:
-
-    "Non-interleaving" basis vectors
-    (evaluation of JVP on basis vectors form columns of the Jacobian matrix)
-    can be colored and grouped, so that a linear combination of basis vectors
-    can be processed in a simultaneous manner.
-
-1.  _Duality_ between pushforward and pullback.
+1.  ~~_Duality_ between pushforward and pullback~~.
 
 ## EASIER AD APIs
 
-### Forward-mode (directional derivative)
+### JVP (proposal)
+
+Resultant module is a composition of operators and primitives.
+
+When run, it:
+1.  reads latest values in `inputs, outputs, tangents_in` and other attribute
+    `easier.Tensor`s in `modules`;
+1.  evaluates both primals and tangents and writes them into
+   `outputs, tangents_out`.
+
+```python
+def easier.jvp(
+    module: easier.Module,
+    inputs: Sequence[easier.Tensor],
+    outputs: Sequence[easier.Tensor],
+) -> Tuple[
+    easier.Module,
+    Sequence[easier.Tensor],
+    Sequence[easier.Tensor]
+]: ...
+```
+
+Usage:
+```python
+m = Module()
+
+jvp_m, [tg_x], [tg_y] = easier.jvp(m, [m.x], [m.y])
+assert jvp_m is not m
+
+[
+    jvp_m, write_tg_x, read_tg_y
+] = easier.compile([
+    jvp_m, write_tg_x, read_tg_y
+], backend='torch')
+
+for i in range(10):
+    write_tg_x()
+
+    jvp_m()
+
+    read_tg_y()
+```
+
+### Jacobian matrix using forward AD (proposal)
+
+Resultant module is basically an SpMV, its matrix elements are fixed and
+not dynamically depending on `inputs, ouputs` or attribute `easier.Tensor`s.
+
+(The resultant elements for the Jacobian matrix and their layout are not visible to users)
+
+When run, it:
+1.  reads latest values in `tangents_in`;
+1.  does SpMV and writes them into `tangents_out`.
+
+```python
+class Jacobian(easier.Module):
+    def transpose(self) -> _Jacobian: ...
+    # TODO make tg_x tg_y attributes of _Jacobian?
+
+def easier.jacfwd(
+    modules: easier.Module,
+    inputs: Sequence[easier.Tensor],
+    outputs: Sequence[easier.Tensor],
+) -> Tuple[
+    easier.Module,  # Jacobian calculator
+    easier.Jacobian,  # Jacobian SpMV
+    Sequence[easier.Tensor],
+    Sequence[easier.Tensor]
+]: ...
+```
+
+Usage:
+```python
+m = Module()
+
+jacfwd_m, jacobian_m, [tg_x], [tg_y] = easier.jacfwd(m, [m.x], [m.y])
+
+[
+    jacfwd_m, jacobian_m, write_tg_x, read_tg_y
+] = easier.compile([
+    jacfwd_m, jacobian_m, write_tg_x, read_tg_y
+], backend='torch')
+
+jacfwd_m()
+
+for i in range(10):
+    write_tg_x()
+
+    jacobian_m()
+
+    read_tg_y()
+```
+
+Open questions about `jacfwd`:
+1.  To get the Jacobian matrix, we must see the values of inputs, with
+    input-tangents-in-JVP-sense being `torch.eye(input_size)`.
+
+    But after the calculation of Jacobian matrix, we don't need input values
+    any more and can use the Jacobian matrix on its own,
+    as long as algorithmically the input values remain unchanged.
+
+    The above API explicitly splits the two stages.
+    (calculation of Jacobian matrix and Jacobian SpMV on whatever tangent vector)
+    This is possible as the sparsity structure of Jacobian matrix can be inferred
+    from input `m: easier.Module`.
+
+    Otherwise, if we want a single pass to get the SpMV module,
+    it requires the calculation of Jacobian matrix to be done during the call to `easier.jacfwd` itself.
+    Consequently, if input values are runtime values, the `easier.jacfwd` must work as
+    `easier.compile() + easier.Module.forward()`.
+    
+    > Challenge: we may need to dynamically re-layout distributed tensors.
+
+
+
+### Open questions
+
+1.  Dense Jacobian matrix for optimization problems
+
+    For optimization problems, the last step would involve reduction into
+    low-dimensional results, causing the Jacobian matrix to be dense.
+
+    Probably we can offer a backward Jacobian API so that the last step
+    can be separatedly evaluated using backward propagation.
+
+    ```python
+    def easier.jacrev(...)
+    ```
+
+### ~~Forward-mode (directional derivative)~~
 
 ```python
 def easier.jvp(
     modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],   # x
-    outputs: Sequence[easier.Tensor],  # y
+    inputs: Sequence[easier.Tensor],
+    outputs: Sequence[easier.Tensor],
 ) -> Tuple[
-    Sequence[easier.Module],  # jvp_m
-    Sequence[easier.Tensor],  # tangents_x
-    Sequence[easier.Tensor]   # tangents_y
+    Sequence[easier.Module],
+    Sequence[easier.Tensor],
+    Sequence[easier.Tensor]
 ]: ...
 ```
-
-**TODO**:
--   Aren't esr.Modules returned by `easier.jvp` already `_Pushforward`s?
-
--   When `tangent_x: easier.Tensor` is distributed, how can user set its value?
-
-    NOTE if like `jax.jvp` and treat `tangent_x` as value-immediately-ready,
-    this API becomes traditional `jvp` and we'll inevitably provide `jacobian` API.
-
--   Should the input/output Modules not be a collection, but a single Module?
-    I.e. can different Modules run in arbitrary order, perhaps interleavedly?
-
-    If we take only one Module,
-    we may encapsulate the related descriptive `easier.Tensor`s into the class:
-    ```python
-    class _Pushforward(easier.Module):
-        tangents_x: Sequence[easier.Tensor]
-        tangents_y: Sequence[easier.Tensor]
-        ...
-
-    def easier.jvp(module: easier.Module, inputs, outputs):
-        class _PushforwardInstance(_Pushforward):
-            # Instantiate the class as `forward()` method is bound to class
-            ...
-        return _PushforwardInstance(m)
-    
-    pushforward = easier.jvp(m, [m.x], [m.y])
-    [tg_x] = pushforward.tangents_x  # impossible to mix positions in tuple
-    ```
-    This may make the API code / user code more self-documentary and
-    less error-prone, especially dealing with "tangent" "cotangent"
-    in the same system.
-
--   It seems not suitable to call it `jvp` anymore,
-    since we don't evaluate the _product_ of Jacobian and vector immediately,
-    or even have (the value of) $v$ immediately.
-
-    Alternative names:
-    1.  `jacobian`:
-        This API returns actually a subprocedure equivalent to Jacobian matrix.
-        But the problem may be we don't have a term in this way for "vjp"
-        -- `jacobian_tranpose`? (might it emphasize too much the nature of being matrix while it's not?)
-
-    1.  `pushforward`:
-        Too uncommon? But the dual API could be `pullback`.
-
-    1.  `tangent_map` and `cotangent_map`
-    1.  `forward_map` and `backward_map`
-
-    1.  `derivative/differential` and `adjoint`: in a sense of e.g. "differential operator" and "adjoint operator"
-
-    Remarkably, `jacfwd/jacrev` APIs in JAX, `torch.func` etc. do not reflect
-    the duality here. They both calculate the Jacobian (pushforward) only
-    but in different ways.
-
 
 Represents:
 -   Jacobian-vector product
@@ -180,7 +430,7 @@ Arguments:
 -   `inputs/outputs`: `easier.Tensor` included in `modules`
 
 Returns:
--   New `easier.Module`s (`easier._Pushforward`s ??):
+-   New `easier.Module`s:
     -   Inherit all original `easier.Tensor`s
     -   After execution, all original `easier.Tensor`s are filled with _primal results_
     -   After execution, new output tangent  `easier.Tensor`s are filled Jacobian-vector product results
@@ -229,97 +479,6 @@ for i in range(10):
 
 > easier.Tensor has ctor parameter `require_grad`, emphasizing _gradients_ which are not in this case,
 > we could only treat them as the real-and-only inputs, also ouputs.
-
-### Forward-mode (Jacobian matrix)
-```python
-class _Pushforward(easier.Module):
-    ...
-
-    # def dual(self) -> _Pullback: ...
-    # TODO where to get cot_y, cot_x for the resultant pullback?
-    # users can simply call easier.vjp, passing the same arguments?
-
-def easier.jacobian(
-    modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],   # x
-    outputs: Sequence[easier.Tensor],  # y
-) -> Tuple[
-    Sequence[_Pushforward],   # pushforward
-    Sequence[easier.Tensor],  # tangent_x
-    Sequence[easier.Tensor]   # tangent_y
-]: ...
-```
-
-
-#### Open question: About sparsity in Jacobian and linear combination of direction bases
-
-Such properties may be leverage to calculate gradient _using forward AD_, where
-backward AD is theoretically better given $nI >> nO = 1$ but comes at the cost
-of memory consumption.
-
-For example, given
-$f\in \mathbb{R}^n \to \mathbb{R}$,
-the pushforward at $x\in\mathbb{R}^n$ is
-$df_x\in \mathbb{R}^n \to \mathbb{R}$ too (up to isomorphism).
-We may need to call $df_x(e_i)$ for all bases $e_i$ to get the components of
-gradient vector.
-
-However, if Jacobian matrix has sparsity (an extreme case is map-then-sum),
-we may have an operator $\mathcal{V}$ to convert (e.g. "vmap")
-$df_x\in \mathbb{R}^n \to \mathbb{R}$
-to
-$\mathcal{V}(df_x) \in \mathbb{R}^n \to \mathbb{R}^n$.
-
-Then we can call $\mathcal{V}(df_x)(\sum_i e_i)$ of some proper linear combination.
-
-And this may be extended to general sparsity (e.g. `Selector/Reducer`) and
-general pullback.
-
-Open questions:
-
--   The algorithm correctness
--   Given a `_Pushforward`, `easier.jvp/jacobian` returns
-    a single (sequence of) tangent `easier.Tensor`, it may not be flexible
-    enough to carry the linear combination of bases given the arbitrariness
-    of the Jacobian sparsity.
-
--   We may provide `_Pushforward.dual(): _Pullback` only and specifically to
-    serve as $\mathcal{V}$, generalized for general pullbacks,
-    and such a pullback is numerically equivalent to pullback from `easier.vjp`
-    but implementation-wise different: using forward AD v.s. backward AD.
-    
-
-
-### Backward-mode
-```python
-class _Pullback(easier.Module):
-    ...
-
-#     def dual(self) -> _Pushforward: ...
-# [pushforward], [tg_x], [tg_y] = easier.jvp()
-# pullback = pushforward.dual()
-# TODO where to get cot_y, cot_x ?
-
-def easier.vjp(
-    modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],   # x
-    outputs: Sequence[easier.Tensor],  # y
-) -> Tuple[
-    Sequence[easier.Module],  # vjp_m  : _Pullback???
-    Sequence[easier.Tensor],  # cotangent_y
-    Sequence[easier.Tensor]   # cotangent_x
-]: ...
-
-def easier.grad(
-    modules: Sequence[easier.Module],
-    inputs: Sequence[easier.Tensor],  # x
-    output: easier.Tensor,            # y
-) -> Tuple[
-    Sequence[easier.Module],  # grad_m
-    Sequence[easier.Tensor],  # grad_x
-]: ...
-```
-
 
 ## References
 
