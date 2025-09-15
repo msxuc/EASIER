@@ -132,6 +132,25 @@
         primitive_jvps[primitive] = jvp  
     ```
 
+    > In contrast to the case that only `jax.jvp` is called where tangent values
+    are computed on the fly,
+    other JAX functional transformations may need full IR of the given functional, one typical example is
+    `jax.jit` which optimizes and lowers IR to XLA, its `JitTracer` may trace
+    the given function into a `Jaxpr` IR graph.
+
+    For EASIER:
+
+    1.  mapped operators: computation for their differential rules are also mapped operations
+
+    1.  Selector: select dual cofficients using the same `idx`
+
+    1.  Reducer:
+    
+        -   using the differential rules for `Reducer.reduce: Literal['sum', 'prod', ...]`
+
+        -   for 'prod', the primal scalars will be involved, casuing extra operations
+            that take both intermediate tensors for primals and tangents as arguments.
+
 
 1.  Automatic Sparse Differentiation
 
