@@ -358,6 +358,8 @@ def easier.jvp(
 ]: ...
 ```
 
+Open question: how about putting `tangents_in/out` as attributes of the resultant Module?
+
 Usage:
 ```python
 m = Module()
@@ -396,7 +398,7 @@ class Jacobian(easier.Module):
     # TODO make tg_x tg_y attributes of _Jacobian?
 
 def easier.jacfwd(
-    modules: easier.Module,
+    module: easier.Module,
     inputs: Sequence[easier.Tensor],
     outputs: Sequence[easier.Tensor],
 ) -> Tuple[
@@ -405,6 +407,30 @@ def easier.jacfwd(
     Sequence[easier.Tensor],
     Sequence[easier.Tensor]
 ]: ...
+
+# How about:
+class JacobianInit(easier.Module):
+    def forward(self): ...
+
+class Jacobian(easier.Module):
+    def __init__(self):
+        self.tangents_in: Sequence[easier.Tensor]
+        self.tangents_out: Sequence[easier.Tensor]
+
+        self.init: JacobianInit
+
+    def transpose(self) -> Jacobian: ...
+
+    def forward(self):
+        # reads tangents_in writes tangents_out
+        ...
+
+def jacfwd(module, inputs, ouputs) -> Jacobian:
+    ...
+# then users can simply `compile([jacobian])` similar to compile CG/GMRES and:
+jacobian.init()
+write_tg_x()
+jacobian()
 ```
 
 Usage:
