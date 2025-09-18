@@ -634,12 +634,18 @@ class TensorViewUsageChecker(EasierInterpreter):
             for i, user in enumerate(self.current_node.users):
                 assert user.target is operator.getitem
                 assert user.args == (self.current_node, i)
-                correctly_cloned = self._check_immediate_user_is_clone(
+                has_cloned_view = self._check_immediate_user_is_clone(
                     user, args_viewsrcs, immediate_after_unpack
                 )
 
-                if correctly_cloned:
+                if has_cloned_view:
                     immediate_after_unpack = immediate_after_unpack.next
+                # (_check_is_clone would have raised if there is a view,
+                # and not cloned)
+                # But if a tuple item is not a view, we disallow unnecessary
+                # clone() on it, therefore we don't move the Node pointer
+                # in the Nodes after unpacking getitems() -- it's now still
+                # pointing at a Node to check for the next tuple item.
 
             self.visited.update(self.current_node.users)
 

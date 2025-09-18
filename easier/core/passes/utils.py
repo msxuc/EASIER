@@ -274,6 +274,54 @@ def normalize_reducer_call_into_args(*args: _T, **kwargs: _T
     return _pattern(*args, **kwargs)
 
 
+def get_node_inplace_arg(
+    call_function: Node,
+    *,
+    add_marker_for_jit_check=True
+) -> Optional[Node]:
+    """
+    Try get argument that's inplace modified by solely inspect the Node.
+
+    Only handle `node.op == 'call_function'` Nodes.
+    Otherwise to handle 'call_module' it may introduce unnecessary context.
+
+    Known cases (definition from PyTorch native_functions.yaml):
+    - parameter name is "out":
+        atanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+        -   because an overloading of function `atanh` and arg name is "out".
+        -   `out` param is always a keyword param.
+
+    - parameter name is "input":
+        atanh_(Tensor(a!) self) -> Tensor(a!)
+        -   the function name is "atanh_" ending with "_"
+            and arg name becomes "input", no longer "self".
+
+    - multiple inplace args:
+        rrelu_with_noise_(Tensor(a!) self, Tensor(b!) noise, ...) -> Tensor(a!)
+        -   TODO not common, currently not handled
+
+
+    TODO we may add a special meta on the Node indicate a AOT pass ever
+    assumes some arg to be inplace modified, later in runtime
+    data_dependency_analysis we can double check it to ensure no mistake.
+    This ensure cases like rrelu_with_noise_
+    """
+    assert call_function.op == FX.CALL_FUNCTION
+
+    assert callable(call_function.target)
+    func_name = call_function.target.__name__
+    if func_name.endswith('_'):
+        out = call_function.kwargs.get('input')
+        if out is None:
+            out = call_function.args[0]
+    else:
+        out = call_function.kwargs.get('out', None)
+
+    assert isinstance(out, Node)
+    return out
+
+
+
 def vector_index_of(
     to_find: torch.Tensor, tests: torch.Tensor
 ) -> torch.LongTensor:
