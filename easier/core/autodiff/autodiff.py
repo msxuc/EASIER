@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 import dataclasses
-from typing import Callable, Dict, Optional, Sequence, TypeAlias, cast
+from typing import Callable, Dict, Optional, Self, Sequence, TypeAlias, cast
 
 from torch.fx import Node, Graph
 from torch.nn.modules import Module
@@ -11,7 +11,7 @@ from easier.core.jit import EasierTracer
 import easier.core.module as esr
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, get_easier_objects, normalize_reducer_call_into_args, \
-    get_node_inplace_arg
+    get_node_inplace_arg, get_easier_tensors
 from easier.core.utils import EasierJitException
 
 
@@ -46,138 +46,251 @@ TODO
 
 
 
-TangentCarrierAdder: TypeAlias = Callable[[], None]
 
-@dataclasses.dataclass
-class TangentCarrier:
-    primal_node: Node
-    taking_effect_after: Node  # time range includes this particular Node.
+# class TangentFlowPropagation(EasierInterpreter):
+#     def __init__(
+#         self, modules, graphs,
+#         inputs: Sequence[esr.Tensor],
+#         outputs: Sequence[esr.Tensor]
+#     ):
+#         super().__init__(modules, graphs)
 
-class TangentFlowPropagation(EasierInterpreter[TangentCarrierAdder]):
+#         self.inputs = OrderedSet(inputs)
+#         self.outputs = OrderedSet(outputs)
+
+#         # Being tangent carrier or not is time-dependent, some esr.Tensors
+#         # may only be treated as carriers, after they are written with values
+#         # that have tangents paired.
+#         # Alternatively, we can see it as carrier can be trivial -- its tangent
+#         # values are all 0s.
+#         self.carriers: OrderedSet[TangentCarrier] = OrderedSet()
+
+#         # Adders are callables, effectively delayed the real addition to
+#         # `carriers` set. The addition will happen when the dataflow reaches
+#         # an JVP output.
+#         self.adders: Dict[Node, TangentCarrierAdder] = {}
+    
+#     def for_each_node(self) -> TangentCarrierAdder:
+#         adder = super().for_each_node()
+#         self.adders[self.current_node] = adder
+#         return adder
+
+#     def _get_carrier_adder(self) -> TangentCarrierAdder:
+#         _captured_this = self.current_node
+
+#         arg_adders = list(map(
+#             self.adders.__getitem__, self.current_node.all_input_nodes
+#         ))
+
+#         def _adder():
+#             self.carriers.add(
+#                 TangentCarrier(_captured_this, _captured_this)
+#             )
+#             for arg_adder in arg_adders:
+#                 arg_adder()
+
+#         return _adder
+
+#     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> TangentCarrierAdder:
+#         if attr_val in self.inputs:
+#             return self._get_carrier_adder()
+#         else:
+#             # For non-JVP input Tensor, at the moment it's get-attr-ed,
+#             # it's not a tangent carrier yet.
+#             # It's only after it's written with values that have tangent paired
+#             # does it becomes a carrier.
+#             return lambda: None
+
+#     def _on_operation(self, written_node: Optional[Node]) -> TangentCarrierAdder:
+#         """
+#         Args:
+#         -   mutable: only regarding the 1st arg
+
+#         NOTE about views:
+#         We can only tell if the input Node is a derived view or not
+#         in runtime by checking the memory address of the tensor.
+#         (e.g. `y = x.reshape().reshape().reshape()`, it's hard to tell
+#         if `y` is a view of `x`)
+
+#         This difficulty is eliminated since we have `data_dependency_analysis`
+#         pass in the runtime, it requires explicit `clone()` calls after
+#         operations that create views. So we don't need to worry about views
+#         even in pre-`compile()` subprocedures (like `jvp()`) or AOT passess.
+        
+#         So, we can be confident that by checking the immediate Node written
+#         by some operation, we can identify the Tensor instance that's written:
+#         -   If input Node is 'get_attr', an esr.Tensor instance is written;
+#         -   Otherwise, an immediate result Tensor is written;
+#         """
+#         if written_node is not None:
+#             if written_node.op == FX.GET_ATTR:
+#                 attr = self.modules[0].get_parameter(
+#                     cast(str, written_node.target)
+#                 )
+#                 if attr in self.outputs:  # type: ignore
+#                     1
+        
+#         return self._get_carrier_adder()
+        
+#         # Because of the enforced clone-view rule, no matter this inplace Node
+#         # has users (user must be a `clone` call) or not, it's not a view.
+#         # I.e. the tangent in this moment must be cloned too.
+    
+#     def if_call_function(self, function) -> TangentCarrierAdder:
+#         out = get_node_inplace_arg(self.current_node)
+#         return self._on_operation(out)
+    
+#     def if_call_method(self, method_name: str) -> TangentCarrierAdder:
+#         if method_name.endswith('_'):
+#             out = self.current_node.args[0]
+#             assert isinstance(out, Node)
+#         else:
+#             out = None
+#         return self._on_operation(out)
+    
+#     def if_call_module(self, submod: Module) -> TangentCarrierAdder:
+#         if isinstance(submod, esr.Module):
+#             """
+#             Given an esr.Tensor `p` both used in parent Module and submod,
+#             if submod ever does `p[:] = f(tangent_carrier)`, `p` becomes a
+#             tangent carrier for parent Module too.
+
+#             However, `p`'s tangent Tensor is only used after the submod call.
+#             This the same as normal attribute Tensors too.
+#             """
+#             def _submod_carriers_adder():
+#                 return None
+            
+#             return _submod_carriers_adder
+
+#         else:
+#             if isinstance(submod, esr.Reducer):
+#                 input, out = normalize_reducer_call_into_args(
+#                     *self.current_node.args, **self.current_node.kwargs
+#                 )
+#                 assert isinstance(out, Node)
+#             else:
+#                 out = None
+#             return self._on_operation(out)
+
+
+class TangentFlowPropCtx:
+    def __init__(self, primal_srcs: OrderedSet[esr.Tensor]) -> None:
+        #
+        # Effectively constant data
+        # =============
+        # fx.Graphs for primal Modules.
+        # NOTE these graphs are generated by EasierTracer once and discarded,
+        # only for creating the JVP Module. With JIT 'torch' backend these
+        # Modules will be traced again.
+        self.graphs: Dict[esr.Module, Graph] = {}
+        # All esr.Tensors accessible to one Module and its submodules.
+        self.accessible_tensors: Dict[esr.Module, OrderedSet[esr.Tensor]] = {}
+
+        #
+        # Propagator-populated data
+        # =============
+        # How many times a submod instance is called, if one has been called
+        # multiple times, we need to union the tangent flow on its graph.
+        self.call_counts: Dict[esr.Module, int] = {}
+
+        self.prop_flow: Dict[esr.Module, OrderedSet[Node]] = {}
+
+        # The snapshot of involved primal esr.Tensor to a Module at the
+        # beginning of one turn of the propagation on it:
+        # - recursively including Tensors in further nested sub Modules
+        # - not including Tensors not accessible from this Module and
+        #   its sub Modules, i.e. the intersection
+        # If the snapshot doesn't change, given the static nature of EASIER
+        # graphs, we don't need to propagate again.
+        self.primal_srcs_snapshot: Dict[esr.Module, OrderedSet[esr.Tensor]] = {}
+
+        # The dynamically increased set of primal esr.Tensors that are ever
+        # involved in the global tangent flow.
+        self.primal_srcs = OrderedSet(primal_srcs)
+    
+    def init_module_once(self, module: esr.Module):
+        if module not in self.graphs:
+            graph = EasierTracer().trace(module)
+            self.graphs[module] = graph
+        
+        if module not in self.accessible_tensors:
+            self.accessible_tensors[module] = OrderedSet(get_easier_tensors([module]))
+
+
+        # Let caller to increment.
+        self.call_counts.setdefault(module, 0)
+
+        self.prop_flow.setdefault(module, OrderedSet())
+        self.primal_srcs_snapshot.setdefault(module, OrderedSet())
+
+
+class TangentFlowPropagator(EasierInterpreter):
     def __init__(
-        self, modules, graphs,
-        inputs: Sequence[esr.Tensor],
-        outputs: Sequence[esr.Tensor]
+        self, module: esr.Module, graph: Graph,
+        ctx: TangentFlowPropCtx,
+        tangents_in: OrderedSet[esr.Tensor],
+        reverse=False
     ):
-        super().__init__(modules, graphs)
+        super().__init__([module], [graph], reverse)
 
-        self.inputs = OrderedSet(inputs)
-        self.outputs = OrderedSet(outputs)
+        self.module = module
 
-        # Being tangent carrier or not is time-dependent, some esr.Tensors
-        # may only be treated as carriers, after they are written with values
-        # that have tangents paired.
-        # Alternatively, we can see it as carrier can be trivial -- its tangent
-        # values are all 0s.
-        self.carriers: OrderedSet[TangentCarrier] = OrderedSet()
+        self.ctx = ctx
 
-        # Adders are callables, effectively delayed the real addition to
-        # `carriers` set. The addition will happen when the dataflow reaches
-        # an JVP output.
-        self.adders: Dict[Node, TangentCarrierAdder] = {}
     
-    def for_each_node(self) -> TangentCarrierAdder:
-        adder = super().for_each_node()
-        self.adders[self.current_node] = adder
-        return adder
+    # TODO if a esr.Tensor involved in tangent flow but is not used across
+    # submodules, we don't really need a persistent tangent esr.Tensor for it.
 
-    def _get_carrier_adder(self) -> TangentCarrierAdder:
-        _captured_this = self.current_node
+    def run(self) -> Self:
+        self.ctx.init_module_once(self.module)
 
-        arg_adders = list(map(
-            self.adders.__getitem__, self.current_node.all_input_nodes
-        ))
+        self.ctx.call_counts[self.module] += 1
+        latest_primals_snapshot = self.ctx.primal_srcs_snapshot[self.module]
 
-        def _adder():
-            self.carriers.add(
-                TangentCarrier(_captured_this, _captured_this)
-            )
-            for arg_adder in arg_adders:
-                arg_adder()
+        # set difference
+        assert len(latest_primals_snapshot - self.ctx.primal_srcs) == 0, \
+            "Tangent sources must grow incrementally among many CALL_MODULEs"
 
-        return _adder
-
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> TangentCarrierAdder:
-        if attr_val in self.inputs:
-            return self._get_carrier_adder()
-        else:
-            # For non-JVP input Tensor, at the moment it's get-attr-ed,
-            # it's not a tangent carrier yet.
-            # It's only after it's written with values that have tangent paired
-            # does it becomes a carrier.
-            return lambda: None
-
-    def _on_operation(self, written_node: Optional[Node]) -> TangentCarrierAdder:
-        """
-        Args:
-        -   mutable: only regarding the 1st arg
-
-        NOTE about views:
-        We can only tell if the input Node is a derived view or not
-        in runtime by checking the memory address of the tensor.
-        (e.g. `y = x.reshape().reshape().reshape()`, it's hard to tell
-        if `y` is a view of `x`)
-
-        This difficulty is eliminated since we have `data_dependency_analysis`
-        pass in the runtime, it requires explicit `clone()` calls after
-        operations that create views. So we don't need to worry about views
-        even in pre-`compile()` subprocedures (like `jvp()`) or AOT passess.
+        if len(self.ctx.primal_srcs - latest_primals_snapshot) > 0:
+            # Enter nested propagation only when tangent sources are updated
+            # on the root submodule.
+            super().run()
         
-        So, we can be confident that by checking the immediate Node written
-        by some operation, we can identify the Tensor instance that's written:
-        -   If input Node is 'get_attr', an esr.Tensor instance is written;
-        -   Otherwise, an immediate result Tensor is written;
-        """
-        if written_node is not None:
-            if written_node.op == FX.GET_ATTR:
-                attr = self.modules[0].get_parameter(
-                    cast(str, written_node.target)
-                )
-                if attr in self.outputs:  # type: ignore
-                    1
-        
-        return self._get_carrier_adder()
-        
-        # Because of the enforced clone-view rule, no matter this inplace Node
-        # has users (user must be a `clone` call) or not, it's not a view.
-        # I.e. the tangent in this moment must be cloned too.
+        accessible = self.ctx.accessible_tensors[self.module]
+        new_primals_snapshot = OrderedSet(
+            ps
+            for ps in self.ctx.primal_srcs
+            if ps in accessible
+        )
+        self.ctx.primal_srcs_snapshot[self.module] = new_primals_snapshot
+
+        return self
+
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+        # When an esr.Tensor is just 'get_attr'-ed, it may not be regarded to
+        # be paired with tangent yet. This may happen on esr.Tensors that are
+        # not specified in `jvp()` arguments.
+        # But in the middle of the graph, the Tensor may be written with
+        # values that carry tangents.
+        # At that timing, we mark the Node as tangent flow, and record the
+        # Tensor to be paired with tangent, 
+        if attr_val in self.ctx.primal_srcs:
+            1
+
     
-    def if_call_function(self, function) -> TangentCarrierAdder:
-        out = get_node_inplace_arg(self.current_node)
-        return self._on_operation(out)
-    
-    def if_call_method(self, method_name: str) -> TangentCarrierAdder:
-        if method_name.endswith('_'):
-            out = self.current_node.args[0]
-            assert isinstance(out, Node)
-        else:
-            out = None
-        return self._on_operation(out)
-    
-    def if_call_module(self, submod: Module) -> TangentCarrierAdder:
+    def if_call_module(self, submod: Module):
         if isinstance(submod, esr.Module):
             """
             Given an esr.Tensor `p` both used in parent Module and submod,
-            if submod ever does `p[:] = f(tangent_carrier)`, `p` becomes a
-            tangent carrier for parent Module too.
+            if submod ever does `p[:] = f(tangent_carrier)`, `p` propagates
+            tangent into parent Module too.
 
             However, `p`'s tangent Tensor is only used after the submod call.
             This the same as normal attribute Tensors too.
             """
-            def _submod_carriers_adder():
-                return None
-            
-            return _submod_carriers_adder
-
-        else:
-            if isinstance(submod, esr.Reducer):
-                input, out = normalize_reducer_call_into_args(
-                    *self.current_node.args, **self.current_node.kwargs
-                )
-                assert isinstance(out, Node)
-            else:
-                out = None
-            return self._on_operation(out)
+            submod_g = self.ctx.get_graph(submod)
+            sub_prop = TangentFlowPropagator(submod, submod_g, self.ctx, []).run()
 
 
 class JvpTransformer(EasierInterpreter):

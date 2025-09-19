@@ -59,6 +59,7 @@ class EasierInterpreter(Generic[_T]):
         self,
         modules: Sequence[esr.Module],
         graphs: Sequence[Graph],
+        reverse=False
     ) -> None:
         assert len(modules) == len(graphs)
 
@@ -75,6 +76,8 @@ class EasierInterpreter(Generic[_T]):
         # available and valid in `if_call_module`
         self.callee_module_path: str
 
+        self.reverse = reverse
+
     def run(self):
         for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
             self.current_module = root
@@ -83,7 +86,11 @@ class EasierInterpreter(Generic[_T]):
 
             # Before traversing, we fix the nodes by copying them into a list,
             # in case the customized handler modifies the `graph.nodes` view.
-            for node in list(graph.nodes):
+            nodes = list(graph.nodes)
+            if self.reverse:
+                nodes.reverse()
+
+            for node in nodes:
                 self.current_node = node
                 self.for_each_node()
 
