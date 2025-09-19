@@ -1,8 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import contextlib
 import dataclasses
-from typing import Callable, Dict, Optional, Self, Sequence, TypeAlias, cast
+from typing import Callable, Dict, List, Optional, Self, Sequence, Tuple, TypeAlias, cast
 
 from torch.fx import Node, Graph
 from torch.nn.modules import Module
@@ -174,6 +175,19 @@ TODO
 #             return self._on_operation(out)
 
 
+@dataclasses.dataclass
+class _PropStackTrace:
+    """
+    This is basically the call stack plus the IR offset.
+
+    However, offsets (Nodes) are not recorded for all stackframe. Because we
+    are taking the union of propagated tangent flows if a Module is called
+    multiple times, only the first involvement of a Tensor in called-once
+    Module makes sense.
+    """
+    stackframe: Sequence[esr.Module]
+    current_node: Node  # a Node in the innermost Node
+
 class TangentFlowPropCtx:
     def __init__(self, primal_srcs: OrderedSet[esr.Tensor]) -> None:
         #
@@ -208,6 +222,12 @@ class TangentFlowPropCtx:
         # The dynamically increased set of primal esr.Tensors that are ever
         # involved in the global tangent flow.
         self.primal_srcs = OrderedSet(primal_srcs)
+
+        # Use tuple instead of list for its immutability, so new StackTrace
+        # can safely store it without explicit copy.
+        self.prop_stackframe: Tuple[esr.Module, ...] = ()
+
+        self.primal_earliest_tangent_pairing: Dict[esr.Tensor, _PropStackTrace] = {}
     
     def init_module_once(self, module: esr.Module):
         if module not in self.graphs:
@@ -217,19 +237,23 @@ class TangentFlowPropCtx:
         if module not in self.accessible_tensors:
             self.accessible_tensors[module] = OrderedSet(get_easier_tensors([module]))
 
-
-        # Let caller to increment.
+        # Let caller increment.
         self.call_counts.setdefault(module, 0)
 
         self.prop_flow.setdefault(module, OrderedSet())
         self.primal_srcs_snapshot.setdefault(module, OrderedSet())
+    
+    @contextlib.contextmanager
+    def new_prop_stackframe(self, module: esr.Module):
+        self.prop_stackframe += (module,)
+        yield
+        self.prop_stackframe = self.prop_stackframe[:-1]
 
 
 class TangentFlowPropagator(EasierInterpreter):
     def __init__(
         self, module: esr.Module, graph: Graph,
         ctx: TangentFlowPropCtx,
-        tangents_in: OrderedSet[esr.Tensor],
         reverse=False
     ):
         super().__init__([module], [graph], reverse)
@@ -243,27 +267,30 @@ class TangentFlowPropagator(EasierInterpreter):
     # submodules, we don't really need a persistent tangent esr.Tensor for it.
 
     def run(self) -> Self:
-        self.ctx.init_module_once(self.module)
+        ctx = self.ctx
+        ctx.init_module_once(self.module)
+        ctx.call_counts[self.module] += 1
 
-        self.ctx.call_counts[self.module] += 1
-        latest_primals_snapshot = self.ctx.primal_srcs_snapshot[self.module]
+        with ctx.new_prop_stackframe(self.module):
 
-        # set difference
-        assert len(latest_primals_snapshot - self.ctx.primal_srcs) == 0, \
-            "Tangent sources must grow incrementally among many CALL_MODULEs"
+            latest_primals_snapshot = ctx.primal_srcs_snapshot[self.module]
 
-        if len(self.ctx.primal_srcs - latest_primals_snapshot) > 0:
-            # Enter nested propagation only when tangent sources are updated
-            # on the root submodule.
-            super().run()
-        
-        accessible = self.ctx.accessible_tensors[self.module]
-        new_primals_snapshot = OrderedSet(
-            ps
-            for ps in self.ctx.primal_srcs
-            if ps in accessible
-        )
-        self.ctx.primal_srcs_snapshot[self.module] = new_primals_snapshot
+            # set difference
+            assert len(latest_primals_snapshot - ctx.primal_srcs) == 0, \
+                "Tangent sources should grow incrementally on the same Module"
+
+            if len(ctx.primal_srcs - latest_primals_snapshot) > 0:
+                # Enter nested propagation only when tangent sources are updated
+                # on the root submodule.
+                super().run()
+            
+            accessible = ctx.accessible_tensors[self.module]
+            new_primals_snapshot = OrderedSet(
+                ps
+                for ps in ctx.primal_srcs
+                if ps in accessible
+            )
+            ctx.primal_srcs_snapshot[self.module] = new_primals_snapshot
 
         return self
 
@@ -275,8 +302,22 @@ class TangentFlowPropagator(EasierInterpreter):
         # values that carry tangents.
         # At that timing, we mark the Node as tangent flow, and record the
         # Tensor to be paired with tangent, 
-        if attr_val in self.ctx.primal_srcs:
-            1
+        ctx = self.ctx
+        if attr_val in ctx.primal_srcs:
+            ctx.prop_flow[self.module].add(self.current_node)
+            ctx.primal_earliest_tangent_pairing.setdefault(
+                attr_val,
+                _PropStackTrace(ctx.prop_stackframe, self.current_node)
+            )
+    
+    def if_call_function(self, function: Callable):
+        inplace_arg = get_node_inplace_arg(self.current_node)
+        self._on_operation(inplace_arg)
+    
+    def if_call_method(self, method_name: str):
+        inplace_arg = self.current_node.args[0]
+        assert isinstance(inplace_arg, Node)
+        self._on_operation(inplace_arg)
 
     
     def if_call_module(self, submod: Module):
@@ -289,8 +330,53 @@ class TangentFlowPropagator(EasierInterpreter):
             However, `p`'s tangent Tensor is only used after the submod call.
             This the same as normal attribute Tensors too.
             """
-            submod_g = self.ctx.get_graph(submod)
-            sub_prop = TangentFlowPropagator(submod, submod_g, self.ctx, []).run()
+            submod_g = self.ctx.graphs[submod]
+            sub_prop = TangentFlowPropagator(
+                submod, submod_g, self.ctx, self.reverse
+            ).run()
+        
+        else:
+            if isinstance(submod, esr.Reducer):
+                input, out = normalize_reducer_call_into_args(
+                    *self.current_node.args, **self.current_node.kwargs
+                )
+                assert out is None or isinstance(out, Node)
+            else:
+                out = None
+
+            self._on_operation(out)
+    
+    def _on_operation(self, written_node: Optional[Node]):
+        """
+        NOTE about views:
+        We can only tell if the input Node is a derived view or not
+        in runtime by checking the memory address of the tensor.
+        (e.g. `y = x.reshape().reshape().reshape()`, it's hard to tell
+        if `y` is a view of `x`)
+
+        This difficulty is eliminated since we have `data_dependency_analysis`
+        pass in the runtime, it requires explicit `clone()` calls after
+        operations that create views. So we don't need to worry about views
+        even in pre-`compile()` subprocedures (like `jvp()`) or AOT passess.
+        
+        So, we can be confident that by checking the immediate Node written
+        by some operation, we can identify the Tensor instance that's written:
+        -   If input Node is 'get_attr', an esr.Tensor instance is written;
+        -   Otherwise, an immediate result Tensor is written;
+        """
+        if written_node is not None:
+            if written_node.op == FX.GET_ATTR:
+                attr_tensor = self.modules[0].get_parameter(
+                    cast(str, written_node.target)
+                )
+            else:
+                1
+                # write to immediate tensors
+        
+        
+        # Because of the enforced clone-view rule, no matter this inplace Node
+        # has users (user must be a `clone` call) or not, it's not a view.
+        # I.e. the tangent in this moment must be cloned too.
 
 
 class JvpTransformer(EasierInterpreter):
