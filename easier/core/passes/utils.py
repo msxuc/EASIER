@@ -281,7 +281,7 @@ def normalize_reducer_call_into_args(*args: _T, **kwargs: _T
     return _pattern(*args, **kwargs)
 
 
-def get_node_inplace_arg(
+def get_torch_func_inplace_arg(
     call_function: Node,
     *,
     add_marker_for_jit_check=True
@@ -324,7 +324,7 @@ def get_node_inplace_arg(
     else:
         out = call_function.kwargs.get('out', None)
 
-    assert isinstance(out, Node)
+    assert out is None or isinstance(out, Node)
     return out
 
 
