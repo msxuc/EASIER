@@ -11,38 +11,31 @@ import torch
 from easier.core.passes.utils import EasierInterpreter
 
 Scalar: TypeAlias = Union[int, float]
+KEY__PUSHFORWARD_META = 'easier_autodiff_pushforwardMeta'
+
 
 # Keys are torch operators. Many operators may share the same pushforward.
 pushforward_registry: Dict[Callable, Callable] = {}
 
-KEY__PUSHFORWARD_META = 'easier_autodiff_pushforwardMeta'
 
 @dataclasses.dataclass
 class PushforwardMeta:
-    output_differentiability: Union[bool, Sequence[bool]] = True
 
-    @staticmethod
-    def update(
-        pushforward: Callable,
-        *,
-        output_differentiability: Optional[Union[bool, Sequence[bool]]] = None
-    ) -> 'PushforwardMeta':
-        """
-        Update inplace and return the latest meta object.
-        """
-        meta: PushforwardMeta = pushforward.__dict__.setdefault(
-            KEY__PUSHFORWARD_META, PushforwardMeta()
-        )
+    param_names: List[str]
 
-        if output_differentiability is not None:
-            meta = dataclasses.replace(
-                meta, output_differentiability=output_differentiability
-            )
-        # TODO chain more
+    primal_result_param_pos: int = -1
+    
+    # result_tangent_param_pos: Optional[int] = None
 
-        pushforward.__dict__[KEY__PUSHFORWARD_META] = meta
-        return meta
-            
+    # 
+    input_differentiablity: int = 1
+
+    # - False: for single-result op, the result is not differentiable.
+    # - Sequence[bool]: mark each result if differentiable or not.
+    # - 'default': no matter single- or multi-result, all are differentiable.
+    output_differentiability: Union[
+        Literal['default', False], Sequence[bool]
+    ] = 'default'
 
 
 # TODO codegen: use fixed version of derviatives.yaml, may be not suitable for different versions of pytorch.
@@ -66,6 +59,8 @@ def aux(func):
 def pushforward(*primal_func):
     """
     Define a pushforward function for a primal operator.
+
+    Must be applied to pushforward first -- at the **bottom** of decorators.
 
     The scheme for pushforward function:
     -   All parameters for the primal operator must be included:
@@ -108,11 +103,14 @@ def pushforward(*primal_func):
         ...
     ```
     """
-    def pf_decorator(pushforward_func):
+    def pf_decorator(pushforward_func: Callable):
         
         for f in primal_func:
             assert f not in pushforward_registry
             pushforward_registry[f] = pushforward_func
+
+        meta = _parse(pushforward_func)
+        pushforward_func.__dict__[KEY__PUSHFORWARD_META] = meta
 
         # the raw function of pushforward is not changed.
         return pushforward_func  
@@ -125,13 +123,13 @@ def output_differentiability(
     """
     For example:
     ```
-    @pushforward(torch.count_nonzero)
     @output_differentiability(False)
+    @pushforward(torch.count_nonzero)
     def count_nonzero(input, dim):
         raise EasierJitException("not differentiable")
     
-    @pushforward(torch.sort)
     @output_differentiability([True, False])  # returns (sorted, pos)
+    @pushforward(torch.sort)
     def sort(
         result,                     # primal result: (sorted, pos)
         input, dim, descending,
@@ -143,19 +141,26 @@ def output_differentiability(
         # return only 1 item -- len(filter(is_True, differentiability))
         return [res_t]  
     ```
-    """
-    def pf_decorator(pushforward_func: Callable):
 
-        PushforwardMeta.update(
-            pushforward_func, output_differentiability=differentiability
+    The "default" case is, no matter it's multi-result or not (which can be
+    told by the Node and subsequent getitem Nodes),
+    the result or all result items are differentiable.
+    We don't need to call with `True` or `[True, ...]` for the default case.
+    """
+    def pf_decorator(pushforward: Callable):
+
+        meta: PushforwardMeta = pushforward.__dict__[KEY__PUSHFORWARD_META]
+        meta = dataclasses.replace(
+            meta, output_differentiability=output_differentiability
         )
+        pushforward.__dict__[KEY__PUSHFORWARD_META] = meta
 
         # the raw function of pushforward is not changed.
-        return pushforward_func  
+        return pushforward  
     return pf_decorator
 
 
-def _parse(pushforward: Callable):
+def _parse(pushforward: Callable) -> PushforwardMeta:
     """
     Trace merely the pushforward function, which results in special PLACEHOLDER
     Nodes for parameters.
@@ -166,6 +171,8 @@ def _parse(pushforward: Callable):
     """
     gm = torch.fx.symbolic_trace(pushforward)
     param_names: List[str] = []
+
+    primal_param_names: List[str] = []
 
     class _ParamGetter(EasierInterpreter):
         def if_placeholder(self, param_name: str):
@@ -181,6 +188,18 @@ def _parse(pushforward: Callable):
                 f' parameter in pushfoward {pushforward.__name__}'
             # `result_t` can appear solely without `result`.
         
+        if (not param_name.endswith('_t')) and param_name not in ['result', 'result_t']:
+            primal_param_names.append(param_name)
+        
+    # TODO when we have hundreds of operators, this tracing-based subprocess
+    # may be slow, but for real AD usage we may only need the param info
+    # for the involved operators, no need to load all. Measure and make it lazy
+    # if it has to be run during easier.autodiff module loading time.
+
+    meta = PushforwardMeta(
+        primal_param_names=primal_param_names
+    )
+    return meta
 
 @aux
 def maybe_multiply(t: torch.Tensor, s: Scalar):
