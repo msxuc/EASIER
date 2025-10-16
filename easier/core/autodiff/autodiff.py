@@ -299,6 +299,7 @@ class TangentFlowPropagatorBase(EasierInterpreter):
         return self
 
     def if_call_function(self, function: Callable):
+        # NOTE setitem and util get_torch_func input aren't needed, the inplace should be integrated into AD rule/subproc.
         if function is operator.setitem:
             inplace_arg = self.current_node.args[0]
             assert isinstance(inplace_arg, Node)
@@ -347,6 +348,20 @@ class TangentFlowPropagatorBase(EasierInterpreter):
         pass
 
 class TangentFlowForwardPropagator(TangentFlowPropagatorBase):
+    """
+    Forward propagate tangent flow. Initial sources of tangent flow are
+    GET_ATTR Nodes for input esr.Tensors in jvp() API.
+
+    During propagation, initially non-source esr.Tensors may become new sources
+    of tangent flow, if they are written with primal values carrying tangents.
+    Such changes should affect all GET_ATTR Nodes and their users that are
+    related to those source esr.Tensors, initial or new.
+
+    And in forward propagation we don't prune those Nodes that don't eventually
+    contribute to any output.
+
+    The involved Tensors/Nodes are called "tangent carriers"
+    """
     def __init__(self, module: esr.Module, graph: Graph, ctx: TangentFlowPropCtx):
         super().__init__(module, graph, ctx, reverse=True)
 
@@ -442,6 +457,12 @@ class TangentFlowForwardPropagator(TangentFlowPropagatorBase):
 
 class TangentFlowBackwardPropagator(TangentFlowPropagatorBase):
     """
+    Unlike forward propagation of tangent flow, in the backward propagation,
+    there aren't any tangent values propagated/pushed-forward along the Nodes,
+    instead, we are marking the possible path that's meaningful for JVP.
+
+    In such a sense, the involved Tensors/Nodes are called "tangent receivers".
+
     ```
     p = GET_ATTR[p]
     q = GET_ATTR[q]
