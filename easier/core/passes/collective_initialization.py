@@ -21,7 +21,7 @@ class SyntaxChecker(EasierInterpreter):
     def __init__(self, modules, graphs):
         super().__init__(modules, graphs)
 
-    def if_placeholder(self):
+    def if_placeholder(self, param_name):
         raise EasierJitException(
             "easier.Module.forward() cannot have parameters"
         )

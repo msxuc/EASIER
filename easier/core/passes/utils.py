@@ -117,7 +117,8 @@ class EasierInterpreter(Generic[_T]):
         node = self.current_node
 
         if node.op == FX.PLACEHOLDER:
-            val = self.if_placeholder()
+            param_name = cast(str, node.target)
+            val = self.if_placeholder(param_name)
 
         elif node.op == FX.GET_ATTR:
             path = cast(str, node.target)
@@ -156,7 +157,7 @@ class EasierInterpreter(Generic[_T]):
 
         return val
 
-    def if_placeholder(self) -> _T:  # type: ignore
+    def if_placeholder(self, param_name: str) -> _T:  # type: ignore
         """
         The handler for Node `curent_node.op=='placeholder'`
         """

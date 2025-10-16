@@ -2,12 +2,48 @@
 # Licensed under the MIT License.
 
 
+import dataclasses
 import functools
 import operator
-from typing import Callable, List, Literal, Sequence, TypeAlias, Union
+from typing import Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, Union
 import torch
 
+from easier.core.passes.utils import EasierInterpreter
+
 Scalar: TypeAlias = Union[int, float]
+
+# Keys are torch operators. Many operators may share the same pushforward.
+pushforward_registry: Dict[Callable, Callable] = {}
+
+KEY__PUSHFORWARD_META = 'easier_autodiff_pushforwardMeta'
+
+@dataclasses.dataclass
+class PushforwardMeta:
+    output_differentiability: Union[bool, Sequence[bool]] = True
+
+    @staticmethod
+    def update(
+        pushforward: Callable,
+        *,
+        output_differentiability: Optional[Union[bool, Sequence[bool]]] = None
+    ) -> 'PushforwardMeta':
+        """
+        Update inplace and return the latest meta object.
+        """
+        meta: PushforwardMeta = pushforward.__dict__.setdefault(
+            KEY__PUSHFORWARD_META, PushforwardMeta()
+        )
+
+        if output_differentiability is not None:
+            meta = dataclasses.replace(
+                meta, output_differentiability=output_differentiability
+            )
+        # TODO chain more
+
+        pushforward.__dict__[KEY__PUSHFORWARD_META] = meta
+        return meta
+            
+
 
 # TODO codegen: use fixed version of derviatives.yaml, may be not suitable for different versions of pytorch.
 
@@ -35,6 +71,10 @@ def pushforward(*primal_func):
     -   All parameters for the primal operator must be included:
         -   Positional parameters must be in the same order;
         -   Keyword parameters can remain as keyword parameters too.
+
+        -   All parameters must have the exactly same names as those of the
+            PyTorch operator.
+            With one extra enforcement: `self` must be renamed to `input`.
 
     -   An optional parameter named 'result' can be included as a positional
         parameter, in whatever position (but recommended to be the first).
@@ -68,12 +108,20 @@ def pushforward(*primal_func):
         ...
     ```
     """
-    def pf_decorator(pf_def):
+    def pf_decorator(pushforward_func):
+        
+        for f in primal_func:
+            assert f not in pushforward_registry
+            pushforward_registry[f] = pushforward_func
+
         # the raw function of pushforward is not changed.
-        return pf_def  
+        return pushforward_func  
     return pf_decorator
 
-def output_differentiability(differentiability: Union[Literal[False], Sequence[bool]]):
+def output_differentiability(
+    # For a single `True`, no need to call this decorator.
+    differentiability: Union[Literal[False], Sequence[bool]]
+):
     """
     For example:
     ```
@@ -96,10 +144,43 @@ def output_differentiability(differentiability: Union[Literal[False], Sequence[b
         return [res_t]  
     ```
     """
-    def pf_decorator(pf_def):
+    def pf_decorator(pushforward_func: Callable):
+
+        PushforwardMeta.update(
+            pushforward_func, output_differentiability=differentiability
+        )
+
         # the raw function of pushforward is not changed.
-        return pf_def  
+        return pushforward_func  
     return pf_decorator
+
+
+def _parse(pushforward: Callable):
+    """
+    Trace merely the pushforward function, which results in special PLACEHOLDER
+    Nodes for parameters.
+    These Nodes are in the same order as the pushforward Python function and
+    can tell the parameter names, but cannot tell they're keyword param or not.
+
+    TODO primal op callsites may use positional-as-keyword, how to bind?
+    """
+    gm = torch.fx.symbolic_trace(pushforward)
+    param_names: List[str] = []
+
+    class _ParamGetter(EasierInterpreter):
+        def if_placeholder(self, param_name: str):
+            param_names.append(param_name)
+    # TODO EasierInterpreter requires (but not strictly) esr.Module, but
+    # GraphModule is merely a torch.nn.Module. Can we relax that requirement?
+    _ParamGetter([gm], [gm.graph]).run()  # type: ignore
+
+    for param_name in param_names:
+        if param_name.endswith('_t') and param_name != 'result_t':
+            assert param_name[:-2] in param_names, \
+                f'Bad parameter name {param_name} for tangent of primal' \
+                f' parameter in pushfoward {pushforward.__name__}'
+            # `result_t` can appear solely without `result`.
+        
 
 @aux
 def maybe_multiply(t: torch.Tensor, s: Scalar):
@@ -111,8 +192,8 @@ def maybe_multiply(t: torch.Tensor, s: Scalar):
 
 @pushforward(operator.setitem)
 def setitem(
-    target, index, value,
-    value_t
+    target: torch.Tensor, index, value: torch.Tensor,
+    value_t: torch.Tensor
 ):
     """
     setitem is a typical example of inplace operator
@@ -129,14 +210,32 @@ def setitem(
     # TODO how is target_t storage ever involved? especially, broadcasting may be needed
     return value_t
 
+@pushforward(torch.add, torch.Tensor.add)
+def add(
+    input: torch.Tensor, other: torch.Tensor,
+    input_t: torch.Tensor, other_t: torch.Tensor,
+    *,
+    alpha: Scalar
+):
+    # torch has an overloading with `other` being Scalar and not involved in pushforward,
+    # for such cases we can escalate Scalars to Tensors, and go with other_t==0
+    # -- it's AD framework to detect Scalar (always non-diff-able) and allocate replicated zero tangent.
+    # TODO can we? store a constant (0,)-shape zero replica in JVP esr.Module?
+    return input_t + maybe_multiply(other_t, alpha)
+
 @pushforward(torch.Tensor.add_)
 def add_(target, value, target_t, value_t):
     """
     TODO
     1.  `add_` may not need a rule at all, as it's derived from non-inplace version of `add`
+        NOTE only the non-inplace version has rule defined (manually or auto-gen-ed)
+            can be derived to its inplace version.
+
     2.  there are 2*2=4 combinations of target/value carries tangent or not.
         the case e.g. value does not carry tangent equals value_t==0,
-        but can AD framework decide value_t==0 equal no need to call pushforward? Can we decide this out of linearity from chain rule?
+        but can AD framework decide value_t==0 equal no need to call pushforward?
+        Can we decide this out of linearity from chain rule?
+
     3.  similar to setitem, how target_t/result_t can be involved, with Tensor broadcasting behavior for free?
     """
     return target_t + value_t
