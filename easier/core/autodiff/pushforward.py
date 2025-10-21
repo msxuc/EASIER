@@ -10,7 +10,7 @@ import torch
 
 from easier.core.passes.utils import EasierInterpreter
 
-Scalar: TypeAlias = Union[int, float]
+
 KEY__PUSHFORWARD_META = 'easier_autodiff_pushforwardMeta'
 
 
@@ -201,70 +201,3 @@ def _parse(pushforward: Callable) -> PushforwardMeta:
     )
     return meta
 
-@aux
-def maybe_multiply(t: torch.Tensor, s: Scalar):
-    if s == 1:
-        return t
-    else:
-        return t * s
-
-
-@pushforward(operator.setitem)
-def setitem(
-    target: torch.Tensor, index, value: torch.Tensor,
-    value_t: torch.Tensor
-):
-    """
-    setitem is a typical example of inplace operator
-    (and not defined in PyTorch derivatives.yaml,
-    however, torch.fill_/copy_ are defined there).
-
-    The data container `target`, an esr.Tensor instance or an immediate Tensor,
-    may start to carry tangent only after this write
-
-    P.S. `target` may also be shadowed into a non-carrier if `value` is not a
-    tangent carrier, but for such cases this pushforward function won't be
-    activated or called.  TODO will it? How is add_ handled then?
-    """
-    # TODO how is target_t storage ever involved? especially, broadcasting may be needed
-    return value_t
-
-@pushforward(torch.add, torch.Tensor.add)
-def add(
-    input: torch.Tensor, other: torch.Tensor,
-    input_t: torch.Tensor, other_t: torch.Tensor,
-    *,
-    alpha: Scalar
-):
-    # torch has an overloading with `other` being Scalar and not involved in pushforward,
-    # for such cases we can escalate Scalars to Tensors, and go with other_t==0
-    # -- it's AD framework to detect Scalar (always non-diff-able) and allocate replicated zero tangent.
-    # TODO can we? store a constant (0,)-shape zero replica in JVP esr.Module?
-    return input_t + maybe_multiply(other_t, alpha)
-
-@pushforward(torch.Tensor.add_)
-def add_(target, value, target_t, value_t):
-    """
-    TODO
-    1.  `add_` may not need a rule at all, as it's derived from non-inplace version of `add`
-        NOTE only the non-inplace version has rule defined (manually or auto-gen-ed)
-            can be derived to its inplace version.
-
-    2.  there are 2*2=4 combinations of target/value carries tangent or not.
-        the case e.g. value does not carry tangent equals value_t==0,
-        but can AD framework decide value_t==0 equal no need to call pushforward?
-        Can we decide this out of linearity from chain rule?
-
-    3.  similar to setitem, how target_t/result_t can be involved, with Tensor broadcasting behavior for free?
-    """
-    return target_t + value_t
-
-# TODO temporarily for demo, can be auto-gen-ed
-@pushforward(torch.addmv)
-def addmv(
-    input: torch.Tensor, mat: torch.Tensor, vec: torch.Tensor,
-    input_t: torch.Tensor, mat_t: torch.Tensor, vec_t: torch.Tensor,
-    *,
-    beta: Scalar, alpha: Scalar
-):
-    return maybe_multiply(input_t, beta) + maybe_multiply(mat_t.mv(vec), alpha) + maybe_multiply(mat.mv(vec_t), alpha)
