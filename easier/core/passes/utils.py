@@ -642,6 +642,28 @@ def fx_normalize_function_variant_into_kwargs(
     instead of functions named like `torch.Tensor.sum`
     (these ".Tensor.sum" functions are yet to be invoked by expressions like
     `torch.rand(...).sum()` in a Tensor method style).
+
+    And, although being a function in `torch` module, some functions
+    are not supported by `fx.normalize_function`:
+
+    -   Functions defined in
+        https://github.com/pytorch/pytorch/blob/main/torch/functional.py
+        e.g. `torch.einsum, torch.split`.
+    
+    -   Function overloadings with Python-API-level transformation than
+        the native form in 
+        PYTORCH_REPO/aten/src/ATen/native/native_functions.yaml
+        e.g.
+        ```yaml
+        - func: cummax.out(
+            Tensor self, int dim, *, Tensor(a!) values, Tensor(b!) indices
+        ) -> (Tensor(a!) values, Tensor(b!) indices)
+        ```
+        with two inplace arguments is wrapped into
+        ```python
+        def cummax(input: Tensor, dim: int, *, out: Tuple[Tensor, Tensor]):
+        ```
+        with only one inplace argument.
     """
 
     arg_types = tuple(map(_fx_normalization_arg_type_infer, args))

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import easier.core.module as esr
-from easier.core.autodiff.autodiff import TangentFlowPropagator, TangentFlowPropCtx
+from easier.core.autodiff.autodiff import TangentFlowPropagator, GlobalTangentFlowPropCtx
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestTangentFlowProp:

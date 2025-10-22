@@ -55,7 +55,8 @@ properties and requirements:
 -   The rule implementations must be value-independent, i.e. not depending on
     shapes or element values.
     TODO certain torch rules do use shapes, may be we need to leave a special
-    conditioning mark to mimic control flow.
+    conditioning mark for NodeEvaluator to mimic control flow
+    (Graph-level), or encapsulate the conditioning into an EASIER-provided op.
 
 
 """
