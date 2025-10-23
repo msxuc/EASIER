@@ -62,12 +62,13 @@ properties and requirements:
 """
 
 import operator
-from typing import TypeAlias, Union
+from typing import Optional, TypeAlias, Union
 import torch
 
 from easier.core.autodiff.pushforward import aux, pushforward
 
 Scalar: TypeAlias = Union[int, float]
+Tangent: TypeAlias = Optional[torch.Tensor]
 
 @aux
 def maybe_multiply(t: torch.Tensor, s: Scalar):
@@ -135,4 +136,6 @@ def addmv(
     *,
     beta: Scalar, alpha: Scalar
 ):
+
     return maybe_multiply(input_t, beta) + maybe_multiply(mat_t.mv(vec), alpha) + maybe_multiply(mat.mv(vec_t), alpha)
+
