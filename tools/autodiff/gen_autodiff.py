@@ -6,8 +6,9 @@ import dataclasses
 import itertools
 import os
 import re
-from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union, cast
 import yaml
+import pyparsing
 
 import torch
 
@@ -104,6 +105,8 @@ class OpDef:
 
     # decision: Literal['']
 
+    # variants: List[Literal['function', 'method']]
+
     def get_name_with_suffix(self):
         if self.overloading_suffix:
             return f'{self.name}.{self.overloading_suffix}'
@@ -140,10 +143,45 @@ TODO
     (those in native_functions.yaml and with `tags: core` -- those will remain after aten-to-aten decomposition)
 """
 
+def _parse_op_def(funcsig: str) -> OpDef:
+    # Extreme cases are like:
+    # split.Tensor(Tensor(a -> *) self, SymInt split_size, \
+    #       int dim=0) -> Tensor(a)[]
+    func_type_str = '(' + '('.join(funcsig.split('(')[1:])
+    ast_level = 0
+    for i, c in enumerate(func_type_str):
+        if c == '(':
+            # First char in func_type is always '(' so AST level begins
+            # with 1.
+            ast_level += 1
+        if c == ')':
+            ast_level -= 1
+        
+        if ast_level == 0:
+            break
+    param_list_str = func_type_str[:(i+1)]
+    assert param_list_str[0] == '('
+    assert param_list_str[-1] == ')'
+
+    from_arrow = func_type_str[(i+1):].strip()
+    assert from_arrow.startswith('-> ')
+    return_type = from_arrow[len('-> '):]
+
+    name_w_suffix = funcsig.split('(')[0]
+    name_wo_suffix = name_w_suffix.split('.')[0]
+    overloading_suffix = name_w_suffix[(len(name_wo_suffix)+1):]
+
+    return OpDef(
+        name=name_wo_suffix,
+        overloading_suffix=overloading_suffix,
+        func_type=func_type_str,
+        param_list=param_list_str,
+        return_type=return_type
+    )
 
 # Get all public, traceable, non-backprop operator definitions, e.g.
 # "all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
-def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
+def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef]]:
     nf_yaml_fp = os.path.join(
         args.pytorch_codebase, 'aten/src/ATen/native/native_functions.yaml'
     )
@@ -164,35 +202,10 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
         if funcsig.startswith('_'):
             continue
 
-        # Extreme cases are like:
-        # split.Tensor(Tensor(a -> *) self, SymInt split_size, \
-        #       int dim=0) -> Tensor(a)[]
-        func_type_str = '(' + '('.join(funcsig.split('(')[1:])
-        ast_level = 0
-        for i, c in enumerate(func_type_str):
-            if c == '(':
-                # First char in func_type is always '(' so AST level begins
-                # with 1.
-                ast_level += 1
-            if c == ')':
-                ast_level -= 1
-            
-            if ast_level == 0:
-                break
-        param_list_str = func_type_str[:(i+1)]
-        assert param_list_str[0] == '('
-        assert param_list_str[-1] == ')'
-
-        from_arrow = func_type_str[(i+1):].strip()
-        assert from_arrow.startswith('-> ')
-        return_type = from_arrow[len('-> '):]
-
-        name_w_suffix = funcsig.split('(')[0]
-        name_wo_suffix = name_w_suffix.split('.')[0]
-        overloading_suffix = name_w_suffix[(len(name_wo_suffix)+1):]
+        opdef = _parse_op_def(funcsig)
 
         # Exclude backprop-only ops
-        if name_wo_suffix.endswith('_backward'):
+        if opdef.name.endswith('_backward'):
             continue
 
         # Exclude Tensor-creators like zeros/eye etc. as they don't get traced
@@ -200,16 +213,10 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
         #
         # However, some Tensor-creators may have `out=` parameter e.g.
         # eye.m_out(SymInt n, SymInt m, *, Tensor(a!) out) -> Tensor(a!)
-        if 'Tensor' not in param_list_str:
+        if 'Tensor' not in opdef.param_list:
             continue
 
-        opdefs.append(OpDef(
-            name=name_wo_suffix,
-            overloading_suffix=overloading_suffix,
-            func_type=func_type_str,
-            param_list=param_list_str,
-            return_type=return_type
-        ))
+        opdefs.append(opdef)
     
     # quick lookup table
     key=lambda d: d.name
@@ -234,24 +241,15 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
             #   -> Tensor(a!)
             noninplace_name = inp_opdef.name[:-1]
 
-
-
-
-
-
-            # TODO split _ and out cases, if out, out if always keyword params
-            # when checking incrementalness, append a * if none.
-
-
-
-
-
-
         elif '!' in inp_opdef.param_list:
             # Generally the last param(s) is inplace, e.g.
             # addmv.out(Tensor self, Tensor mat, Tensor vec, *, \
             #   Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
             noninplace_name = inp_opdef.name
+
+            # When check the non-inplace version, we should note that
+            # the inplace version has an extra '*' delimiter in the params.
+
         else:
             continue
 
@@ -280,6 +278,9 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
             for p in params:
                 _validate_param(p)
 
+            #
+            # Find out `out` parameters
+            #
             # If a `out=` parameter is a tuple/list, it's like
             # split_copy.Tensor_out(Tensor self, SymInt split_size, \
             #   int dim=0, *, Tensor(a!)[] out) -> ()
@@ -306,30 +307,72 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
                     prev_inp_param_pos = i
                 
 
-            # Expect the inplace param to be the 1st
-            if inp_opdef.name.endswith('_'):
-                assert prev_inp_param_pos == 0
-                assert len(inp_params) == 1
-            
-
-            assert len(inp_params) > 0
-
+            # Check if inplace func type is symmetric:
+            # (Tensor(a!) arg) -> Tensor(a!)
+            #
+            # Modify the inplace part in the param list to get the result type.
+            # The convention is, the result of an inplace op must be also the
+            # inplace parameters.
+            #
             if len(inp_params) == 1:
-                simple_return_type = 'Tensor(a!)'
+                is_symmetric_inp_op = inp_opdef.return_type == 'Tensor(a!)'
+                noninp_res_type = 'Tensor'
             else:
-                simple_return_type = \
-                    '(' + ', '.join(p for i, p in inp_params) + ')'
+                # e.g. ['Tensor(a!)', 'Tensor(b!)']
+                #
+                # Some ops do not follow the convention e.g.
+                # max.dim_max(Tensor self, int dim, bool keepdim=False, *, \
+                #   Tensor(a!) max, Tensor(b!) max_values) -> ( \
+                #   Tensor(a!) values, Tensor(b!) indices)
+                # But the result item names take no effect in resolution.
+                if not (
+                    inp_opdef.return_type[0] == '(' \
+                        or inp_opdef.return_type[-1] == ')'
+                ):
+                    is_symmetric_inp_op = False
+                    noninp_res_type = 'WHATEVER'
+
+                else:
+                    # Ignore result item names, only check if type lists match.
+                    is_symmetric_inp_op = \
+                        list(
+                            p.split(' ')[0] for i, p in inp_params
+                        ) == list(
+                            p.split(' ')[0] for p
+                            in inp_opdef.return_type[1:-1].split(', ')
+                        )
+
+                    noninp_res_type = re.sub(
+                        '\\(\\w!\\)', '', inp_opdef.return_type
+                    )
 
 
-            if inp_opdef.return_type == simple_return_type:
+            if is_symmetric_inp_op:
+                #
+                # Remove (a!) for memory alias -- inplace target -- in the
+                # param/result types
+                #
+                if inp_opdef.name.endswith('_'):
+                    # Expect the inplace param to be the 1st
+                    assert prev_inp_param_pos == 0
+                    assert len(inp_params) == 1
 
-                noninp_params = list(params)
-                for i, p in inp_params:
-                    noninp_params[i] = re.sub('(\\w!)', '', p)
+                    noninp_params = list(params)
+                    for i, p in inp_params:
+                        noninp_params[i] = re.sub('\\(\\w!\\)', '', p)
                 
-                noninp_return_type = re.sub('(\\w!)', '', simple_return_type)
+                else:
+                    # Inplace version has keyword `out` param, we should remove
+                    # keyword delimiter * in the param list.
+                    assert len(inp_params) >= 1
 
-                noninp_func_type = '('  + ', '.join(noninp_params) + ') -> ' + noninp_return_type
+                    noninp_params = list(params)
+                    for maxi, p in sorted(inp_params, key=lambda ip: ip[0], reverse=True):
+                        noninp_params.pop(maxi)
+                    if noninp_params[-1] == '*':
+                        noninp_params.pop()
+
+                noninp_func_type = '('  + ', '.join(noninp_params) + ') -> ' + noninp_res_type
 
 
                 for noninp in noninplace_versions:
@@ -343,8 +386,10 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
                         f'{inp_opdef}\n\tis not an INCREMENTAL inplace op'
                     )
             else:
+                # An extra kind of inplace ops: non-symmetric
+                # where the inplace arguments are not returned.
                 print(
-                    f'{inp_opdef}\n\tdoes not have a SIMPLE noninplace'
+                    f'{inp_opdef}\n\tdoes not have a SYMMETRIC noninplace'
                     ' version'
                 )
 
@@ -356,9 +401,21 @@ def parse_native_functions_yaml(args: 'CliArgs') -> List[OpDef]:
 
     opdefs = list(filter(lambda d: d not in removed_inplace_ops, opdefs))
     
-    return opdefs
+    return opdefs, removed_inplace_ops
 
-def parse_derivatives_yaml(args: 'CliArgs') -> Tuple[List[DerivativeDefinition], List[ExceptionalDefinition]]:
+
+def _parse_derivative_rule(cpp_expr: str):
+    1
+
+def parse_derivatives_yaml(
+    args: 'CliArgs', opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
+) -> Tuple[List[DerivativeDefinition], List[ExceptionalDefinition]]:
+    print("""
+##############################
+#   Parse derivatives.yaml   #
+##############################
+""")
+
     derivatives_yaml_fp = os.path.join(
         args.pytorch_codebase, 'tools/autograd/derivatives.yaml'
     )
@@ -366,79 +423,53 @@ def parse_derivatives_yaml(args: 'CliArgs') -> Tuple[List[DerivativeDefinition],
     # TODO some op result item has alias like Q K V, and does not have 'result' field
     with open(derivatives_yaml_fp, 'r') as yaml_fs:
         torch_derivatives: list = yaml.safe_load(yaml_fs)
-
-    mm = []
-
-    jitall_names_w_sfx = []
-    alls = torch._C._jit_get_all_schemas()
-    for s in alls:
-        if 'aten::' in s.name:
-            wo_aten_ns = s.name[6:]
-            if wo_aten_ns.startswith('_'):
-                continue
-
-            for arg in s.arguments:
-                if 'Tensor' in arg.type.annotation_str:
-                    jitall_names_w_sfx.append(_aten_name_with_overloading_suffix(s))
-                    break
-        
-        if 'aten::mm' in s.name:
-            mm.append(s)
     
-    nf_sigs = parse_native_functions_yaml(args)
-    nf_names_w_sfx = set('aten::' + sig.split('(')[0] for sig in nf_sigs)
+    opdef_by_sig = { 
+        f'{opdef.get_name_with_suffix()}{opdef.func_type}': opdef
+        for opdef in opdefs
+    }
+    removed_incr_inp_by_sig = {
+        f'{opdef.get_name_with_suffix()}{opdef.func_type}': opdef
+        for opdef in removed_incremental_inplace_ops
+    }
 
-    missing = nf_names_w_sfx - set(jitall_names_w_sfx)
+    for derivdef in torch_derivatives:
+        derivdef: dict
 
-    schemas_from_derivatives = []
-    for torch_deriv in torch_derivatives:
-        torch_deriv: dict
+        deriv_op_sig = cast(str, derivdef['name'])
 
-        # e.g. "all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
-        name: str = torch_deriv['name']
-
-        # e.g. "all.dim"
-        name_with_suffix = name.split('(')[0]
-
-        if name_with_suffix.startswith('_'):
-            # torch internal operators, skip, e.g.
-            # "_unsafe_index.Tensor(Tensor self, Tensor?[] indices) -> Tensor"
+        # torch internal operators
+        if deriv_op_sig.startswith('_'):
             continue
 
-        # Torch JIT system contains more operators like:
-        # - control flow operators
-        # - TorchScript VM operators
-        # - Type-system-wise generic operators e.g. `add.t(t a, t b) -> t`
-        # - many more ...
-        # We have to filter to get 
-        #
-        # This _C API doesn't allow overloading suffix
-        schemas: List[torch._C.FunctionSchema] = \
-            torch._C._jit_get_schemas_for_operator(name_with_suffix.split('.')[0])
-        
-        aten_name_w_suffix = 'aten::' + name_with_suffix
-        for fs in schemas:
-            fs_name_w_suffix = _aten_name_with_overloading_suffix(fs)
+        deriv_opdef = _parse_op_def(deriv_op_sig)
 
-            if fs_name_w_suffix == aten_name_w_suffix:
-                break
-        else:
-            assert False, f"{aten_name_w_suffix} not found in TorchScript"
-        
-        schemas_from_derivatives.append(fs)
-    
-
-
-
-    probably_need_manually = set(jitall_names_w_sfx) - set(schemas)
-        
+        if deriv_op_sig in removed_incr_inp_by_sig:
+            #
+            # Why derivatives.yaml still has rules for INCREMENTAL inplace ops?
+            # Check if there's anything special
+            #
+            result_tangent: str = derivdef.get('result', 'NOT_RESULT')
+            if result_tangent == 'NOT_RESULT':
+                print(
+                    f'{deriv_op_sig}\n\tdoes not have "result" tangent defined'
+                    f'\n\t{derivdef}\n'
+                )
+            
+            elif not result_tangent in ['auto_element_wise', 'auto_linear',
+                                        'self_t.zero_()',
+            ]:
+                print(
+                    f'{deriv_op_sig}\n\tdoes not have TRIVIAL result tangent:'
+                    f'\n\t{result_tangent}\n'
+                )
+                
+            # else: default cases, follow EASIER rules:
+            # 1) calculate tangent as non-inplace, 2) setitem.
 
 
-
-
-    
     return ([], [])
-    
+
 
 
 
@@ -498,14 +529,16 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
         differentiable or not, so autodiff process will be interrupted and
         the user can define a custom derivative rule as a temporary solution.
         """
-        op_sigs = parse_native_functions_yaml(args)
-        # ops = []
-        # for func in op_sigs:
-        #     op = OpDef(func=func)
-        #     ops.append(op)
-        
-        # op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
-        # with open(op_names_fp, 'w') as op_names_fs:
-        #     yaml.safe_dump(ops, op_names_fs)
+        opdefs, removed_inplace_ops = parse_native_functions_yaml(args)
+
+        op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
+        with open(op_names_fp, 'w') as op_names_fs:
+            yaml.safe_dump(
+                list(map(dataclasses.asdict, opdefs)),
+                op_names_fs,
+                sort_keys=False,
+                width=float("inf")
+            )
 
     
+        parse_derivatives_yaml(args, opdefs, removed_inplace_ops)
