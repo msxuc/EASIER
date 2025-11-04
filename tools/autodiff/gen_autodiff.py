@@ -3,6 +3,7 @@
 
 import argparse
 import dataclasses
+import enum
 import itertools
 import os
 import re
@@ -404,8 +405,102 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
     return opdefs, removed_inplace_ops
 
 
-def _parse_derivative_rule(cpp_expr: str):
-    1
+
+import parsec as P
+
+@dataclasses.dataclass
+class CppAst:
+    pass
+
+@dataclasses.dataclass
+class CppValue(CppAst):
+    # Only one arg
+    value: object
+
+@dataclasses.dataclass
+class CppCall(CppAst):
+    # f(arg[, arg+]) or ns::f(arg[, arg+]) or v.f(arg[, arg+])
+    # 1st arg is the object or namespace or None
+    domain: Union[str, CppValue, None]
+    func: str
+    args: List[CppValue]
+
+
+
+@dataclasses.dataclass
+class CppTernary(CppAst):
+    # a ? b : c
+    pass
+
+class _DerivExprParser:
+    """
+    A case-driven parser to a very small set of CPP syntax used in tangent
+    expression in derivatives.yaml.
+
+    TODO because of the simplicity of the target expression and the locality
+    of this parser itself, we are using ParseC to parse.
+    But OK to switch to whatever in the future.
+    """
+    # Encapsulate and init parser objects only once.
+    num = P.optional(P.string('-')) + P.decimal + P.optional(P.string('.') + P.optional(P.decimal))
+    boolean = P.string('true') | P.string('false')
+
+    var_id = P.regex(R'\w+')
+    func_id = P.optional(P.string('aten::')) + P.regex(R'\w+')
+
+    # `>>` discard left result; `<<` discard right result.
+    op = P.spaces() >> P.regex('[-+*/]') << P.spaces()
+
+    @P.generate
+    @staticmethod
+    def value():
+        D = _DerivExprParser
+        v = yield D.num | D.boolean | P.between(P.string('('), P.string(')'), D.expr)
+        return ()
+
+    @P.generate
+    @staticmethod
+    def call():
+        D = _DerivExprParser
+
+        callee = yield D.func_id | D.expr
+        args = P.between(
+            P.string('('),
+            P.string(')'), 
+            P.sepBy1(D.expr, ))
+        return (CppAstType.CALL, callee, args)
+    
+    @P.generate
+    @staticmethod
+    def ternary():
+        D = _DerivExprParser
+
+        cond = yield D.expr
+
+        yield P.spaces() >> P.string('?') >> P.spaces()
+        if_b = yield D.expr
+
+        yield P.spaces() >> P.string(':') >> P.spaces()
+        else_b = yield D.expr
+
+        return (CppAstType.TERNARY, cond, if_b, else_b)
+    
+    @P.generate
+    @staticmethod
+    def expr():
+        D = _DerivExprParser
+
+        yield D.num | D.boolean | P.between(P.string('('), P.string(')'), D.expr)
+        return s
+
+
+
+    def __call__(self, cpp_expr: str):
+        pass
+
+# Used like a function, to encapsulate parser objects and init them once.
+_parse_derivative_expression = _DerivExprParser()
+
 
 def parse_derivatives_yaml(
     args: 'CliArgs', opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
