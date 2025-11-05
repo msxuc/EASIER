@@ -4,10 +4,12 @@
 import argparse
 import dataclasses
 import enum
+import functools
 import itertools
 import os
 import re
-from typing import Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union, cast
+from typing import Any, Dict, Generator, List, Literal, Optional, Self, Sequence, Set, Tuple, TypeAlias, TypeVar, TypedDict, Union, cast
+import more_itertools
 import yaml
 import pyparsing
 
@@ -413,9 +415,19 @@ class CppAst:
     pass
 
 @dataclasses.dataclass
+class CppVar(CppAst):
+    name: str
+
+    def __repr__(self) -> str:
+        return self.name
+
+@dataclasses.dataclass
 class CppValue(CppAst):
     # Only one arg
-    value: object
+    value: Union[bool, int, float]
+
+    def __repr__(self) -> str:
+        return repr(self.value)
 
 @dataclasses.dataclass
 class CppCall(CppAst):
@@ -425,81 +437,156 @@ class CppCall(CppAst):
     func: str
     args: List[CppValue]
 
+    def __repr__(self) -> str:
+        return f"{self.domain}::{self.func}(*{self.args})"
+
+
+@dataclasses.dataclass
+class CppBinExprList(CppAst):
+    # An over-simplified conciser, flattened list for operands on the same
+    # left-to-right precedence level
+    ops: List[str]
+    operands: List[CppAst]  # len(operands) == len(ops) + 1
+
+    def concat(self, other: 'CppBinExprList') -> 'CppBinExprList':
+        return CppBinExprList(self.ops + other.ops, self.operands + other.operands)
+    
+    def __post_init__(self):
+        assert len(self.operands) == len(self.ops) + 1
+    
+    def __repr__(self) -> str:
+        comps = [repr(self.operands[0])]
+        for i in range(len(self.ops)):
+            comps.append(self.ops[i])
+            comps.append(repr(self.operands[i+1]))
+        return '(' + ' '.join(comps) + ')'
 
 
 @dataclasses.dataclass
 class CppTernary(CppAst):
-    # a ? b : c
-    pass
+    cond: CppAst
+    if_b: CppAst
+    else_b: CppAst
 
-class _DerivExprParser:
-    """
-    A case-driven parser to a very small set of CPP syntax used in tangent
-    expression in derivatives.yaml.
 
-    TODO because of the simplicity of the target expression and the locality
-    of this parser itself, we are using ParseC to parse.
-    But OK to switch to whatever in the future.
-    """
-    # Encapsulate and init parser objects only once.
-    num = P.optional(P.string('-')) + P.decimal + P.optional(P.string('.') + P.optional(P.decimal))
-    boolean = P.string('true') | P.string('false')
+@staticmethod
+def _combine_num(s_p_f: Tuple[Tuple[Optional[str], int], Optional[int]]):
+    (s, p), f = s_p_f
 
-    var_id = P.regex(R'\w+')
-    func_id = P.optional(P.string('aten::')) + P.regex(R'\w+')
+    int_str = (s or '') + str(p)
 
-    # `>>` discard left result; `<<` discard right result.
-    op = P.spaces() >> P.regex('[-+*/]') << P.spaces()
+    if f is None:
+        # no ".xxx" part, it's int
+        return int(int_str)
+    else:
+        # floating number
+        f_str = int_str + '.' + str(f)
+        return float(f_str)
 
-    @P.generate
-    @staticmethod
-    def value():
-        D = _DerivExprParser
-        v = yield D.num | D.boolean | P.between(P.string('('), P.string(')'), D.expr)
-        return ()
+_P_num = (P.optional(P.string('-')) + P.decimal + P.optional(P.string('.') >> P.optional(P.decimal))).map(_combine_num)
+_P_bool = P.string('true').result(True) | P.string('false').result(False)
 
-    @P.generate
-    @staticmethod
-    def call():
-        D = _DerivExprParser
+_P_ident = P.regex(R'\w+')
+_P_func_name = (P.optional(_P_ident << P.string('::')) + P.regex(R'\w+'))
 
-        callee = yield D.func_id | D.expr
-        args = P.between(
+# `>>` discard left result; `<<` discard right result.
+_P_plus_minus = P.space() >> P.one_of('+-') << P.space()
+_P_mul_div = P.space() >> P.one_of('*/') << P.space()
+
+def _same_bin_level(op_parser: P.Parser, sub_ast_parser: P.Parser):
+    def _generator():
+        head: CppAst = yield sub_ast_parser
+
+        tails: List[Tuple[str, CppAst]] = yield P.many(op_parser + sub_ast_parser)
+        if len(tails) == 0:
+            return head
+        else:
+            ops, tail_asts = more_itertools.unzip(tails) # type: ignore
+            ops: List[str] = list(ops)
+            operands: List[CppAst] = [head] + list(tail_asts)
+            return CppBinExprList(ops, operands)
+    return _generator
+
+@P.generate('func_call') # type: ignore
+def _P_func_call():
+    ns, func_name = yield _P_func_name
+
+    tp = yield P.try_choice(
+        P.string('()'),
+        P.between(
             P.string('('),
-            P.string(')'), 
-            P.sepBy1(D.expr, ))
-        return (CppAstType.CALL, callee, args)
-    
-    @P.generate
-    @staticmethod
-    def ternary():
-        D = _DerivExprParser
+            P.string(')'),
+            P.sepBy(_P_expr, P.string(', ')),
+        )
+    )
 
-        cond = yield D.expr
+    if tp  == '()':
+        args = []
+    else:
+        args = tp
 
-        yield P.spaces() >> P.string('?') >> P.spaces()
-        if_b = yield D.expr
-
-        yield P.spaces() >> P.string(':') >> P.spaces()
-        else_b = yield D.expr
-
-        return (CppAstType.TERNARY, cond, if_b, else_b)
-    
-    @P.generate
-    @staticmethod
-    def expr():
-        D = _DerivExprParser
-
-        yield D.num | D.boolean | P.between(P.string('('), P.string(')'), D.expr)
-        return s
+    return CppCall(ns, func_name, args)
 
 
+@P.generate('method_call') # type: ignore
+def _P_method_call():
+    callee = yield _P_primary_expr
+    yield P.string('.')
+    method_name = yield _P_ident
 
-    def __call__(self, cpp_expr: str):
-        pass
+    tp = yield P.try_choice(
+        P.string('()'),
+        P.between(
+            P.string('('),
+            P.string(')'),
+            P.sepBy(_P_expr, P.string(', ')),
+        )
+    )
 
-# Used like a function, to encapsulate parser objects and init them once.
-_parse_derivative_expression = _DerivExprParser()
+    if tp  == '()':
+        args = []
+    else:
+        args = tp
+
+    return CppCall(callee, method_name, args)
+
+@P.generate('ternary') # type: ignore
+def _P_ternary_expr():
+    cond = yield _P_expr
+
+    yield P.space() >> P.string('?') >> P.space()
+    if_b = yield _P_expr
+
+    yield P.space() >> P.string(':') >> P.space()
+    else_b = yield _P_expr
+
+    return CppTernary(cond, if_b, else_b)
+
+_P_primary_expr = P.try_choices(
+    (_P_num | _P_bool).map(CppValue) | _P_ident.map(CppVar),
+    _P_func_call,
+    _P_method_call,
+    P.between(P.string('('), P.string(')'), _P_ternary_expr)
+).desc('primary')
+
+_P_mul_expr = P.generate(_same_bin_level(_P_mul_div, _P_primary_expr))
+_P_add_expr = P.generate(_same_bin_level(_P_plus_minus, _P_mul_expr))
+
+_P_expr: P.Parser = P.try_choices(
+    _P_primary_expr,
+    _P_add_expr,
+    _P_ternary_expr
+ ) # type: ignore
+
+
+def _parse_derivative_expression(cpp_expression: str) -> Optional[CppAst]:
+    print(cpp_expression)
+    return _P_expr.parse_strict(cpp_expression)
+    try:
+        return _P_expr.parse_strict(cpp_expression)
+    except P.ParseError:
+        return None
+
 
 
 def parse_derivatives_yaml(
@@ -538,29 +625,51 @@ def parse_derivatives_yaml(
             continue
 
         deriv_opdef = _parse_op_def(deriv_op_sig)
+        result_tangent: str = derivdef.get('result', 'NOT_RESULT')
 
         if deriv_op_sig in removed_incr_inp_by_sig:
             #
             # Why derivatives.yaml still has rules for INCREMENTAL inplace ops?
             # Check if there's anything special
             #
-            result_tangent: str = derivdef.get('result', 'NOT_RESULT')
             if result_tangent == 'NOT_RESULT':
                 print(
                     f'{deriv_op_sig}\n\tdoes not have "result" tangent defined'
                     f'\n\t{derivdef}\n'
                 )
+                continue
             
-            elif not result_tangent in ['auto_element_wise', 'auto_linear',
+            elif result_tangent in ['auto_element_wise', 'auto_linear',
                                         'self_t.zero_()',
             ]:
+                continue
+                # else: default cases, follow EASIER rules:
+                # 1) calculate tangent as non-inplace, 2) setitem.
+
+            else:
                 print(
                     f'{deriv_op_sig}\n\tdoes not have TRIVIAL result tangent:'
                     f'\n\t{result_tangent}\n'
                 )
                 
-            # else: default cases, follow EASIER rules:
-            # 1) calculate tangent as non-inplace, 2) setitem.
+        # endif in removed_incr_inp
+        if result_tangent not in ['NOT_RESULT', 'auto_element_wise', 'auto_linear']:
+            ast = _parse_derivative_expression(result_tangent)
+
+            if ast is None:
+                print(
+                    f'{deriv_op_sig}\n\tParse failed'
+                    f'\n\t{result_tangent}\n'
+                )
+
+            else:
+                print(
+                    f'{deriv_op_sig}\n\tParse succeeded'
+                    f'\n\t{result_tangent}\n{ast}\n'
+                )
+
+
+        
 
 
     return ([], [])
@@ -608,7 +717,7 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
 """
     )
 
-    args = CliArgs(**vars(parser.parse_args()))
+    _P_args = CliArgs(**vars(parser.parse_args()))
 
     # if args.mode == 'collect_op_names':
     if True:
@@ -624,7 +733,7 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
         differentiable or not, so autodiff process will be interrupted and
         the user can define a custom derivative rule as a temporary solution.
         """
-        opdefs, removed_inplace_ops = parse_native_functions_yaml(args)
+        opdefs, removed_inplace_ops = parse_native_functions_yaml(_P_args)
 
         op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
         with open(op_names_fp, 'w') as op_names_fs:
@@ -636,4 +745,4 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
             )
 
     
-        parse_derivatives_yaml(args, opdefs, removed_inplace_ops)
+        parse_derivatives_yaml(_P_args, opdefs, removed_inplace_ops)
