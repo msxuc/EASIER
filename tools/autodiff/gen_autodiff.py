@@ -408,58 +408,64 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
 
 
 
-import parsec as P
-
 @dataclasses.dataclass
 class CppAst:
     pass
 
 @dataclasses.dataclass
 class CppVar(CppAst):
-    name: str
+    qual_name: List[str]
 
-    def __repr__(self) -> str:
-        return self.name
+    def __str__(self) -> str:
+        return "::".join(self.qual_name)
 
 @dataclasses.dataclass
-class CppValue(CppAst):
+class CppLiteral(CppAst):
     # Only one arg
     value: Union[bool, int, float]
 
-    def __repr__(self) -> str:
-        return repr(self.value)
+    def __str__(self) -> str:
+        return str(self.value)
 
 @dataclasses.dataclass
 class CppCall(CppAst):
     # f(arg[, arg+]) or ns::f(arg[, arg+]) or v.f(arg[, arg+])
-    # 1st arg is the object or namespace or None
-    domain: Union[str, CppValue, None]
-    func: str
-    args: List[CppValue]
+    this: Optional[CppAst]
+    func: CppVar
+    args: List[CppAst]
 
-    def __repr__(self) -> str:
-        return f"{self.domain}::{self.func}(*{self.args})"
+    def __str__(self) -> str:
+        arg_list = ', '.join(map(str, self.args))
+        if self.this is None:
+            return f"{self.func}({arg_list})"
+        else:
+            this = str(self.this)
+            if type(self.this) in [CppUnaryOp, CppBinOpList, CppTernary]:
+                this = f'({this})'
+
+            return f"{this}.{self.func}({arg_list})"
 
 
 @dataclasses.dataclass
-class CppBinExprList(CppAst):
-    # An over-simplified conciser, flattened list for operands on the same
-    # left-to-right precedence level
-    ops: List[str]
-    operands: List[CppAst]  # len(operands) == len(ops) + 1
+class CppUnaryOp(CppAst):
+    op: Literal['-!']
+    operand: CppAst
 
-    def concat(self, other: 'CppBinExprList') -> 'CppBinExprList':
-        return CppBinExprList(self.ops + other.ops, self.operands + other.operands)
-    
-    def __post_init__(self):
-        assert len(self.operands) == len(self.ops) + 1
-    
-    def __repr__(self) -> str:
-        comps = [repr(self.operands[0])]
-        for i in range(len(self.ops)):
-            comps.append(self.ops[i])
-            comps.append(repr(self.operands[i+1]))
-        return '(' + ' '.join(comps) + ')'
+    def __str__(self) -> str:
+        operand = str(self.operand)
+        if type(self.operand) in [CppUnaryOp, CppBinOpList, CppTernary]:
+            operand = f'({operand})'
+        return f'{self.op}{operand}'
+
+
+@dataclasses.dataclass
+class CppBinOpList(CppAst):
+    # Same-precedence binary operations in a batch
+    head: CppAst
+    tail: List[Tuple[Literal['+', '-', '*', '/'], CppAst]]
+
+    def __str__(self) -> str:
+        return ' '.join(map(str, [self.head] + self.tail))
 
 
 @dataclasses.dataclass
@@ -468,125 +474,203 @@ class CppTernary(CppAst):
     if_b: CppAst
     else_b: CppAst
 
+    def __str__(self) -> str:
+        return f'{self.cond} ? {self.if_b} : {self.else_b}'
 
-@staticmethod
-def _combine_num(s_p_f: Tuple[Tuple[Optional[str], int], Optional[int]]):
-    (s, p), f = s_p_f
 
-    int_str = (s or '') + str(p)
 
-    if f is None:
-        # no ".xxx" part, it's int
-        return int(int_str)
-    else:
-        # floating number
-        f_str = int_str + '.' + str(f)
-        return float(f_str)
+"""
+Simplified EBNF grammar for CPP expressions in yaml:
 
-_P_num = (P.optional(P.string('-')) + P.decimal + P.optional(P.string('.') >> P.optional(P.decimal))).map(_combine_num)
-_P_bool = P.string('true').result(True) | P.string('false').result(False)
+# [] for optional, {} for 0 or more
 
-_P_ident = P.regex(R'\w+')
-_P_func_name = (P.optional(_P_ident << P.string('::')) + P.regex(R'\w+'))
+<expr>          ::= <ternary-expr>
+<ternary-expr>  ::= <cmp-expr> ["?" <expr> ":" <expr>]
+<cmp-expr>      ::= ...
+<add-expr>      ::= <mul-expr> { ("+" | "-") <mul-expr> }
+<mul-expr>      ::= <call-expr> { ("*" | "/") <call-expr> }
+<call-expr>     ::= <primary> { <call-tail> }
+<call-tail>     ::= <args-tuple> 
+                  | "." <identifier> <args-tuple>
+<args-tuple>    ::= "(" [ <arg-list> ] ")"
+<arg-list>      ::= <expr> { "," <expr> }
+<primary>       ::= "-" <primary>
+                  | <number>
+                  | <identifier>
+                  | <qualified-name>
+                  | "(" <expr> ")"
+<qualified-name>::= <identifier> { "::" <identifier> }
 
-# `>>` discard left result; `<<` discard right result.
-_P_plus_minus = P.space() >> P.one_of('+-') << P.space()
-_P_mul_div = P.space() >> P.one_of('*/') << P.space()
+# NOTE repeated <call-tail> means `f()()` is acceptable, but no such cases.
 
-def _same_bin_level(op_parser: P.Parser, sub_ast_parser: P.Parser):
-    def _generator():
-        head: CppAst = yield sub_ast_parser
+The simplification does not work for all edge cases, we can handle those
+cases manually.
+"""
 
-        tails: List[Tuple[str, CppAst]] = yield P.many(op_parser + sub_ast_parser)
-        if len(tails) == 0:
-            return head
+import parsec as P
+
+class _ParsecCppExprParser:
+    def __init__(self) -> None:
+        self.num = (P.decimal + P.optional(
+            P.string('.') >> P.optional(P.decimal)
+        )).map(self._combine_num).map(CppLiteral)
+        self.boolean = (
+            P.string('true').result(True) | P.string('false').result(False)
+        ).map(CppLiteral)
+
+        self.ident = P.regex(R'\w+')
+        self.qual_name = P.sepBy1(self.ident, P.string('::')).map(CppVar)
+
+
+        # Basic expressions
+        self.ternary = P.generate(self._ternary)  # type: ignore
+        self.expr: 'P.Parser[CppAst]' = self.ternary
+
+
+        # Function/method calls
+        self.arg_list = P.sepBy(self.expr, P.string(',') + P.spaces())
+        self.args_tuple: 'P.Parser[List[CppAst]]' = P.between(
+            P.string('('), P.string(')'), self.arg_list  # type: ignore
+        )
+
+        def _to_function_call_ast_ctor(args: List[CppAst]):
+            return lambda func_name: CppCall(None, func_name, args)
+        def _to_method_call_ast_ctor(tp: Tuple[CppVar, List[CppAst]]):
+            method_name, args = tp
+            return lambda this: CppCall(this, method_name, args)
+
+        self.call_tail = self.args_tuple.map(
+            # primary ( args )
+            _to_function_call_ast_ctor
+        ) | (P.string('.') >> (self.qual_name + self.args_tuple)).map(
+            # primary . method_name ( args )
+            _to_method_call_ast_ctor
+        )
+        self.call_expr = P.generate(self._call_expr)  # type: ignore
+
+
+        # Binary ops
+        self.mul_expr = self._make_binops_parser('*/', self.call_expr)
+        self.add_expr = self._make_binops_parser('+-', self.mul_expr)
+        # TODO in CPP cmp/bitwise ops aren't closed on numbers therefore can
+        # be sequentially used, but we don't validate it.
+        self.cmp_expr = self._make_binops_parser(
+            ['==', '>=', '<=', '>', '<'], self.add_expr, True
+        )
+        self.bit_and = self._make_binops_parser('&', self.cmp_expr, True)
+        self.bit_or = self._make_binops_parser('|', self.bit_and, True)
+
+        self._lowest_bin = self.bit_or
+
+
+        # Primary values (l/r/xvalues in CPP, immediately carrying bytes)
+        self.primary: 'P.Parser[CppLiteral|CppVar|CppUnaryOp|CppAst]' = \
+            P.generate(self._primary)  # type: ignore
+    
+
+    def _ternary(self):
+        cond = yield self._lowest_bin
+        if_else = yield P.optional(
+            (P.string(' ? ') >> self.expr) + (P.string(' : ') >> self.expr)
+        )
+        if if_else is not None:
+            if_b, else_b = if_else
+            return CppTernary(cond, if_b, else_b)
+
         else:
-            ops, tail_asts = more_itertools.unzip(tails) # type: ignore
-            ops: List[str] = list(ops)
-            operands: List[CppAst] = [head] + list(tail_asts)
-            return CppBinExprList(ops, operands)
-    return _generator
+            return cond
+    
+    def _make_binops_parser(
+        self, precendence_level: Sequence[str], sub_parser: 'P.Parser[CppAst]',
+        disable_sequential=False
+    ):
+        def _generator():
+            lhs = yield sub_parser
+            many_op_rhs = yield P.many(
+                (
+                    P.spaces() >> functools.reduce(
+                        P.choice, map(P.string, precendence_level)
+                    )
+                ) + (
+                    P.spaces() >> sub_parser
+                )
+            )
 
-@P.generate('func_call') # type: ignore
-def _P_func_call():
-    ns, func_name = yield _P_func_name
+            if disable_sequential and len(many_op_rhs) > 1:
+                yield P.fail_with(f'Sequential binary ops')
 
-    tp = yield P.try_choice(
-        P.string('()'),
-        P.between(
-            P.string('('),
-            P.string(')'),
-            P.sepBy(_P_expr, P.string(', ')),
+
+            if len(many_op_rhs) > 0:
+                return CppBinOpList(lhs, many_op_rhs)
+            else:
+                return lhs
+
+        return P.generate(_generator)  # type: ignore
+    
+    def _call_expr(self):
+        """
+        <call-expr>     ::= <primary> { <call-tail> }
+        <call-tail>     ::= <args-tuple> 
+                        | "." <identifier> <args-tuple>
+        <args-tuple>    ::= "(" [ <arg-list> ] ")"
+
+        Function call or chained method call.
+        """
+        p = yield self.primary
+        call_ast_ctors = yield P.many(self.call_tail)
+
+        if len(call_ast_ctors) > 0:
+            r = p
+            # Apply all invocations.
+            for ctor in call_ast_ctors:
+                r = ctor(r)
+            return r
+        else:
+            return p
+    
+    def _primary(self):
+        unary = yield P.optional(P.one_of('-!'))
+        operand = yield self.num | self.qual_name | P.between(
+            P.string('('), P.string(')'), self.expr  # type: ignore
         )
-    )
 
-    if tp  == '()':
-        args = []
-    else:
-        args = tp
+        if unary is None:
+            return operand
+        else:
+            return CppUnaryOp(unary, operand)
+    
+    def _combine_num(
+        self, p_f: Tuple[int, Optional[int]]
+    ) -> Union[int, float]:
+        p, f = p_f
 
-    return CppCall(ns, func_name, args)
+        if f is None:
+            # no ".xxx" part, it's int
+            return p
+        else:
+            # floating number
+            f_str = str(p) + '.' + str(f)
+            return float(f_str)
 
-
-@P.generate('method_call') # type: ignore
-def _P_method_call():
-    callee = yield _P_primary_expr
-    yield P.string('.')
-    method_name = yield _P_ident
-
-    tp = yield P.try_choice(
-        P.string('()'),
-        P.between(
-            P.string('('),
-            P.string(')'),
-            P.sepBy(_P_expr, P.string(', ')),
-        )
-    )
-
-    if tp  == '()':
-        args = []
-    else:
-        args = tp
-
-    return CppCall(callee, method_name, args)
-
-@P.generate('ternary') # type: ignore
-def _P_ternary_expr():
-    cond = yield _P_expr
-
-    yield P.space() >> P.string('?') >> P.space()
-    if_b = yield _P_expr
-
-    yield P.space() >> P.string(':') >> P.space()
-    else_b = yield _P_expr
-
-    return CppTernary(cond, if_b, else_b)
-
-_P_primary_expr = P.try_choices(
-    (_P_num | _P_bool).map(CppValue) | _P_ident.map(CppVar),
-    _P_func_call,
-    _P_method_call,
-    P.between(P.string('('), P.string(')'), _P_ternary_expr)
-).desc('primary')
-
-_P_mul_expr = P.generate(_same_bin_level(_P_mul_div, _P_primary_expr))
-_P_add_expr = P.generate(_same_bin_level(_P_plus_minus, _P_mul_expr))
-
-_P_expr: P.Parser = P.try_choices(
-    _P_primary_expr,
-    _P_add_expr,
-    _P_ternary_expr
- ) # type: ignore
+    def __call__(self, cpp_expression: str) -> Union[
+            Tuple[CppAst, Literal[-1]],
+            Tuple[None, int]  # parse fails, return index
+        ]:
+        try:
+            return (self.expr.parse_strict(cpp_expression), -1)
+        except P.ParseError as pe:
+            return (None, pe.index)
+            
 
 
-def _parse_derivative_expression(cpp_expression: str) -> Optional[CppAst]:
-    print(cpp_expression)
-    return _P_expr.parse_strict(cpp_expression)
-    try:
-        return _P_expr.parse_strict(cpp_expression)
-    except P.ParseError:
-        return None
 
+_parse_derivative_expression = _ParsecCppExprParser()
+
+# simple test
+_parse_derivative_expression('f()')
+_parse_derivative_expression('a + b')
+_parse_derivative_expression('a.f().h(0) + 2.')
+_parse_derivative_expression('p.f(a ? b : c)')
 
 
 def parse_derivatives_yaml(
@@ -654,19 +738,24 @@ def parse_derivatives_yaml(
                 
         # endif in removed_incr_inp
         if result_tangent not in ['NOT_RESULT', 'auto_element_wise', 'auto_linear']:
-            ast = _parse_derivative_expression(result_tangent)
-
+            result_tangent = result_tangent.strip()
+            (ast, fail_pos) = _parse_derivative_expression(result_tangent)
             if ast is None:
+
+                pointer = ' ' * fail_pos + '>>>'
                 print(
                     f'{deriv_op_sig}\n\tParse failed'
-                    f'\n\t{result_tangent}\n'
+                    f'\n    RAW: {result_tangent}'
+                    f'\n         {pointer}'
+                    '\n'
                 )
 
-            else:
-                print(
-                    f'{deriv_op_sig}\n\tParse succeeded'
-                    f'\n\t{result_tangent}\n{ast}\n'
-                )
+            # else:
+                # print(
+                #     f'{deriv_op_sig}\n\tParse succeeded'
+                #     f'\n\tRAW: {result_tangent}\n\tRES: {ast}\n'
+                # )
+
 
 
         
