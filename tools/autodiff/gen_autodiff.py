@@ -422,7 +422,7 @@ class CppVar(CppAst):
 @dataclasses.dataclass
 class CppLiteral(CppAst):
     # Only one arg
-    value: Union[bool, int, float]
+    value: Union[bool, int, float, tuple]
 
     def __str__(self) -> str:
         return str(self.value)
@@ -511,15 +511,15 @@ import parsec as P
 
 class _ParsecCppExprParser:
     def __init__(self) -> None:
-        self.num = (P.decimal + P.optional(
-            P.string('.') >> P.optional(P.decimal)
-        )).map(self._combine_num).map(CppLiteral)
+        self.num = (
+            P.decimal + P.optional(P.string('.') >> P.optional(P.decimal))
+        ).map(self._combine_num).map(CppLiteral)
         self.boolean = (
             P.string('true').result(True) | P.string('false').result(False)
         ).map(CppLiteral)
+        # self.empty = P.string('{}').result(CppLiteral(()))
 
-        self.ident = P.regex(R'\w+')
-        self.qual_name = P.sepBy1(self.ident, P.string('::')).map(CppVar)
+        self.qual_name = P.sepBy1(P.regex(R'\w+'), P.string('::')).map(CppVar)
 
 
         # Basic expressions
@@ -528,7 +528,7 @@ class _ParsecCppExprParser:
 
 
         # Function/method calls
-        self.arg_list = P.sepBy(self.expr, P.string(',') + P.spaces())
+        self.arg_list = P.sepBy(self.expr, P.string(', '))
         self.args_tuple: 'P.Parser[List[CppAst]]' = P.between(
             P.string('('), P.string(')'), self.arg_list  # type: ignore
         )
@@ -539,13 +539,14 @@ class _ParsecCppExprParser:
             method_name, args = tp
             return lambda this: CppCall(this, method_name, args)
 
-        self.call_tail = self.args_tuple.map(
-            # primary ( args )
-            _to_function_call_ast_ctor
-        ) | (P.string('.') >> (self.qual_name + self.args_tuple)).map(
-            # primary . method_name ( args )
-            _to_method_call_ast_ctor
-        )
+        self.call_tail \
+            = self.args_tuple.map(_to_function_call_ast_ctor) \
+            | (
+                P.string('.') >> (self.qual_name + self.args_tuple)
+            ).map(
+                # primary . method_name ( args )
+                _to_method_call_ast_ctor
+            )
         self.call_expr = P.generate(self._call_expr)  # type: ignore
 
 
@@ -555,7 +556,7 @@ class _ParsecCppExprParser:
         # TODO in CPP cmp/bitwise ops aren't closed on numbers therefore can
         # be sequentially used, but we don't validate it.
         self.cmp_expr = self._make_binops_parser(
-            ['==', '>=', '<=', '>', '<'], self.add_expr, True
+            ['>', '<', '==', '>=', '<='], self.add_expr, True
         )
         self.bit_and = self._make_binops_parser('&', self.cmp_expr, True)
         self.bit_or = self._make_binops_parser('|', self.bit_and, True)
@@ -588,9 +589,10 @@ class _ParsecCppExprParser:
             lhs = yield sub_parser
             many_op_rhs = yield P.many(
                 (
-                    P.spaces() >> functools.reduce(
-                        P.choice, map(P.string, precendence_level)
-                    )
+                    # P.spaces() >> functools.reduce(
+                    #     P.choice, map(P.string, precendence_level)
+                    # )
+                    P.spaces() >> P.try_choices_longest(*map(P.string, precendence_level))
                 ) + (
                     P.spaces() >> sub_parser
                 )
@@ -630,9 +632,10 @@ class _ParsecCppExprParser:
     
     def _primary(self):
         unary = yield P.optional(P.one_of('-!'))
-        operand = yield self.num | self.qual_name | P.between(
-            P.string('('), P.string(')'), self.expr  # type: ignore
-        )
+
+        operand = yield self.num | self.boolean  | self.qual_name | P.between(
+                P.string('('), P.string(')'), self.expr  # type: ignore
+            )
 
         if unary is None:
             return operand
@@ -667,10 +670,16 @@ class _ParsecCppExprParser:
 _parse_derivative_expression = _ParsecCppExprParser()
 
 # simple test
-_parse_derivative_expression('f()')
-_parse_derivative_expression('a + b')
-_parse_derivative_expression('a.f().h(0) + 2.')
-_parse_derivative_expression('p.f(a ? b : c)')
+for _parse_testcase in [
+    'self_t'
+    'f(h())',
+    'a + b',
+    '(a < b).f()',
+    'a.f().h(0) + 2.',
+    'p.f(a ? b : c)',
+]:
+    _test_res, _test_pos = _parse_derivative_expression(_parse_testcase)
+    assert _test_res is not None, _parse_testcase
 
 
 def parse_derivatives_yaml(
