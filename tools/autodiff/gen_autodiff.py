@@ -708,30 +708,12 @@ def parse_derivatives_yaml(
                         f'\n\t{yaml_derivdef}\n'
                     )
                     continue
-        
-        # if result_tangent in ['auto_element_wise', 'auto_linear']:
-        #     if 'self' in derivdef:
-        #         self_expr = derivdef['self'].strip()
-        #         vars = _parse_derivative_expression2(deriv_opdef, self_expr)
-        #         for var in vars:
-        #             if 'jvp' not in var and 'backward' not in var:
-        #                 _vars.add(var)
-        #                 _auto.add(deriv_opdef)
-                
-        # # endif in removed_incr_inp
-        # if result_tangent not in ['NOT_RESULT', 'auto_element_wise', 'auto_linear']:
-        #     result_tangent = result_tangent.strip()
-        #     vars = _parse_derivative_expression2(deriv_opdef, result_tangent)
-        #     for var in vars:
-        #         if 'jvp' not in var and 'backward' not in var:
-        #             _vars.add(var)
-        #             _simple_results.add(deriv_opdef)
 
-            # else:
-                # print(
-                #     f'{deriv_op_sig}\n\tParse succeeded'
-                #     f'\n\tRAW: {result_tangent}\n\tRES: {ast}\n'
-                # )
+            # endif  # field in [RESULT, ...]
+
+        # endif special inplace
+
+    # endfor  #derive rule
 
     print('Nondiffable input types:', list(_audit_non_diffable_input_types.keys()))
 
@@ -739,8 +721,6 @@ def parse_derivatives_yaml(
 
     print(len(_auto))
     print(len(_simple_results))
-        
-
 
     return ([], [])
 
