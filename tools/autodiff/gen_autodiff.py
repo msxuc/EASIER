@@ -90,6 +90,16 @@ therefore can be categorized:
 """
 
 @dataclasses.dataclass
+class Param:
+    type: str
+    name: Optional[str]
+    
+    # NOTE `p=None` in yaml results in default="None" -- a str, not Python nil
+    default: Optional[str]
+
+    kind: Literal['positional', 'keyword', 'return']
+
+@dataclasses.dataclass
 class OpDef:
     # name is without overloading suffix
     name: str
@@ -105,6 +115,13 @@ class OpDef:
 
     # e.g. Tensor
     return_type: str
+
+    named_params: List[Param]
+
+    # certain ops do not have results, generally should be excluded in EASIER
+    named_return: Union[Param, List[Param], None]
+
+    
 
     # decision: Literal['']
 
@@ -174,12 +191,70 @@ def _parse_op_def(funcsig: str) -> OpDef:
     name_wo_suffix = name_w_suffix.split('.')[0]
     overloading_suffix = name_w_suffix[(len(name_wo_suffix)+1):]
 
+    params = param_list_str[1:-1].split(', ')
+    named_params: List[Param] = []
+
+    param_kind = 'positional'
+
+    for param in params:
+
+        if param == '*':
+            param_kind = 'keyword'
+            continue
+
+        defaults = param.split('=')
+        assert len(defaults) <= 2
+
+        if len(defaults) == 2:
+            default = defaults[1]  # maybe str "None"
+        else:
+            default = None  # Python nil object None
+        
+        type_name = defaults[0]
+        segs = type_name.split(' ')
+        param_name = segs[-1]
+        param_type = ' '.join(segs[:-1])  # e.g 
+        named_param = Param(param_type, param_name, default, param_kind)
+        named_params.append(named_param)
+
+    if return_type == '()':
+        named_return = None
+    
+    elif return_type.startswith('('):
+        return_items = return_type[1:-1].split(', ')
+
+        named_return = []
+        for return_item in return_items:
+            assert '=' not in return_item
+            segs = return_item.split(' ')
+            assert len(segs) <= 2
+            if len(segs) == 2:
+                item_name = segs[1]
+            else:
+                item_name = None
+            item_type = segs[0]
+            named_item = Param(item_type, item_name, None, 'return')
+            named_return.append(named_item)
+
+
+    else:
+        segs = return_type.split(' ')
+        assert len(segs) <= 2
+        if len(segs) == 2:
+            item_name = segs[1]
+        else:
+            item_name = None
+        item_type = segs[0]
+        named_return = Param(item_type, item_name, None, 'return')
+
     return OpDef(
         name=name_wo_suffix,
         overloading_suffix=overloading_suffix,
         func_type=func_type_str,
         param_list=param_list_str,
-        return_type=return_type
+        return_type=return_type,
+        named_params=named_params,
+        named_return=named_return
     )
 
 # Get all public, traceable, non-backprop operator definitions, e.g.
@@ -407,279 +482,16 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
     return opdefs, removed_inplace_ops
 
 
+TangentField: TypeAlias = Literal['RESULT', 'RESULT_N', 'NAMED_RESULT', 'UNKNOWN']
 
-@dataclasses.dataclass
-class CppAst:
-    pass
+def _parse_derivative_expression2(opdef: OpDef, field: TangentField, auto: bool, cpp_expr: str):
+    vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
+    assert len(vars) > 0
 
-@dataclasses.dataclass
-class CppVar(CppAst):
-    qual_name: List[str]
+    op_derived_terms = set(['grad'])
+    # for named_param in opdef.named_params
 
-    def __str__(self) -> str:
-        return "::".join(self.qual_name)
-
-@dataclasses.dataclass
-class CppLiteral(CppAst):
-    # Only one arg
-    value: Union[bool, int, float, tuple]
-
-    def __str__(self) -> str:
-        return str(self.value)
-
-@dataclasses.dataclass
-class CppCall(CppAst):
-    # f(arg[, arg+]) or ns::f(arg[, arg+]) or v.f(arg[, arg+])
-    this: Optional[CppAst]
-    func: CppVar
-    args: List[CppAst]
-
-    def __str__(self) -> str:
-        arg_list = ', '.join(map(str, self.args))
-        if self.this is None:
-            return f"{self.func}({arg_list})"
-        else:
-            this = str(self.this)
-            if type(self.this) in [CppUnaryOp, CppBinOpList, CppTernary]:
-                this = f'({this})'
-
-            return f"{this}.{self.func}({arg_list})"
-
-
-@dataclasses.dataclass
-class CppUnaryOp(CppAst):
-    op: Literal['-!']
-    operand: CppAst
-
-    def __str__(self) -> str:
-        operand = str(self.operand)
-        if type(self.operand) in [CppUnaryOp, CppBinOpList, CppTernary]:
-            operand = f'({operand})'
-        return f'{self.op}{operand}'
-
-
-@dataclasses.dataclass
-class CppBinOpList(CppAst):
-    # Same-precedence binary operations in a batch
-    head: CppAst
-    tail: List[Tuple[Literal['+', '-', '*', '/'], CppAst]]
-
-    def __str__(self) -> str:
-        return ' '.join(map(str, [self.head] + self.tail))
-
-
-@dataclasses.dataclass
-class CppTernary(CppAst):
-    cond: CppAst
-    if_b: CppAst
-    else_b: CppAst
-
-    def __str__(self) -> str:
-        return f'{self.cond} ? {self.if_b} : {self.else_b}'
-
-
-
-"""
-Simplified EBNF grammar for CPP expressions in yaml:
-
-# [] for optional, {} for 0 or more
-
-<expr>          ::= <ternary-expr>
-<ternary-expr>  ::= <cmp-expr> ["?" <expr> ":" <expr>]
-<cmp-expr>      ::= ...
-<add-expr>      ::= <mul-expr> { ("+" | "-") <mul-expr> }
-<mul-expr>      ::= <call-expr> { ("*" | "/") <call-expr> }
-<call-expr>     ::= <primary> { <call-tail> }
-<call-tail>     ::= <args-tuple> 
-                  | "." <identifier> <args-tuple>
-<args-tuple>    ::= "(" [ <arg-list> ] ")"
-<arg-list>      ::= <expr> { "," <expr> }
-<primary>       ::= "-" <primary>
-                  | <number>
-                  | <identifier>
-                  | <qualified-name>
-                  | "(" <expr> ")"
-<qualified-name>::= <identifier> { "::" <identifier> }
-
-# NOTE repeated <call-tail> means `f()()` is acceptable, but no such cases.
-
-The simplification does not work for all edge cases, we can handle those
-cases manually.
-"""
-
-import parsec as P
-
-class _ParsecCppExprParser:
-    def __init__(self) -> None:
-        self.num = (
-            P.decimal + P.optional(P.string('.') >> P.optional(P.decimal))
-        ).map(self._combine_num).map(CppLiteral)
-        self.boolean = (
-            P.string('true').result(True) | P.string('false').result(False)
-        ).map(CppLiteral)
-        # self.empty = P.string('{}').result(CppLiteral(()))
-
-        self.qual_name = P.sepBy1(P.regex(R'\w+'), P.string('::')).map(CppVar)
-
-
-        # Basic expressions
-        self.ternary = P.generate(self._ternary)  # type: ignore
-        self.expr: 'P.Parser[CppAst]' = self.ternary
-
-
-        # Function/method calls
-        self.arg_list = P.sepBy(self.expr, P.string(', '))
-        self.args_tuple: 'P.Parser[List[CppAst]]' = P.between(
-            P.string('('), P.string(')'), self.arg_list  # type: ignore
-        )
-
-        def _to_function_call_ast_ctor(args: List[CppAst]):
-            return lambda func_name: CppCall(None, func_name, args)
-        def _to_method_call_ast_ctor(tp: Tuple[CppVar, List[CppAst]]):
-            method_name, args = tp
-            return lambda this: CppCall(this, method_name, args)
-
-        self.call_tail \
-            = self.args_tuple.map(_to_function_call_ast_ctor) \
-            | (
-                P.string('.') >> (self.qual_name + self.args_tuple)
-            ).map(
-                # primary . method_name ( args )
-                _to_method_call_ast_ctor
-            )
-        self.call_expr = P.generate(self._call_expr)  # type: ignore
-
-
-        # Binary ops
-        self.mul_expr = self._make_binops_parser('*/', self.call_expr)
-        self.add_expr = self._make_binops_parser('+-', self.mul_expr)
-        # TODO in CPP cmp/bitwise ops aren't closed on numbers therefore can
-        # be sequentially used, but we don't validate it.
-        self.cmp_expr = self._make_binops_parser(
-            ['>', '<', '==', '>=', '<='], self.add_expr, True
-        )
-        self.bit_and = self._make_binops_parser('&', self.cmp_expr, True)
-        self.bit_or = self._make_binops_parser('|', self.bit_and, True)
-
-        self._lowest_bin = self.bit_or
-
-
-        # Primary values (l/r/xvalues in CPP, immediately carrying bytes)
-        self.primary: 'P.Parser[CppLiteral|CppVar|CppUnaryOp|CppAst]' = \
-            P.generate(self._primary)  # type: ignore
-    
-
-    def _ternary(self):
-        cond = yield self._lowest_bin
-        if_else = yield P.optional(
-            (P.string(' ? ') >> self.expr) + (P.string(' : ') >> self.expr)
-        )
-        if if_else is not None:
-            if_b, else_b = if_else
-            return CppTernary(cond, if_b, else_b)
-
-        else:
-            return cond
-    
-    def _make_binops_parser(
-        self, precendence_level: Sequence[str], sub_parser: 'P.Parser[CppAst]',
-        disable_sequential=False
-    ):
-        def _generator():
-            lhs = yield sub_parser
-            many_op_rhs = yield P.many(
-                (
-                    # P.spaces() >> functools.reduce(
-                    #     P.choice, map(P.string, precendence_level)
-                    # )
-                    P.spaces() >> P.try_choices_longest(*map(P.string, precendence_level))
-                ) + (
-                    P.spaces() >> sub_parser
-                )
-            )
-
-            if disable_sequential and len(many_op_rhs) > 1:
-                yield P.fail_with(f'Sequential binary ops')
-
-
-            if len(many_op_rhs) > 0:
-                return CppBinOpList(lhs, many_op_rhs)
-            else:
-                return lhs
-
-        return P.generate(_generator)  # type: ignore
-    
-    def _call_expr(self):
-        """
-        <call-expr>     ::= <primary> { <call-tail> }
-        <call-tail>     ::= <args-tuple> 
-                        | "." <identifier> <args-tuple>
-        <args-tuple>    ::= "(" [ <arg-list> ] ")"
-
-        Function call or chained method call.
-        """
-        p = yield self.primary
-        call_ast_ctors = yield P.many(self.call_tail)
-
-        if len(call_ast_ctors) > 0:
-            r = p
-            # Apply all invocations.
-            for ctor in call_ast_ctors:
-                r = ctor(r)
-            return r
-        else:
-            return p
-    
-    def _primary(self):
-        unary = yield P.optional(P.one_of('-!'))
-
-        operand = yield self.num | self.boolean  | self.qual_name | P.between(
-                P.string('('), P.string(')'), self.expr  # type: ignore
-            )
-
-        if unary is None:
-            return operand
-        else:
-            return CppUnaryOp(unary, operand)
-    
-    def _combine_num(
-        self, p_f: Tuple[int, Optional[int]]
-    ) -> Union[int, float]:
-        p, f = p_f
-
-        if f is None:
-            # no ".xxx" part, it's int
-            return p
-        else:
-            # floating number
-            f_str = str(p) + '.' + str(f)
-            return float(f_str)
-
-    def __call__(self, cpp_expression: str) -> Union[
-            Tuple[CppAst, Literal[-1]],
-            Tuple[None, int]  # parse fails, return index
-        ]:
-        try:
-            return (self.expr.parse_strict(cpp_expression), -1)
-        except P.ParseError as pe:
-            return (None, pe.index)
-            
-
-
-
-_parse_derivative_expression = _ParsecCppExprParser()
-
-# simple test
-for _parse_testcase in [
-    'self_t'
-    'f(h())',
-    'a + b',
-    '(a < b).f()',
-    'a.f().h(0) + 2.',
-    'p.f(a ? b : c)',
-]:
-    _test_res, _test_pos = _parse_derivative_expression(_parse_testcase)
-    assert _test_res is not None, _parse_testcase
+    return vars
 
 
 def parse_derivatives_yaml(
@@ -708,56 +520,212 @@ def parse_derivatives_yaml(
         for opdef in removed_incremental_inplace_ops
     }
 
-    for derivdef in torch_derivatives:
-        derivdef: dict
+    _audit_non_diffable_input_types: Dict[str, List[OpDef]] = {}
 
-        deriv_op_sig = cast(str, derivdef['name'])
+    _vars = set()
+
+    _simple_results = set()
+    _auto = set()
+
+    for yaml_derivdef in torch_derivatives:
+        yaml_derivdef: dict
+
+        deriv_op_sig = cast(str, yaml_derivdef['name'])
 
         # torch internal operators
         if deriv_op_sig.startswith('_'):
             continue
 
         deriv_opdef = _parse_op_def(deriv_op_sig)
-        result_tangent: str = derivdef.get('result', 'NOT_RESULT')
+
+        if deriv_opdef.name.endswith('_backward'):
+            continue
+
+        if 'dispatch' in yaml_derivdef:
+            yaml_derivdef = yaml_derivdef['dispatch']['Default']
+
+        field: TangentField
+        if 'result' in yaml_derivdef:
+            field = 'RESULT'
+        elif 'result0' in yaml_derivdef:
+            field = 'RESULT_N'
+        elif isinstance(deriv_opdef.named_return, list) and any(
+                named_res_item.name in yaml_derivdef
+                for named_res_item in deriv_opdef.named_return
+            ):
+            field = 'NAMED_RESULT'
+        else:
+            field = 'UNKNOWN'  # matmul alike
+
+
 
         if deriv_op_sig in removed_incr_inp_by_sig:
+            assert field == 'RESULT' or field == 'UNKNOWN'
             #
             # Why derivatives.yaml still has rules for INCREMENTAL inplace ops?
             # Check if there's anything special
             #
-            if result_tangent == 'NOT_RESULT':
-                print(
-                    f'{deriv_op_sig}\n\tdoes not have "result" tangent defined'
-                    f'\n\t{derivdef}\n'
-                )
-                continue
-            
-            elif result_tangent in ['auto_element_wise', 'auto_linear',
-                                        'self_t.zero_()',
-            ]:
-                continue
-                # else: default cases, follow EASIER rules:
-                # 1) calculate tangent as non-inplace, 2) setitem.
+            if field == 'RESULT':
+                tangent_expr: str = yaml_derivdef['result']
+                if tangent_expr in ['auto_element_wise', 'auto_linear', 'self_t.zero_()']:
+                    continue
+                    # else: default cases, follow EASIER rules:
+                    # 1) calculate tangent as non-inplace, 2) setitem.
+
+                else:
+                    print(
+                        f'{deriv_op_sig}\n\tinplace but does not have TRIVIAL result tangent:'
+                        f'\n\t{tangent_expr}\n'
+                    )
+                    continue
 
             else:
                 print(
-                    f'{deriv_op_sig}\n\tdoes not have TRIVIAL result tangent:'
-                    f'\n\t{result_tangent}\n'
+                    f'{deriv_op_sig}\n\tinplace but does not have "result" tangent defined'
+                    f'\n\t{yaml_derivdef}\n'
                 )
-                
-        # endif in removed_incr_inp
-        if result_tangent not in ['NOT_RESULT', 'auto_element_wise', 'auto_linear']:
-            result_tangent = result_tangent.strip()
-            (ast, fail_pos) = _parse_derivative_expression(result_tangent)
-            if ast is None:
+                continue
+        
+        else:
 
-                pointer = ' ' * fail_pos + '>>>'
-                print(
-                    f'{deriv_op_sig}\n\tParse failed'
-                    f'\n    RAW: {result_tangent}'
-                    f'\n         {pointer}'
-                    '\n'
-                )
+            # not for inplace ops
+            if field == 'RESULT':
+                tangent_expr: str = yaml_derivdef['result']
+                auto = tangent_expr in ['auto_element_wise', 'auto_linear']
+
+                if auto:
+                    if 'self' not in yaml_derivdef:
+                        print(
+                            f'{deriv_op_sig}\n\tis auto but does not have "self" tangent defined'
+                            f'\n\t{yaml_derivdef}\n'
+                        )
+                        continue
+                    
+                    else:
+                        tangent_expr = yaml_derivdef['self']
+                
+                else:
+                    pass
+
+                tangent_expr = tangent_expr.strip()
+                vars = _parse_derivative_expression2(deriv_opdef, field, auto, tangent_expr)
+            
+            elif field == 'RESULT_N':
+                assert isinstance(deriv_opdef.named_return, list)
+
+                for i in range(len(deriv_opdef.named_return)):
+
+                    if f'result{i}' not in yaml_derivdef:
+                        # Not used but check it's consistent
+                        if 'output_differentiability' in yaml_derivdef:
+                            output_diffables: List[bool] = yaml_derivdef['output_differentiability']
+                            assert output_diffables[i] == False
+                        # Assert no mixed use of resultN and result item name
+                        assert deriv_opdef.named_return[i].name not in yaml_derivdef
+                        continue
+
+                    tangent_expr_i: str = yaml_derivdef[f'result{i}']
+                    tangent_expr_i = tangent_expr_i.strip()
+
+                    assert not tangent_expr_i.startswith('auto')
+                    auto = False
+
+                    vars = _parse_derivative_expression2(deriv_opdef, field, auto, tangent_expr_i)
+                
+            else:
+
+                # Check output_differentiabilty
+                if 'output_differentiability' in yaml_derivdef:
+                    output_diffables: List[bool] = yaml_derivdef['output_differentiability']
+                    if isinstance(deriv_opdef.named_return, list):
+                        assert len(output_diffables) == len(deriv_opdef.named_return)
+                    else:
+                        assert len(output_diffables) == 1
+
+                    if not any(output_diffables):
+                        # No output propagate tangents
+                        # print(
+                        #     f'{deriv_op_sig}\n\tdoes not have differentiable output'
+                        #     f'\n\t{yaml_derivdef}\n'
+                        # )
+                        continue
+
+                # Check if input is marked non-diff-able, or its type is effectively non-diff-able
+                # NOTE this does not fully identify non-diff-able inputs
+                input_marked_as_non_diffables = []
+                special_type_nondiffable_input = False
+                for p in deriv_opdef.named_params:
+                    if 'Tensor' not in p.type:
+                        _audit_non_diffable_input_types.setdefault(p.type, []).append(deriv_opdef)
+                        special_type_nondiffable_input = True
+                        input_marked_as_non_diffables.append(True)
+                    else:
+                        input_marked_as_non_diffables.append(
+                            yaml_derivdef.get(p.name, "") == "non_differentiable"
+                        )
+                if all(input_marked_as_non_diffables):
+                    # No input propagate tangents
+
+                    # if special_type_nondiffable_input:
+                    #     # Only warn to ensure `'Tensor' not in` assumption.
+                    #     print(
+                    #         f'{deriv_op_sig}\n\tdoes not have differentiable input (w/ special input type)'
+                    #         f'\n\t{yaml_derivdef}\n'
+                    #     )
+
+                    continue
+                
+                # field in [RESULT, RESULT_N] are handled before
+                for k in yaml_derivdef.keys():
+                    assert not k.startswith('result')
+                
+                # If an input is still diffable and handled, its field in yaml
+                # is its name.
+                inputs_handled = [False] * len(deriv_opdef.named_params)
+                for i, (marked_non_diffable, p) in enumerate(
+                    more_itertools.zip_equal(
+                        input_marked_as_non_diffables, deriv_opdef.named_params
+                    )
+                ):
+                    if marked_non_diffable:
+                        continue
+
+                    if p.name in yaml_derivdef:
+                        inputs_handled[i] = True
+                
+                if all(
+                    nondiff or handled for nondiff, handled
+                    in more_itertools.zip_equal(
+                        input_marked_as_non_diffables, inputs_handled
+                    )
+                ):
+                    continue
+            
+                else:
+
+                    print(
+                        f'{deriv_op_sig}\n\ttangent unknown'
+                        f'\n\t{yaml_derivdef}\n'
+                    )
+                    continue
+        
+        # if result_tangent in ['auto_element_wise', 'auto_linear']:
+        #     if 'self' in derivdef:
+        #         self_expr = derivdef['self'].strip()
+        #         vars = _parse_derivative_expression2(deriv_opdef, self_expr)
+        #         for var in vars:
+        #             if 'jvp' not in var and 'backward' not in var:
+        #                 _vars.add(var)
+        #                 _auto.add(deriv_opdef)
+                
+        # # endif in removed_incr_inp
+        # if result_tangent not in ['NOT_RESULT', 'auto_element_wise', 'auto_linear']:
+        #     result_tangent = result_tangent.strip()
+        #     vars = _parse_derivative_expression2(deriv_opdef, result_tangent)
+        #     for var in vars:
+        #         if 'jvp' not in var and 'backward' not in var:
+        #             _vars.add(var)
+        #             _simple_results.add(deriv_opdef)
 
             # else:
                 # print(
@@ -765,8 +733,12 @@ def parse_derivatives_yaml(
                 #     f'\n\tRAW: {result_tangent}\n\tRES: {ast}\n'
                 # )
 
+    print('Nondiffable input types:', list(_audit_non_diffable_input_types.keys()))
 
+    print(sorted(_vars))
 
+    print(len(_auto))
+    print(len(_simple_results))
         
 
 
@@ -815,7 +787,7 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
 """
     )
 
-    _P_args = CliArgs(**vars(parser.parse_args()))
+    cliargs = CliArgs(**vars(parser.parse_args()))
 
     # if args.mode == 'collect_op_names':
     if True:
@@ -831,7 +803,7 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
         differentiable or not, so autodiff process will be interrupted and
         the user can define a custom derivative rule as a temporary solution.
         """
-        opdefs, removed_inplace_ops = parse_native_functions_yaml(_P_args)
+        opdefs, removed_inplace_ops = parse_native_functions_yaml(cliargs)
 
         op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
         with open(op_names_fp, 'w') as op_names_fs:
@@ -843,4 +815,4 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
             )
 
     
-        parse_derivatives_yaml(_P_args, opdefs, removed_inplace_ops)
+        parse_derivatives_yaml(cliargs, opdefs, removed_inplace_ops)
