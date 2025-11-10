@@ -484,11 +484,39 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
 
 TangentField: TypeAlias = Literal['RESULT', 'RESULT_N', 'NAMED_RESULT', 'UNKNOWN']
 
+_torch_ad_functions_manual: Set[str] = set()
+_audit_involve_backward: Set[OpDef] = set()
+
+_audit_op_only_derivs: Set[OpDef] = set()
+
 def _parse_derivative_expression2(opdef: OpDef, field: TangentField, auto: bool, cpp_expr: str):
     vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
     assert len(vars) > 0
 
-    op_derived_terms = set(['grad'])
+    op_derived_terms = set()
+    for p in opdef.named_params:
+        op_derived_terms.add(p.name)
+        op_derived_terms.add(f'{p.name}_p')
+        op_derived_terms.add(f'{p.name}_t')
+        op_derived_terms.add(f'original_{p.name}_p')
+        op_derived_terms.add(f'original_{p.name}_t')
+    
+
+    for v in vars:
+        if v not in op_derived_terms:
+            if '_backward' in v and v not in _torch_ad_functions_manual:
+                _audit_involve_backward.add(opdef)
+
+            if '_vjp' in v or '_backward' in v:
+                break
+            if not (hasattr(torch, v) or v in ['maybe_multiply']):
+                break
+    else:
+        _audit_op_only_derivs.add(opdef)
+
+        
+
+
     # for named_param in opdef.named_params
 
     return vars
@@ -502,6 +530,14 @@ def parse_derivatives_yaml(
 #   Parse derivatives.yaml   #
 ##############################
 """)
+    
+    functions_manual_fp = os.path.join(
+        args.pytorch_codebase, 'torch/csrc/autograd/FunctionsManual.h'
+    )
+    with open(functions_manual_fp, 'r') as fm_fs:
+        fm_header_str = fm_fs.read()
+    header_vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', fm_header_str)
+    _torch_ad_functions_manual.update(header_vars)
 
     derivatives_yaml_fp = os.path.join(
         args.pytorch_codebase, 'tools/autograd/derivatives.yaml'
@@ -717,10 +753,20 @@ def parse_derivatives_yaml(
 
     print('Nondiffable input types:', list(_audit_non_diffable_input_types.keys()))
 
-    print(sorted(_vars))
+    # print(sorted(_vars))
 
-    print(len(_auto))
-    print(len(_simple_results))
+    # print(len(_auto))
+    # print(len(_simple_results))
+
+    print(
+        len(_audit_op_only_derivs),
+        sorted(set(op.get_name_with_suffix() for op in _audit_op_only_derivs))
+    )
+
+    print(
+        len(_audit_involve_backward),
+        sorted(set(op.get_name_with_suffix() for op in _audit_involve_backward))
+    )
 
     return ([], [])
 
