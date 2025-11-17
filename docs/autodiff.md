@@ -552,6 +552,8 @@ Open questions about `jacfwd`:
         are extracted using `ElemPart` (because of fully fledged compilation in Step 2) and previous results/rules.
 
         **This is mainly for operators with complicated shape-dependent decision space.**
+
+        Nonetheless, this also save us from redundant calculation of shapes/dtypes etc.
     
     Remarks:
 
