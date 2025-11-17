@@ -476,6 +476,107 @@ Open questions about `jacfwd`:
     **Challenge**: we may need to dynamically re-layout distributed tensors.
 
 
+## Implementation of EASIER JVP
+
+### Principles
+
+1.  Metadata shape/dtype/role etc. should be stable, value-independent.
+
+    Currently as a simplified `JitEngine` rule, we enforce runtime values must have the same metadata across iterations.
+    Previously we have also proposed acceptance of changes, and it results in JIT re-codegen for certain operations.
+
+    However, metadata stableness is more important, because if a primal operation can have its shape changed,
+    the _structure_ of the derived sub-Graph for calculating the operation's JVP may change dramatically.
+
+    So, we can accept that the JVP calculation of an operation is shape-dependent, as long as we ensure shape-stableness
+    in EASIER.
+
+1.  Audit JVP rule for every operator even it's auto-generated.
+
+    Although we can leverage PyTorch built-in AD functionality to generate JVP for some operators,
+    we still need to audit JVP sub-Graph (or the generation of the sub-Graph) of every operator.
+
+    This is to exclude value-dependency, view-reusing etc.
+
+    E.g. PyTorch built-in JVP for `torch.prod(x, dim=-1)` results in `torch.ones([]).expand_as(X)` without extra `clone()`.
+
+    Remarks:
+
+    -   The requirement of value-independency and audit arguably stops us from
+        directly and blindly calling `torch.func.jvp` in runtime,
+        but legitimizes AOT and higher-order AD, for example, we can determine the
+        JVP sub-Graph by providing **zero inputs in compile-time**,
+        or **whatever legal inputs in dev-time** to author the JVP rule.
+
+    -   JVP rules for some operators (a typical example is `matmul`) may have
+        a complicated decision space i.e. conditioning on shapes.
+        For such operators, instead of transforming the generation of JVP sub-Graph into code,
+        we may use some light-weight transformation utilities like adding `clone()` calls
+        on `torch.func.jvp()`-resultant FX Graphs of those operators.
+
+        What's more, such utilities also ease cases like `torch.prod` above,
+        no matter it's compile-time or dev-time.
+
+    -   Pay attention to any operators with combined cases to a extreme extent:
+        1) legal inputs are not trivially zeros;
+        2) the shape-dependent decision space is complicated.
+
+1.  Handle the propagation/transformation per-Node, as we have at least nested
+    Module calls, which should result in an individual JVP Module for that nested
+    Module.
+
+    Such nested Module do not have a dataflow-like reference on input/output Tensors
+    and make it harder to leverage PyTorch built-in JVP mechanism on Graph level.
+
+
+### AOT passes
+
+1.  When calling `easier.jvp`, decide input/output tangent Tensor instances,
+    since target input/output Tensors have been specified.
+
+2.  In `easier.compile` and AOT passes, distribute and rewrite the _raw_ Module
+    (may be another pre-existing JVP Module yet to be generated).
+
+    Distribution is necessary, otherwise we may not be able to run the raw Module because it cannot fit in one machine.
+
+3.  Still in `easier.compile`, per-Node propagates and generates JVP calculation:
+
+    1.  If not involving tangent calculation, keep the Node unchanged;
+
+    2.  If the operator has predefined JVP rule (e.g. legal inputs are not zeros, PyTorch-built-in JVP is value-dependent)
+    transform it using the rule.
+
+        **The predefined rule should define the how the result shapes/dtypes etc. are calculated.**
+
+    3.  Otherwise, **Run the operator** using zero values, and their shapes/dtypes
+        are extracted using `ElemPart` (because of fully fledged compilation in Step 2) and previous results/rules.
+
+        **This is mainly for operators with complicated shape-dependent decision space.**
+    
+    Remarks:
+
+    -   For step 3 we can leverage `JitEngine` infrastructure (although during `easier.compile`)
+
+    -   For higher-order AD, Step 2 and 3 should be done recursively.
+
+4.  Taking new JVP Nodes as well as new Selector/Reducer instances injected for JVP of Reducers/aggregators,
+    redo tensor_grouping, partitioning, rewriting etc.
+
+
+### Open questions about JVP
+
+-   Aggregator `easier.prod` is likely non-differentiable currently.
+
+    If follow the idea of JVP for Reducer-using-prod, the resultant Selector will be too huge -- $O(\text{len}(idx)^2)$.
+
+    An alternative way is to do `cumprod` **along the batch dim**, which isn't compatible with EASIER semantics
+    until we add mechanism for manipulation on batch dim.
+
+    E.g. `cumprod` generate two vectors with one position shifted:
+    $[1, a, ab, abc]$ and $[bcd, cd, d, 1]$, then the element-wise product is
+    $[t_a bcd, a t_b cd, ab t_c d, abc t_d]$.
+
+
 ## Open questions about AD
 
 1.  Dense Jacobian matrix for optimization problems

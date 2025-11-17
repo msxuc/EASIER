@@ -1186,6 +1186,15 @@ class JitEngine:
         # ms, gs = passes.codegen(ms, gs)
 
         [self.module], [self.graph] = ms, gs
+    
+    def evaluate_node(
+        self,
+        root: esr.Module,
+        node: Node,
+        args: List[RuntimeValue],
+        kwargs: Dict[str, RuntimeValue]
+    ) -> RuntimeValue:
+        return evaluate_node(root, node, args, kwargs)
 
     def forward(self):
         """
@@ -1229,7 +1238,7 @@ class JitEngine:
                 # Only if none of the preprocess steps breaks
                 # can we eval the Node;
                 # Otherwise it means the Node should be skipped.
-                res = evaluate_node(self.module, node, args, kwargs)
+                res = self.evaluate_node(self.module, node, args, kwargs)
             else:
                 res = jit_skipped
 

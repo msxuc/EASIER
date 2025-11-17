@@ -257,6 +257,10 @@ def _parse_op_def(funcsig: str) -> OpDef:
         named_return=named_return
     )
 
+
+
+_audit_nondecompable_backward_ops = set()
+
 # Get all public, traceable, non-backprop operator definitions, e.g.
 # "all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
 def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef]]:
@@ -268,6 +272,30 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
         funcdefs: list = yaml.safe_load(yaml_fs)
 
     opdefs: List[OpDef] = []
+
+
+#
+##########################
+
+    decomp_able_namesuffix = set()
+    import torch.nn.functional
+    import torch._decomp as _D
+    import torch._inductor.decomposition as _ID
+    # for decomp_k, decomp_v in _ID.decompositions.items():
+    for decomp_k, decomp_v in _D.decomposition_table.items():
+        if decomp_k.namespace != 'aten':
+            continue
+
+        if decomp_k._can_decompose:
+            name = decomp_k._opname
+            overload = decomp_k._overloadname
+            if overload == 'default':
+                overload = ''
+            decomp_able_namesuffix.add((name, overload))
+        
+##########################
+#
+
 
     # Collect all public, traceable ops
     for funcdef in funcdefs:
@@ -284,7 +312,13 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
 
         # Exclude backprop-only ops
         if opdef.name.endswith('_backward'):
-            continue
+
+            k = (opdef.name, opdef.overloading_suffix)
+            if k not in decomp_able_namesuffix:
+                _audit_nondecompable_backward_ops.add(opdef)
+
+            # continue
+
 
         # Exclude Tensor-creators like zeros/eye etc. as they don't get traced
         # or appear on FX Graph.
@@ -478,7 +512,7 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
         
 
     opdefs = list(filter(lambda d: d not in removed_inplace_ops, opdefs))
-    
+
     return opdefs, removed_inplace_ops
 
 
@@ -511,6 +545,8 @@ def _parse_derivative_expression2(opdef: OpDef, field: TangentField, auto: bool,
                 break
             if not (hasattr(torch, v) or v in ['maybe_multiply']):
                 break
+
+            assert not v.startswith('_')
     else:
         _audit_op_only_derivs.add(opdef)
 
@@ -563,6 +599,8 @@ def parse_derivatives_yaml(
     _simple_results = set()
     _auto = set()
 
+    _audit_backward_ops_in_deriv = set()
+
     for yaml_derivdef in torch_derivatives:
         yaml_derivdef: dict
 
@@ -575,6 +613,9 @@ def parse_derivatives_yaml(
         deriv_opdef = _parse_op_def(deriv_op_sig)
 
         if deriv_opdef.name.endswith('_backward'):
+
+            _audit_backward_ops_in_deriv.add(deriv_opdef)
+
             continue
 
         if 'dispatch' in yaml_derivdef:
@@ -623,6 +664,11 @@ def parse_derivatives_yaml(
                 continue
         
         else:
+            #
+            # TODO currently we don't parse deriv rule by ourselves
+            #
+            continue
+            
 
             # not for inplace ops
             if field == 'RESULT':
@@ -768,6 +814,18 @@ def parse_derivatives_yaml(
         sorted(set(op.get_name_with_suffix() for op in _audit_involve_backward))
     )
 
+
+    for nondecomp_bw_op in sorted(
+        _audit_nondecompable_backward_ops, key=lambda p: p.name
+    ):
+        print("Nondecompable backward op", nondecomp_bw_op.get_name_with_suffix())
+
+    for nondecomp_bw_op in sorted(filter(
+        lambda op: op not in _audit_backward_ops_in_deriv,
+        _audit_nondecompable_backward_ops 
+    ), key=lambda p: p.name):
+        print("Nondiffable backward op", nondecomp_bw_op.get_name_with_suffix())
+
     return ([], [])
 
 
@@ -839,6 +897,8 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
                 sort_keys=False,
                 width=float("inf")
             )
+        
+
 
     
         parse_derivatives_yaml(cliargs, opdefs, removed_inplace_ops)

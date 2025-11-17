@@ -4,7 +4,7 @@
 import contextlib
 import dataclasses
 import operator
-from typing import Callable, Dict, List, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
+from typing import Callable, Collection, Dict, List, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
 
 import torch
 from torch.fx import Node, Graph
@@ -33,6 +33,9 @@ class Jvp(esr.Module):
     
     def forward(self):
         raise EasierJitException()
+
+
+
     
 
 """
@@ -464,11 +467,71 @@ class JvpTransformer(EasierInterpreter):
 
         return super().if_call_module(submod)
 
+
+class LazyJvpModule(esr.Module):
+    def __init__(self, primal_module: esr.Module, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor]):
+        super().__init__()
+
+        self._check_dup_args(inputs, 'inputs')
+        self._check_dup_args(outputs, 'outputs')
+
+        
+        # TODO the primal module may also be a placeholder JvpModule
+        self.easier_primal_module: esr.Module = primal_module
+
+
+        # nn.ParamList is not actually a Sequence[Tensor] because it lacks
+        # __contains__.
+        self.inputs: Sequence[esr.Tensor] = \
+            torch.nn.ParameterList(inputs)  # type: ignore
+        self.outputs: Sequence[esr.Tensor] = \
+            torch.nn.ParameterList(outputs)  # type: ignore
+
+
+        # TODO how about tangents_in tangents_out?
+        self.vectors: Sequence[esr.Tensor] = torch.nn.ParameterList(
+            self._args_zerolike(inputs, 'inputs')
+                          )  # type: ignore
+        self.products: Sequence[esr.Tensor] = torch.nn.ParameterList(
+            self._args_zerolike(outputs, 'outputs')
+        )  # type: ignore
+    
+    
+    def _check_dup_args(self, args: Sequence[esr.Tensor], param_name: str):
+        counts = {}
+        for arg in args:
+            counts.setdefault(arg, 0)
+            counts[arg] += 1
+        for arg, c in counts.items():
+            if c > 1:
+                pos = args.index(arg)
+                raise ValueError(
+                    f"The {pos}-th easier.Tensor gets specified {c} times"
+                    f" in {param_name}"
+                )
+    
+    def _args_zerolike(self, args: Sequence[esr.Tensor], param_name: str):
+        for pos, arg in enumerate(args):
+            if not arg.dtype.is_floating_point:
+                raise ValueError(
+                    f"The {pos}-th easier.Tensor does not have floating-point"
+                    f" dtype in {param_name}"
+                )
+
+            yield esr.Tensor(
+                esr.zeros_like(arg),
+                mode=('partition' if arg.is_partition else 'replicate')
+            )
+    
+    def forward(self):
+        assert False, "not callable"
+
+
 def jvp(
     module: esr.Module,
     inputs: Sequence[esr.Tensor],
     outputs: Sequence[esr.Tensor]
-) -> Jvp:
+) -> LazyJvpModule:
     """
     Remarks:
     -   Input and output easier.Tensors are all mutable.
@@ -481,30 +544,11 @@ def jvp(
     -   In `inputs` or `outputs`, the same easier.Tensor instance cannot be
         specified twice.
     """
-    def _check_dup_arg(args: Sequence[esr.Tensor], param_name: str):
-        counts = {}
-        for arg in args:
-            counts.setdefault(arg, 0)
-            counts[arg] += 1
-        for arg, c in counts.items():
-            if c > 1:
-                pos = args.index(arg)
-                raise ValueError(
-                    f"The {pos}-th easier.Tensor gets specified {c} times"
-                    f" in {param_name}"
-                )
-    _check_dup_arg(inputs, 'inputs')
-    _check_dup_arg(outputs, 'outputs')
 
+    jvpm = LazyJvpModule(module, inputs, outputs)
 
-
-    # TODO the resultant Jvp module should be disconnected from `module`
-    # in a way that get_easier_object(jvp) does not include moudle.
     # TODO assign meaningful names to:
     # - Jvp.inputs, like `x` if input is InputModule.x
     # - Jvp.vector, like `tan_x`
 
-
-    jvp_transformer = JvpTransformer(module).run()
-
-    return Jvp()
+    return jvpm
