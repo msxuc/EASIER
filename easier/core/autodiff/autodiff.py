@@ -12,6 +12,9 @@ from torch.nn.modules import Module
 
 from easier.core.jit import EasierTracer
 import easier.core.module as esr
+from easier.core.passes.tensor_grouping import group_tensors, get_node_tensor_group
+from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
+from easier.core.runtime.metadata import Role, RuntimeTensorMeta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
     get_torch_func_inplace_arg, get_easier_tensors, get_attr_value
@@ -446,26 +449,63 @@ class JvpTransformer(EasierInterpreter):
     the result of this is that there won't be explicit easier.Tensors to
     store tangents at the boundary of nested easier.Modules.
     """
-    def __init__(self, root_jvp: esr.Module, module: esr.Module):
+    def __init__(
+        self,
+        # TODO wrap to Ctx obj
+        root_jvp: esr.Module,
+
+        module: esr.Module
+    ):
         # All referenced nested esr.Modules will be created a paired sub
         # Jvp module, cached by instance.
         self.root_jvp = root_jvp
+
         graph = EasierTracer().trace(module)
 
-        super().__init__([module], [graph])
+        [module], [graph] = group_tensors([module], [graph])
 
+        super().__init__([module], [graph])
+    
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+        
+        ng = get_node_tensor_group(self.current_node)
+        if ng is None:
+            role = Role.REPLICATED
+        else:
+            role = Role.DISTRIBUTED
+
+        def _meta_from_shape_dtype(shape, dtype):
+            return RuntimeTensorMeta(role, shape, dtype)
+
+        runtime_meta = get_value_runtime_info(
+            self.current_module, self.current_node, attr_val, _meta_from_shape_dtype
+        )
+
+        set_node_meta(self.current_node, runtime_meta)
+
+
+
+    def if_call_function(self, function: Callable):
+        return super().if_call_function(function)
+    
+    def if_call_method(self, method_name: str):
+        return super().if_call_method(method_name)
 
     def if_call_module(self, submod: Module):
         if isinstance(submod, esr.Module):
+            raise NotImplementedError()
             # Nested easier.Module, must be JVP-ed.
             sub_jvp_transformer = JvpTransformer(self.root_jvp, submod).run()
 
 
-
-        else:
+        elif isinstance(submod, esr.Selector):
             1
 
-        return super().if_call_module(submod)
+        elif isinstance(submod, esr.Reducer):
+            assert submod.reduce == 'sum'
+
+        else:
+            assert False, 'unreachable'
 
 
 class LazyJvpModule(esr.Module):

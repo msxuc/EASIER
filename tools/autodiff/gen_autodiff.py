@@ -601,6 +601,8 @@ def parse_derivatives_yaml(
 
     _audit_backward_ops_in_deriv = set()
 
+    _audit_deriv_ops: List[OpDef] = []
+
     for yaml_derivdef in torch_derivatives:
         yaml_derivdef: dict
 
@@ -667,6 +669,9 @@ def parse_derivatives_yaml(
             #
             # TODO currently we don't parse deriv rule by ourselves
             #
+
+            _audit_deriv_ops.append(deriv_opdef)
+
             continue
             
 
@@ -814,17 +819,34 @@ def parse_derivatives_yaml(
         sorted(set(op.get_name_with_suffix() for op in _audit_involve_backward))
     )
 
+    _op_multi_overloads = {}
+    _deriv_op_names = set(do.get_name_with_suffix() for do in _audit_deriv_ops)
+    for op in opdefs:
+        _op_multi_overloads.setdefault(op.name, []).append(op)
+    for name, ops in _op_multi_overloads.items():
+        if len(ops) > 1:
+            missing = False
+            for oo in ops:
+                if oo.get_name_with_suffix() not in _deriv_op_names:
+                    print(f'NO DERIV {oo}')
+                    missing = True
+            
+            if missing:
+                for oo in ops:
+                    if oo.get_name_with_suffix() in _deriv_op_names:
+                        print(f'W/ DERIV {oo}')
+                print('\n')
 
-    for nondecomp_bw_op in sorted(
-        _audit_nondecompable_backward_ops, key=lambda p: p.name
-    ):
-        print("Nondecompable backward op", nondecomp_bw_op.get_name_with_suffix())
+    # for nondecomp_bw_op in sorted(
+    #     _audit_nondecompable_backward_ops, key=lambda p: p.name
+    # ):
+    #     print("Nondecompable backward op", nondecomp_bw_op.get_name_with_suffix())
 
-    for nondecomp_bw_op in sorted(filter(
-        lambda op: op not in _audit_backward_ops_in_deriv,
-        _audit_nondecompable_backward_ops 
-    ), key=lambda p: p.name):
-        print("Nondiffable backward op", nondecomp_bw_op.get_name_with_suffix())
+    # for nondecomp_bw_op in sorted(filter(
+    #     lambda op: op not in _audit_backward_ops_in_deriv,
+    #     _audit_nondecompable_backward_ops 
+    # ), key=lambda p: p.name):
+    #     print("Nondiffable backward op", nondecomp_bw_op.get_name_with_suffix())
 
     return ([], [])
 

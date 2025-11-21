@@ -6,8 +6,44 @@ import pytest
 import torch
 
 import easier.core.module as esr
-from easier.core.autodiff.autodiff import TangentFlowPropagator, GlobalTangentFlowPropCtx
+from easier.core.autodiff.autodiff import JvpTransformer #TangentFlowPropagator, GlobalTangentFlowPropCtx
 
+
+@pytest.mark.usefixtures('dummy_dist_env')
+class TestJvpTransformation:
+    def test_mul_t_t(self):
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+
+                # have tangent
+                self.v1 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
+                self.v2 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
+                self.r1 = esr.Tensor(torch.rand(3).double(), mode='partition')
+
+                # no tangent
+                self.v3 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
+                self.r2 = esr.Tensor(torch.rand(3).double(), mode='partition')
+
+                self.res = esr.Tensor(esr.zeros([10, 3], dtype=torch.float64), mode='partition')
+
+            
+            def forward(self):
+                v2 = self.v1 * self.v2
+                v3 = self.v1 * self.v3
+                r1 = self.v1 * self.r1
+                r2 = self.v1 * self.r2
+                c1 = self.v1 * 5
+
+                self.res[:] = v2 + v3 + r1 + r2 + c1
+        
+        raw = M()
+        jvp_transfomer = JvpTransformer(raw, raw).run()
+        
+
+
+
+@pytest.mark.skip
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestTangentFlowProp:
     def test_forward_prop(self):
