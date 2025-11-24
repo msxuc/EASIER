@@ -17,16 +17,19 @@ class Differentiability:
     # And each overloading lattice corresponds to a certain number of params.
 
     # The names for params that are differentiable.
-    # Must be a subset of `params`.
+    # Generally the param names are not ordered within this dataclass.
     diffable_params: List[str]
 
-    # The second field is the default value
+    # The second field is the default value.
     # NOTE A mandatory param without default value will still have the second
     # field be None, and will be overwritten by callsite non-None value.
+    #
+    # Generally the param names are not ordered within this dataclass.
     other_params: List[Tuple[str, object]] = dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
-    # than a constant.
+    # than a constant, e.g.
+    # `output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]`
     output: Union[Literal[True], List[bool]] = True
 
     def all_param_names(self) -> Set[str]:
@@ -44,6 +47,11 @@ class Differentiability:
 
 tangent_rules: Dict[Callable, List[Tuple[Differentiability, Callable]]] = {}
 
+def setitem(
+    self_p, index, value_p,
+    value_t
+):
+    return value_t
 
 # TODO add decorator on functions for these cases
 # tangent_rules[torch.div] = []

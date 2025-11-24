@@ -8,7 +8,7 @@ from typing import Callable, Collection, Dict, List, Optional, Self, Sequence, T
 
 import more_itertools
 import torch
-from torch.fx import Node, Graph
+from torch.fx import Node, Graph, GraphModule
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.modules import Module
 
@@ -474,10 +474,9 @@ class JvpTransformer(EasierInterpreter):
         ng = get_node_tensor_group(self.current_node)
         if ng is None:
             role = Role.REPLICATED
+
         else:
             role = Role.DISTRIBUTED
-
-        if role == Role.DISTRIBUTED:
             shape = (1000,) + shape[1:]
 
         return RuntimeTensorMeta(role, shape, dtype)
@@ -533,8 +532,11 @@ class JvpTransformer(EasierInterpreter):
                 f" with Differentiabilities {dfbs}," \
                 f" get {raw_kwargs}"
         
-        jvp_kwargs = {}  # primals and constants
-        jvp_tangents = {}  # tangents only
+        # Some diffable parameters are given as literals e.g. "add(x, 3)"
+        # and we need to convert them to replicated tensors to simplify
+        # the generated tangent sub-Graph.
+        jvp_diff_primals = {}
+        jvp_tangents = {}
         
         for diff_param in dfb.diffable_params:
             diff_param: str
@@ -549,11 +551,11 @@ class JvpTransformer(EasierInterpreter):
                 # Take a small-sized float32 dtype.
                 diff_arg = torch.zeros([], dtype=torch.float32)
 
-                jvp_kwargs[diff_param] = diff_arg
+                jvp_diff_primals[diff_param] = diff_arg
                 jvp_tangents[diff_param] = diff_arg.clone()
             
             else:
-                jvp_kwargs[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
+                jvp_diff_primals[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
                 jvp_tangents[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
         
         other_kwargs = {}
@@ -575,7 +577,7 @@ class JvpTransformer(EasierInterpreter):
         # API param list.
         # The names and the zero Tensors must be in the same order.
         diff_arg_names: List[str] = dfb.diffable_params
-        diff_args = tuple(map(jvp_kwargs.__getitem__, diff_arg_names))
+        diff_primals = tuple(map(jvp_diff_primals.__getitem__, diff_arg_names))
         tangents = tuple(map(jvp_tangents.__getitem__, diff_arg_names))
 
         # Other non-differentiable parameters must NOT be passed via jvp()
@@ -598,8 +600,8 @@ class JvpTransformer(EasierInterpreter):
         ):
             return torch.func.jvp(_primal_func, primals, tangents)
         
-        gm = make_fx(_jvp)(diff_args, tangents)
-        y, jvp_res = gm(diff_args, tangents)
+        gm: GraphModule = make_fx(_jvp)(diff_primals, tangents)
+        y, jvp_res = gm(diff_primals, tangents)
 
         
         ng = get_node_tensor_group(self.current_node)
@@ -607,7 +609,6 @@ class JvpTransformer(EasierInterpreter):
             role = Role.REPLICATED
         else:
             role = Role.DISTRIBUTED
-        
 
         y_meta = get_value_runtime_info(self.current_node, y, self._fake_eval_meta_ctor)
         jvp_meta = get_value_runtime_info(self.current_node, jvp_res, self._fake_eval_meta_ctor)
@@ -615,9 +616,6 @@ class JvpTransformer(EasierInterpreter):
 
         g = simplify_torchfunc_fx_graph(gm.graph)
         
-        print(g)
-        print(y_meta)
-
         set_node_meta(self.current_node, y_meta)
 
 
@@ -627,6 +625,8 @@ class JvpTransformer(EasierInterpreter):
     def if_call_method(self, method_name: str):
         function = getattr(torch, method_name)
         kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
+
+        assert False
 
     def if_call_module(self, submod: Module):
         if isinstance(submod, esr.Module):
@@ -639,7 +639,8 @@ class JvpTransformer(EasierInterpreter):
             1
 
         elif isinstance(submod, esr.Reducer):
-            assert submod.reduce == 'sum'
+            if submod.reduce != 'sum':
+                raise NotImplementedError()
 
         else:
             assert False, 'unreachable'

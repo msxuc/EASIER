@@ -5,8 +5,9 @@ from typing import Union
 import pytest
 import torch
 
-import easier.core.module as esr
-from easier.core.autodiff.autodiff import JvpTransformer #TangentFlowPropagator, GlobalTangentFlowPropCtx
+import easier as esr
+from easier.core.autodiff.autodiff import JvpTransformer
+from easier.numeric import linsys
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
@@ -39,7 +40,51 @@ class TestJvpTransformation:
         
         raw = M()
         jvp_transfomer = JvpTransformer(raw, raw).run()
+    
+
+@pytest.mark.usefixtures('dummy_dist_env')
+class TestJvp:
+    def test_spmv(self):
+        nx = 30
+        ny = 20
+
+        _ne = nx * ny // 2
+        nnz = torch.randint(0, nx * ny, [_ne]).unique(sorted=True)
+        ne = nnz.shape[0]
+
+        Ae = torch.rand_like(nnz, dtype=torch.float64)
+        x = torch.rand(nx, dtype=torch.float64)
+        y = torch.rand(ny, dtype=torch.float64)
+
+        class SpMV(esr.Module):
+            def __init__(self):
+                super().__init__()
+
+                p = torch.randperm(ne)
+                nnz2 = nnz[p]
+                s_idx = nnz2 % nx
+                r_idx = nnz2 // ny
+
+                self.Ae = esr.Tensor(Ae[p], mode='partition')
+                self.selector = esr.Selector(s_idx)
+                self.reducer = esr.Reducer(r_idx, ny)
+
+                self.x = esr.Tensor(x, mode='partition')
+                self.y = esr.Tensor(y, mode='partition')
+
+            def forward(self):
+                self.y[:] = self.reducer(
+                    self.selector(self.x) * self.Ae
+                )
         
+        raw = SpMV()
+        [jvp], [tx], [ty] = esr.jvp([raw], [raw.x], [raw.y])
+
+        [jvp] = esr.compile([jvp], backend='torch')
+
+
+        torch.sparse_coo_tensor()
+
 
 
 
