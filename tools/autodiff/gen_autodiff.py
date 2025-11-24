@@ -513,6 +513,8 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
 
     opdefs = list(filter(lambda d: d not in removed_inplace_ops, opdefs))
 
+    
+
     return opdefs, removed_inplace_ops
 
 

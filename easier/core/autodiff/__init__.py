@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import pushforward
+# import pushforward
 
-import torch_ops_manual
-import torch_ops_generated
+# import torch_ops_manual
+# import torch_ops_generated
 
 """
 NOTE torch_opinfo_generated should not be imported here, as auto-generation

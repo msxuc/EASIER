@@ -19,11 +19,11 @@ class TestJvpTransformation:
                 # have tangent
                 self.v1 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
                 self.v2 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
-                self.r1 = esr.Tensor(torch.rand(3).double(), mode='partition')
+                self.r1 = esr.Tensor(torch.rand(3).double(), mode='replicate')
 
                 # no tangent
                 self.v3 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
-                self.r2 = esr.Tensor(torch.rand(3).double(), mode='partition')
+                self.r2 = esr.Tensor(torch.rand(3).double(), mode='replicate')
 
                 self.res = esr.Tensor(esr.zeros([10, 3], dtype=torch.float64), mode='partition')
 

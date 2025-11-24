@@ -49,7 +49,7 @@ _T = TypeVar('_T')
 
 
 def get_value_runtime_info(
-    root: esr.Module, node: Node, val,
+    node: Node, val,
     meta_ctor: Callable[[Tuple[int, ...], torch.dtype], _T],
     *,
     _rec_depth=0  # debug-only
@@ -101,7 +101,7 @@ def get_value_runtime_info(
         for i in range(n_items):
             item = val[i]
             item_meta = get_value_runtime_info(
-                root, node, item, meta_ctor,
+                node, item, meta_ctor,
                 _rec_depth=_rec_depth+1
             )
 
@@ -515,7 +515,7 @@ class ShapeDtypeValidation(NodeHandlerBase):
         prev_s_d = tree_map(prev_meta, _get_shape_dtype)
 
         result_s_d = get_value_runtime_info(
-            self.current_module, current_node, res, (lambda s, d: (s, d))
+            current_node, res, (lambda s, d: (s, d))
         )
 
         # TODO if we support meta changes on the fly, we can just check
@@ -713,7 +713,7 @@ class MetadataPropagation(NodeHandlerBase):
             return RuntimeTensorMeta(role, shape, dtype)
 
         runtime_meta = get_value_runtime_info(
-            self.current_module, current_node, res, _meta_from_shape_dtype
+            current_node, res, _meta_from_shape_dtype
         )
 
         # TODO wrong! releasing Node or releasing the tensor don't mean

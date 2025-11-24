@@ -6,20 +6,25 @@ import dataclasses
 import operator
 from typing import Callable, Collection, Dict, List, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
 
+import more_itertools
 import torch
 from torch.fx import Node, Graph
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.modules import Module
 
 from easier.core.jit import EasierTracer
 import easier.core.module as esr
+from easier.core.passes.collective_initialization import collectively_initialize_and_validate
 from easier.core.passes.tensor_grouping import group_tensors, get_node_tensor_group
 from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
-    get_torch_func_inplace_arg, get_easier_tensors, get_attr_value
+    get_torch_func_inplace_arg, get_easier_tensors, get_attr_value, fx_normalize_function_variant_into_kwargs, tree_map
 from easier.core.utils import EasierJitException
+from easier.core.autodiff.utils import simplify_torchfunc_fx_graph
 
+from .torch_jvp import tangent_rules, differentiabilities
 
 class Jvp(esr.Module):
     """
@@ -460,36 +465,168 @@ class JvpTransformer(EasierInterpreter):
         # Jvp module, cached by instance.
         self.root_jvp = root_jvp
 
-        graph = EasierTracer().trace(module)
-
+        [module], [graph] = collectively_initialize_and_validate([module])
         [module], [graph] = group_tensors([module], [graph])
 
         super().__init__([module], [graph])
     
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        
+    def _fake_eval_meta_ctor(self, shape, dtype):
         ng = get_node_tensor_group(self.current_node)
         if ng is None:
             role = Role.REPLICATED
         else:
             role = Role.DISTRIBUTED
 
-        def _meta_from_shape_dtype(shape, dtype):
-            return RuntimeTensorMeta(role, shape, dtype)
+        if role == Role.DISTRIBUTED:
+            shape = (1000,) + shape[1:]
 
+        return RuntimeTensorMeta(role, shape, dtype)
+    
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
         runtime_meta = get_value_runtime_info(
-            self.current_module, self.current_node, attr_val, _meta_from_shape_dtype
+            self.current_node, attr_val, self._fake_eval_meta_ctor
         )
 
         set_node_meta(self.current_node, runtime_meta)
 
+    def _create_zero_placeholder(self, arg):
+        # one arg of a Node can be a nested structure of Nodes;
+        # but one Node here can have only non-nested value, i.e. multi-res operations are handled elsewhere
+        def _make(x):
+            if isinstance(x, Node):
+                meta = get_node_meta(x)
+                assert isinstance(meta, RuntimeTensorMeta), \
+                    "value of arg Node cannot be nested structure"
+                return torch.zeros(meta.shape, dtype=meta.dtype)
+            else:
+                return x
+
+        return tree_map(arg, _make)
 
 
     def if_call_function(self, function: Callable):
-        return super().if_call_function(function)
+        if function is operator.getitem:
+            assert False
+        
+        if function in esr.easier_aggregators:
+            assert False
+
+        if function in tangent_rules:
+            assert False
+        
+        if getattr(operator, function.__name__, None) is function:
+            function = getattr(torch, function.__name__)
+        
+
+        self._handle_using_jvp(function)
+
+    def _handle_using_jvp(self, function: Callable):
+        # keys are strs, values are FX arguments
+        raw_kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
+        dfbs = differentiabilities[function]
+        for dfb in dfbs:
+            if dfb.all_param_names() == set(raw_kwargs.keys()):
+                break
+        else:
+            assert False, \
+                "Failed to resolve overloading:" \
+                f" with Differentiabilities {dfbs}," \
+                f" get {raw_kwargs}"
+        
+        jvp_kwargs = {}  # primals and constants
+        jvp_tangents = {}  # tangents only
+        
+        for diff_param in dfb.diffable_params:
+            diff_param: str
+
+            raw_diff_arg = raw_kwargs[diff_param]
+            if not isinstance(raw_diff_arg, (Node, Sequence)):
+                assert isinstance(raw_diff_arg, (int, bool, float)), \
+                    "If a differentiable parameter is not a fx.Node" \
+                    " or Node list, it must be a scalar"
+                
+                # If diffable, literal integer is treated as float.
+                # Take a small-sized float32 dtype.
+                diff_arg = torch.zeros([], dtype=torch.float32)
+
+                jvp_kwargs[diff_param] = diff_arg
+                jvp_tangents[diff_param] = diff_arg.clone()
+            
+            else:
+                jvp_kwargs[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
+                jvp_tangents[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
+        
+        other_kwargs = {}
+        for other_param, default_arg in dfb.other_params:
+            other_arg = raw_kwargs[other_param]
+
+            # TODO this takes effect even user specifies the value to be
+            # explicitly None.
+            # It seems ok that no common operators offer a default value
+            # (especially when the argument is omitted at callsite)
+            # that is not None.
+            if other_arg is None:
+                other_arg = default_arg
+            
+            other_kwargs[other_param] = other_arg
+
+        
+        # Differentiable Tensor-type parameters, must be passed via jvp()
+        # API param list.
+        # The names and the zero Tensors must be in the same order.
+        diff_arg_names: List[str] = dfb.diffable_params
+        diff_args = tuple(map(jvp_kwargs.__getitem__, diff_arg_names))
+        tangents = tuple(map(jvp_tangents.__getitem__, diff_arg_names))
+
+        # Other non-differentiable parameters must NOT be passed via jvp()
+        # API param list, but via function closure.
+
+        def _primal_func(*args: torch.Tensor):
+            # There preparations are not part of FX Proxy and won't be traced
+            kw = {}
+            for diff_arg_name, v in zip(diff_arg_names, args):
+                kw[diff_arg_name] = v
+            for other_arg_name, v in other_kwargs.items():
+                kw[other_arg_name] = v
+            
+            # The core operation to let torch.func.jvp to analyze
+            return function(**kw)
+        
+        def _jvp(
+            primals: Tuple[torch.Tensor, ...],
+            tangents: Tuple[torch.Tensor, ...]
+        ):
+            return torch.func.jvp(_primal_func, primals, tangents)
+        
+        gm = make_fx(_jvp)(diff_args, tangents)
+        y, jvp_res = gm(diff_args, tangents)
+
+        
+        ng = get_node_tensor_group(self.current_node)
+        if ng is None:
+            role = Role.REPLICATED
+        else:
+            role = Role.DISTRIBUTED
+        
+
+        y_meta = get_value_runtime_info(self.current_node, y, self._fake_eval_meta_ctor)
+        jvp_meta = get_value_runtime_info(self.current_node, jvp_res, self._fake_eval_meta_ctor)
+        assert y_meta == jvp_meta
+
+        g = simplify_torchfunc_fx_graph(gm.graph)
+        
+        print(g)
+        print(y_meta)
+
+        set_node_meta(self.current_node, y_meta)
+
+
+
+
     
     def if_call_method(self, method_name: str):
-        return super().if_call_method(method_name)
+        function = getattr(torch, method_name)
+        kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
 
     def if_call_module(self, submod: Module):
         if isinstance(submod, esr.Module):

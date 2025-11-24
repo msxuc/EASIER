@@ -15,20 +15,27 @@ class Differentiability:
     # TODO currently we assume the elements of an overloading lattice only
     # differ between parameter type Tensor/Scalar.
     # And each overloading lattice corresponds to a certain number of params.
-    #
-    # The full list of param names of one overloading of the operator
-    params: List[str]
 
     # The names for params that are differentiable.
     # Must be a subset of `params`.
     diffable_params: List[str]
 
+    # The second field is the default value
+    # NOTE A mandatory param without default value will still have the second
+    # field be None, and will be overwritten by callsite non-None value.
+    other_params: List[Tuple[str, object]] = dataclasses.field(default_factory=list)
+
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant.
     output: Union[Literal[True], List[bool]] = True
 
-    def __post_init__(self):
-        assert len(set(self.diffable_params).difference(self.params)) == 0
+    def all_param_names(self) -> Set[str]:
+        # For current handling of overloading resolution, a Set[str] suffices.
+        params = set()
+        params.update(self.diffable_params)
+        params.update(k for k, v in self.other_params)
+        return params
+
 
 #
 # TODO before dispatch to Differentiability + torch.func.jvp,
@@ -36,6 +43,7 @@ class Differentiability:
 #
 
 tangent_rules: Dict[Callable, List[Tuple[Differentiability, Callable]]] = {}
+
 
 # TODO add decorator on functions for these cases
 # tangent_rules[torch.div] = []
@@ -58,7 +66,13 @@ differentiabilities: Dict[Callable, List[Differentiability]] = {}
 
 differentiabilities[torch.mul] = [
     Differentiability(
-        ['input', 'other'],
         ['input', 'other']
+    )
+]
+
+differentiabilities[torch.add] = [
+    Differentiability(
+        ['input', 'other'],
+        [('alpha', 1)]
     )
 ]
