@@ -9,6 +9,7 @@ from typing import Callable, Dict, List, Literal, Set, Tuple, Union
 
 import torch
 
+import easier as esr
 
 @dataclasses.dataclass
 class Differentiability:
@@ -52,6 +53,11 @@ def setitem(
     value_t
 ):
     return value_t
+
+def esr_sum(
+    self_p, self_t
+):
+    return esr.sum(self_t)
 
 # TODO add decorator on functions for these cases
 # tangent_rules[torch.div] = []

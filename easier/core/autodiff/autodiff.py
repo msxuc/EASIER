@@ -19,7 +19,7 @@ from easier.core.passes.tensor_grouping import group_tensors, get_node_tensor_gr
 from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
-    FX, EasierInterpreter, OrderedSet, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
+    FX, EasierInterpreter, OrderedSet, SubmodNameAllocator, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
     get_torch_func_inplace_arg, get_easier_tensors, get_attr_value, fx_normalize_function_variant_into_kwargs, tree_map
 from easier.core.utils import EasierJitException
 from easier.core.autodiff.utils import simplify_torchfunc_fx_graph
@@ -456,21 +456,29 @@ class JvpTransformer(EasierInterpreter):
     """
     def __init__(
         self,
-        # TODO wrap to Ctx obj
-        root_jvp: esr.Module,
-
-        module: esr.Module
+        module: esr.Module,
+        jvp_module: Jvp,
+        tangent_tensors: Dict[esr.Tensor, esr.Tensor]
     ):
-        # All referenced nested esr.Modules will be created a paired sub
-        # Jvp module, cached by instance.
-        self.root_jvp = root_jvp
 
         [module], [graph] = collectively_initialize_and_validate([module])
         [module], [graph] = group_tensors([module], [graph])
 
         super().__init__([module], [graph])
-    
+
+        self.jvp_module = jvp_module
+        self.tangent_tensors = tangent_tensors
+
+        self.jvp_graph = Graph()
+        self.primal_node_map: Dict[Node, Node] = {}
+        self.tangent_node_map: Dict[Node, Node] = {}
+
+        # Not only supporting submod, any kinds of attributes are OK.
+        self.tangent_name_allocator = SubmodNameAllocator('tangent')
+
     def _fake_eval_meta_ctor(self, shape, dtype):
+        # Special function needed by get_value_runtime_info, to provide
+        # Role in TensorMeta.
         ng = get_node_tensor_group(self.current_node)
         if ng is None:
             role = Role.REPLICATED
@@ -481,12 +489,36 @@ class JvpTransformer(EasierInterpreter):
 
         return RuntimeTensorMeta(role, shape, dtype)
     
+    def for_each_node(self):
+        jvp_primal_node = self.jvp_graph.node_copy(
+            self.current_node, arg_transform=self.primal_node_map.__getitem__
+        )
+        self.primal_node_map[self.current_node] = jvp_primal_node
+
+        # Extra logic of this Interpreter/Transformer, to propagate tangent
+        # flow and inject JVP computations.
+        return super().for_each_node()
+    
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
         runtime_meta = get_value_runtime_info(
             self.current_node, attr_val, self._fake_eval_meta_ctor
         )
-
         set_node_meta(self.current_node, runtime_meta)
+
+        if attr_val in self.tangent_tensors:
+            # Simplified: it's unlikely the same primal tensor has GET_ATTR
+            # Nodes multiple times, therefore it's OK to inject GET_ATTR Nodes
+            # for tangent each time.
+            tangent_tensor = self.tangent_tensors[attr_val]
+            tangent_name = self.tangent_name_allocator.alloc_name(self.jvp_module, attr_name)
+            setattr(self.jvp_module, tangent_name, tangent_tensor)
+
+            # Inject tangent node
+            tangent_node = self.jvp_graph.get_attr(tangent_name)
+
+            # Bind primal-tangent
+            self.tangent_node_map[self.current_node] = tangent_node
+            set_node_meta(tangent_node, runtime_meta)
 
     def _create_zero_placeholder(self, arg):
         # one arg of a Node can be a nested structure of Nodes;
@@ -504,22 +536,75 @@ class JvpTransformer(EasierInterpreter):
 
 
     def if_call_function(self, function: Callable):
-        if function is operator.getitem:
-            assert False
+        if self._try_handle_inplace(function):
+            return
         
-        if function in esr.easier_aggregators:
-            assert False
+        self._handle_noninplace(function)
+        
+    def _try_handle_inplace(self, function: Callable) -> bool:
+        """
+        Basically we treat all inplace ops as "non-inplace ops plus setitem".
 
-        if function in tangent_rules:
-            assert False
+        An important extra property for inplace ops is that the target Node,
+        esr.Tensor instance or immediately result, may not be bound with
+        tangent initially.
+        It's at this inplace Node does the target starts to have tangent.
+        """
+        if function is operator.setitem:
+            inplace_arg = self.current_node.args[0]
+
+            # Actually should be `identify` (no such op!).
+            # Let's handle setitem specially.
+            noninplace_op = operator.setitem
+
+        elif function.__name__.endswith('_'):
+            inplace_arg = self.current_node.kwargs.get('input', None)
+            if inplace_arg is None:
+                inplace_arg = self.current_node.args[0]
+
+            noninplace_op = getattr(
+                function.__module__, function.__name__[:-1]
+            )
+
+        else:
+            inplace_arg = self.current_node.kwargs.get('out', None)
+
+            noninplace_op = function
         
+        if inplace_arg is None:
+            return False
+        
+        # Some operations' `out` keyword parameter is actually a tuple
+        # e.g. `torch.cummax(input, dim, *, out=(values, indices))`
+        if not isinstance(inplace_arg, Node):
+            raise NotImplementedError(
+                "Some aten ops have multiple out args, in their Python APIs,"
+                " the `out` param is a tuple."
+                f" EASIER does not support it yet:\n{self.current_node}"
+            )
+
+        self._handle_noninplace(function)
+
+        return True
+    
+    def _handle_noninplace(self, function: Callable):
+        if function in tangent_rules:
+            raise NotImplementedError()
+        
+        # operator.xxx only appears in non-inplace CALL_FUNCTION Nodes.
         if getattr(operator, function.__name__, None) is function:
             function = getattr(torch, function.__name__)
-        
 
-        self._handle_using_jvp(function)
+        #
+        # Handle using torch.func.jvp and tracing.
+        # This is not purely symbolic, must have proper shapes to work with.
+        #
 
-    def _handle_using_jvp(self, function: Callable):
+        if function not in differentiabilities:
+            raise NotImplementedError(
+                f"Differentiation for operator {function} is not registered"
+            )
+
         # keys are strs, values are FX arguments
         raw_kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
         dfbs = differentiabilities[function]

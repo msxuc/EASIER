@@ -80,10 +80,17 @@ class TestJvp:
         raw = SpMV()
         [jvp], [tx], [ty] = esr.jvp([raw], [raw.x], [raw.y])
 
-        [jvp] = esr.compile([jvp], backend='torch')
+        # [jvp] = esr.compile([jvp], backend='torch')
 
 
-        torch.sparse_coo_tensor()
+        raw_f = raw.forward
+        [raw] = esr.compile([raw], backend='none')
+
+        # NoneBackendEngine adds extra computation
+        raw.forward = raw_f
+
+        def _classic(input_x: torch.Tensor):
+            1
 
 
 
