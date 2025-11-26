@@ -4,7 +4,7 @@
 import contextlib
 import dataclasses
 import operator
-from typing import Callable, Collection, Dict, List, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
+from typing import Callable, Collection, Dict, List, Literal, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
 
 import more_itertools
 import torch
@@ -17,7 +17,7 @@ import easier.core.module as esr
 from easier.core.passes.collective_initialization import collectively_initialize_and_validate
 from easier.core.passes.tensor_grouping import group_tensors, get_node_tensor_group
 from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
-from easier.core.runtime.metadata import Role, RuntimeTensorMeta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
+from easier.core.runtime.metadata import Role, RuntimeTensorMeta, StructuredTensorMeta, collect_meta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, SubmodNameAllocator, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
     get_torch_func_inplace_arg, get_easier_tensors, get_attr_value, fx_normalize_function_variant_into_kwargs, tree_map
@@ -460,9 +460,25 @@ class JvpTransformer(EasierInterpreter):
         jvp_module: Jvp,
         tangent_tensors: Dict[esr.Tensor, esr.Tensor]
     ):
-
+        # TODO move outside
         [module], [graph] = collectively_initialize_and_validate([module])
         [module], [graph] = group_tensors([module], [graph])
+
+
+        _getattr_vals = set()
+        class _SingleGetAttrValidator(EasierInterpreter):
+            # torch.fx would likely deduplicate GET_ATTR for multi-aliases
+            # attribute Tensor, but the correctness of AD explicitly relies on
+            # such a property, therefore we need to validate it.
+            def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+                if attr_val in _getattr_vals:
+                    raise NotImplementedError(
+                        "EASIER currently does not accept that in FX Graph"
+                        " two 'get_attr' Nodes point to the same instance"
+                    )
+                _getattr_vals.add(attr_val)
+        _SingleGetAttrValidator([module], [graph]).run()
+
 
         super().__init__([module], [graph])
 
@@ -475,6 +491,8 @@ class JvpTransformer(EasierInterpreter):
 
         # Not only supporting submod, any kinds of attributes are OK.
         self.tangent_name_allocator = SubmodNameAllocator('tangent')
+
+
 
     def _fake_eval_meta_ctor(self, shape, dtype):
         # Special function needed by get_value_runtime_info, to provide
@@ -489,7 +507,7 @@ class JvpTransformer(EasierInterpreter):
 
         return RuntimeTensorMeta(role, shape, dtype)
     
-    def for_each_node(self):
+    def for_each_node(self) -> None:
         jvp_primal_node = self.jvp_graph.node_copy(
             self.current_node, arg_transform=self.primal_node_map.__getitem__
         )
@@ -499,7 +517,23 @@ class JvpTransformer(EasierInterpreter):
         # flow and inject JVP computations.
         return super().for_each_node()
     
-    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+
+    def _create_zero_placeholder(self, arg: Union[Node, Sequence[Node]]) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
+        # one arg of a Node can be a nested structure of Nodes;
+        # but one Node here can have only non-nested value, i.e. multi-res operations are handled elsewhere
+        def _make(x):
+            assert isinstance(x, Node), \
+                "In a list, Node and scalar are not expected to be mixed"
+
+            meta = get_node_meta(x)
+            assert isinstance(meta, RuntimeTensorMeta), \
+                "Value of arg Node cannot be nested structure"
+
+            return torch.zeros(meta.shape, dtype=meta.dtype)
+
+        return tree_map(arg, _make)
+    
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
         runtime_meta = get_value_runtime_info(
             self.current_node, attr_val, self._fake_eval_meta_ctor
         )
@@ -520,22 +554,9 @@ class JvpTransformer(EasierInterpreter):
             self.tangent_node_map[self.current_node] = tangent_node
             set_node_meta(tangent_node, runtime_meta)
 
-    def _create_zero_placeholder(self, arg):
-        # one arg of a Node can be a nested structure of Nodes;
-        # but one Node here can have only non-nested value, i.e. multi-res operations are handled elsewhere
-        def _make(x):
-            if isinstance(x, Node):
-                meta = get_node_meta(x)
-                assert isinstance(meta, RuntimeTensorMeta), \
-                    "value of arg Node cannot be nested structure"
-                return torch.zeros(meta.shape, dtype=meta.dtype)
-            else:
-                return x
-
-        return tree_map(arg, _make)
 
 
-    def if_call_function(self, function: Callable):
+    def if_call_function(self, function: Callable) -> None:
         if self._try_handle_inplace(function):
             return
         
@@ -571,8 +592,11 @@ class JvpTransformer(EasierInterpreter):
 
             noninplace_op = function
         
+
+        # If not an inplace op, back to continue with JVP transformation
         if inplace_arg is None:
             return False
+
         
         # Some operations' `out` keyword parameter is actually a tuple
         # e.g. `torch.cummax(input, dim, *, out=(values, indices))`
@@ -583,7 +607,7 @@ class JvpTransformer(EasierInterpreter):
                 f" EASIER does not support it yet:\n{self.current_node}"
             )
 
-        self._handle_noninplace(function)
+        self._handle_noninplace(noninplace_op)
 
         return True
     
@@ -604,9 +628,22 @@ class JvpTransformer(EasierInterpreter):
             raise NotImplementedError(
                 f"Differentiation for operator {function} is not registered"
             )
+        
+
+        # TODO for a multi-out op, its Python API has a tuple-typed `out` param
+        # but its `aten` API has explicit kwarg like `values=x, indices=y`.
+        # When `aten` APIs appear in higher-order AD scenario, we need AD
+        # registry to cover both PyTorch Python and aten APIs.
+        #
+        # When handling inplace op as its noninplace version, the Node may have
+        # a `out` param (and always named as `out`).
+        # Remove this `out` kwarg to let FX normalization below focus on the
+        # noninplace version of the op.
+        noninplace_kwargs = dict(self.current_node.kwargs)
+        noninplace_kwargs.pop('out', None)
 
         # keys are strs, values are FX arguments
-        raw_kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
+        raw_kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, noninplace_kwargs)
         dfbs = differentiabilities[function]
         for dfb in dfbs:
             if dfb.all_param_names() == set(raw_kwargs.keys()):
@@ -614,34 +651,94 @@ class JvpTransformer(EasierInterpreter):
         else:
             assert False, \
                 "Failed to resolve overloading:" \
-                f" with Differentiabilities {dfbs}," \
-                f" get {raw_kwargs}"
+                f" with Differentiabilities {dfbs}, get {raw_kwargs}"
         
         # Some diffable parameters are given as literals e.g. "add(x, 3)"
         # and we need to convert them to replicated tensors to simplify
         # the generated tangent sub-Graph.
-        jvp_diff_primals = {}
-        jvp_tangents = {}
-        
+        jvp_diff_primal_vals = {}
+        jvp_tangent_vals = {}
+
+        # If a diffable param happens to carry tangent
+        # -- tangent on non-diffable param is not counted.
+        #
+        # Also, in this noninplace handler we DO NOT count tangent appearance
+        # on inplace target. This is handled by the inplace handler.
+        tangent_appear_flag: List[bool] = []
+
         for diff_param in dfb.diffable_params:
             diff_param: str
+            raw_diff_node_arg = raw_kwargs[diff_param]
+            if isinstance(raw_kwargs, (Node, Sequence)):
+                arg_flags = collect_meta(
+                    raw_diff_node_arg,
+                    self.tangent_node_map.__contains__,
+                    leaf_type=Node
+                )
+                tangent_appear_flag.extend(arg_flags)
+        
 
-            raw_diff_arg = raw_kwargs[diff_param]
-            if not isinstance(raw_diff_arg, (Node, Sequence)):
-                assert isinstance(raw_diff_arg, (int, bool, float)), \
+        if not any(tangent_appear_flag):
+            #
+            # No tangent computation for the noninplace part.
+            #
+            return None
+
+
+        jvp_tangent_nodes: Dict[str, Union[Node, Sequence[Node]]] = {}
+
+        for diff_param in dfb.diffable_params:
+            diff_param: str
+            raw_diff_node_arg = raw_kwargs[diff_param]
+
+            if not isinstance(raw_diff_node_arg, (Node, Sequence)):
+                # const scalars
+                assert isinstance(raw_diff_node_arg, (int, bool, float)), \
                     "If a differentiable parameter is not a fx.Node" \
                     " or Node list, it must be a scalar"
                 
                 # If diffable, literal integer is treated as float.
                 # Take a small-sized float32 dtype.
-                diff_arg = torch.zeros([], dtype=torch.float32)
+                diff_argval = torch.zeros([], dtype=torch.float32)
 
-                jvp_diff_primals[diff_param] = diff_arg
-                jvp_tangents[diff_param] = diff_arg.clone()
+                jvp_diff_primal_vals[diff_param] = diff_argval
+                jvp_tangent_vals[diff_param] = diff_argval.clone()
+
+                # Zero tangent for scalar
+                #
+                # NOTE it's safer to create replicated zero tensors, because
+                # to generate JVP sub-Graph we use zero tensors (diff_argval)
+                # so the sub-Graph may exploit the assumption that all input
+                # tangents are tensors. And it eases our copying since all
+                # elements are Nodes -- no need to inline scalars.
+                # Although literal `1.0` may also work, computationally.
+                jvp_tangent_nodes[diff_param] = self.jvp_graph.call_function(
+                    torch.zeros, ([],), { 'dtype': torch.float32 }
+                )
             
-            else:
-                jvp_diff_primals[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
-                jvp_tangents[diff_param] = tree_map(raw_diff_arg, self._create_zero_placeholder)
+            else:  # Node or Node list
+
+                # for a list-typed arg, we assume no mix of Node and scalar.
+                jvp_diff_primal_vals[diff_param] = tree_map(
+                    raw_diff_node_arg, self._create_zero_placeholder
+                )
+                jvp_tangent_vals[diff_param] = tree_map(
+                    raw_diff_node_arg, self._create_zero_placeholder
+                )
+
+                def _prepare_tangent_node(primal: Node) -> Node:
+                    assert isinstance(primal, Node)
+                    if primal in self.tangent_node_map:
+                        return self.tangent_node_map[primal]
+                    else:
+                        # Create zero tangent
+                        return self.jvp_graph.call_function(
+                            torch.zeros_like, (primal,)
+                        )
+                jvp_tangent_nodes[diff_param] = tree_map(  # type: ignore
+                    raw_diff_node_arg, _prepare_tangent_node
+                )
+
         
         other_kwargs = {}
         for other_param, default_arg in dfb.other_params:
@@ -662,47 +759,21 @@ class JvpTransformer(EasierInterpreter):
         # API param list.
         # The names and the zero Tensors must be in the same order.
         diff_arg_names: List[str] = dfb.diffable_params
-        diff_primals = tuple(map(jvp_diff_primals.__getitem__, diff_arg_names))
-        tangents = tuple(map(jvp_tangents.__getitem__, diff_arg_names))
+        diff_primal_vals = tuple(map(jvp_diff_primal_vals.__getitem__, diff_arg_names))
+        tangent_vals = tuple(map(jvp_tangent_vals.__getitem__, diff_arg_names))
 
-        # Other non-differentiable parameters must NOT be passed via jvp()
-        # API param list, but via function closure.
+        gm, y_meta = self._generate_jvp_subgraph_using_torchfunc(
+            function, diff_arg_names,
+            diff_primal_vals, tangent_vals, other_kwargs
+        )
+        subg = simplify_torchfunc_fx_graph(gm.graph)
 
-        def _primal_func(*args: torch.Tensor):
-            # There preparations are not part of FX Proxy and won't be traced
-            kw = {}
-            for diff_arg_name, v in zip(diff_arg_names, args):
-                kw[diff_arg_name] = v
-            for other_arg_name, v in other_kwargs.items():
-                kw[other_arg_name] = v
-            
-            # The core operation to let torch.func.jvp to analyze
-            return function(**kw)
-        
-        def _jvp(
-            primals: Tuple[torch.Tensor, ...],
-            tangents: Tuple[torch.Tensor, ...]
-        ):
-            return torch.func.jvp(_primal_func, primals, tangents)
-        
-        gm: GraphModule = make_fx(_jvp)(diff_primals, tangents)
-        y, jvp_res = gm(diff_primals, tangents)
-
-        
-        ng = get_node_tensor_group(self.current_node)
-        if ng is None:
-            role = Role.REPLICATED
-        else:
-            role = Role.DISTRIBUTED
-
-        y_meta = get_value_runtime_info(self.current_node, y, self._fake_eval_meta_ctor)
-        jvp_meta = get_value_runtime_info(self.current_node, jvp_res, self._fake_eval_meta_ctor)
-        assert y_meta == jvp_meta
-
-        g = simplify_torchfunc_fx_graph(gm.graph)
-        
         set_node_meta(self.current_node, y_meta)
 
+        #
+        # Copy JVP sub-Graph into the resultant JVP Graph
+        #
+        JvpSubGraphCopier(gm, subg, self.jvp_graph).run()
 
 
 
@@ -729,6 +800,87 @@ class JvpTransformer(EasierInterpreter):
 
         else:
             assert False, 'unreachable'
+
+    def _generate_jvp_subgraph_using_torchfunc(
+        self,
+        function: Callable,
+        diff_arg_names: List[str],
+        diff_primal_vals: Tuple[Union[torch.Tensor, Sequence[torch.Tensor]]],
+        tangent_vals: Tuple[Union[torch.Tensor, Sequence[torch.Tensor]]],
+        other_kwargs: dict
+    ) -> Tuple[GraphModule, StructuredTensorMeta]:
+        """
+        We need to note that torch.func.jvp API only leverage the order of
+        parameters -- via `diff_arg_names: List[str]`,
+        but FX normalization results in `Dict[str, Node]`.
+
+        We need to convert between list and dict.
+
+        An extra conversion is to flatten the nested arg `Sequence` above,
+        and the identities of the nested elements are only told by their
+        positions in the nested structure.
+        """
+
+        # Other non-differentiable parameters must NOT be passed via jvp()
+        # API param list, but via function closure.
+
+        def _primal_func(*args: torch.Tensor):
+            # There preparations are not part of FX Proxy and won't be traced
+            kw = {}
+            for diff_arg_name, v in zip(diff_arg_names, args):
+                kw[diff_arg_name] = v
+            for other_arg_name, v in other_kwargs.items():
+                kw[other_arg_name] = v
+            
+            # The core operation to let torch.func.jvp to analyze
+            return function(**kw)
+        
+        def _jvp(
+            primals: Tuple[torch.Tensor, ...],
+            tangents: Tuple[torch.Tensor, ...]
+        ):
+            return torch.func.jvp(_primal_func, primals, tangents)
+        
+        # FX Graph, including make_fx, does not respect nested inputs,
+        # so we need to manually flatten any nested args and maintain the
+        # mapping between before/after flattening.
+        gm: GraphModule = make_fx(_jvp)(diff_primal_vals, tangent_vals)
+        y, jvp_res = gm(diff_primal_vals, tangent_vals)
+        
+        ng = get_node_tensor_group(self.current_node)
+        if ng is None:
+            role = Role.REPLICATED
+        else:
+            role = Role.DISTRIBUTED
+
+        y_meta = get_value_runtime_info(self.current_node, y, self._fake_eval_meta_ctor)
+        jvp_meta = get_value_runtime_info(self.current_node, jvp_res, self._fake_eval_meta_ctor)
+        assert y_meta == jvp_meta
+
+        return gm, y_meta
+
+class JvpSubGraphCopier(EasierInterpreter):
+    def __init__(self, subgm: GraphModule, subg: Graph, jvp_graph: Graph,         diff_arg_names: List[str],) -> None:
+        super().__init__([subgm], [subg])  # type: ignore
+
+        self.jvp_graph = jvp_graph
+        self.diff_arg_names = diff_arg_names
+
+        self.placeholder_i = 0  # totally 2*len(diff_arg_names)
+
+        self.node_map: Dict[Node, Node] = {}
+        
+    def if_placeholder(self, param_name: str):
+        """
+        Same as torch.func.jvp requirements, the PLACEHOLDER Nodes only differ
+        in their positions and the order.
+        """
+        # param_name would be "primals_1" "tangents_2" (from `def _jvp` above)
+        # and not usable.
+        is_primal = self.placeholder_i < len(self.diff_arg_names)
+        
+
+        self.placeholder_i += 1
 
 
 class LazyJvpModule(esr.Module):

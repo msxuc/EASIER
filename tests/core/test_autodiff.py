@@ -41,6 +41,11 @@ class TestJvpTransformation:
         raw = M()
         jvp_transfomer = JvpTransformer(raw, raw).run()
     
+    def test_nest_arg_tangent_appear_and_not_appear(self):
+        class M(esr.Module):
+            def forward(self):
+                return torch.concat([x1, x2, x3], dim=1)
+    
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestJvp:
