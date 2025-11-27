@@ -5,6 +5,7 @@
 
 
 import dataclasses
+import operator
 from typing import Callable, Dict, List, Literal, Set, Tuple, Union
 
 import torch
@@ -26,7 +27,7 @@ class Differentiability:
     # field be None, and will be overwritten by callsite non-None value.
     #
     # Generally the param names are not ordered within this dataclass.
-    other_params: List[Tuple[str, object]] = dataclasses.field(default_factory=list)
+    other_params: List[Tuple[str, Union[int, float, str]]] = dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant, e.g.
@@ -41,6 +42,9 @@ class Differentiability:
         return params
 
 
+class NonSchemaDifferentiabilitiyBase:
+    1
+
 #
 # TODO before dispatch to Differentiability + torch.func.jvp,
 # certain ops must be handled specifically and manually
@@ -48,11 +52,26 @@ class Differentiability:
 
 tangent_rules: Dict[Callable, List[Tuple[Differentiability, Callable]]] = {}
 
+def tangent(
+    target_op: Callable,
+    diff_params: List[str], other_params: List[Tuple[str, Union[int, float, str]]] = [],
+    output_differentiability: Union[Literal[True], List[bool]] = True
+):
+    def wrapper(rule_func):
+        tangent_rules.setdefault(target_op, []).append((
+            Differentiability(
+                diff_params, other_params, output_differentiability
+            ), rule_func
+        ))
+    return wrapper
+
+# @tangent(operator.setitem)
 def setitem(
     self_p, index, value_p,
     value_t
 ):
     return value_t
+
 
 def esr_sum(
     self_p, self_t

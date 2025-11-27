@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import easier as esr
-from easier.core.autodiff.autodiff import JvpTransformer
+from easier.core.autodiff.autodiff import Jvp, JvpTransformer
 from easier.numeric import linsys
 
 
@@ -67,8 +67,8 @@ class TestJvp:
 
                 p = torch.randperm(ne)
                 nnz2 = nnz[p]
-                s_idx = nnz2 % nx
-                r_idx = nnz2 // ny
+                s_idx = nnz2 % ny
+                r_idx = nnz2 // nx
 
                 self.Ae = esr.Tensor(Ae[p], mode='partition')
                 self.selector = esr.Selector(s_idx)
@@ -78,11 +78,20 @@ class TestJvp:
                 self.y = esr.Tensor(y, mode='partition')
 
             def forward(self):
-                self.y[:] = self.reducer(
+                y = self.reducer(
                     self.selector(self.x) * self.Ae
                 )
+                # self.y[:] = y
         
         raw = SpMV()
+
+        raw_jvp = Jvp()
+        t_x = esr.Tensor(x, mode='partition')
+
+        jvp_transfomer = JvpTransformer(raw, raw_jvp, { raw.x: t_x}).run()
+        jvp_g = jvp_transfomer.jvp_graph
+
+
         [jvp], [tx], [ty] = esr.jvp([raw], [raw.x], [raw.y])
 
         # [jvp] = esr.compile([jvp], backend='torch')
