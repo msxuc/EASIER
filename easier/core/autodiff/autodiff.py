@@ -45,7 +45,7 @@ class Jvp(esr.Module):
         raise EasierJitException()
 
 
-_FxConst: TypeAlias = Union[int, float, str]
+FxConst: TypeAlias = Union[int, float, str]
 
 
 """
@@ -698,7 +698,7 @@ class JvpTransformer(EasierInterpreter):
         jvp_tangent_vals: \
             Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]] = {}
 
-        input_primal_nodes: Dict[str, Union[_FxConst, Node, Sequence[Node]]] = {}
+        input_primal_nodes: Dict[str, Union[FxConst, Node, Sequence[Node]]] = {}
         input_tangent_nodes: Dict[str, Union[Node, Sequence[Node]]] = {}
 
         for diff_param in dfb.diffable_params:
@@ -774,7 +774,7 @@ class JvpTransformer(EasierInterpreter):
         # We need to map it back to primal Nodes.
         # TODO jvp_nondiff_env_nodes = {}
 
-        jvp_nondiff_env_vals: Dict[str, Union[torch.Tensor, _FxConst]] = {}
+        jvp_nondiff_env_vals: Dict[str, Union[torch.Tensor, FxConst]] = {}
         for nondiff_param, default_arg in dfb.other_params:
             raw_node_nondiff_arg = raw_node_kwargs[nondiff_param]
 
@@ -941,7 +941,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
     def __init__(
         self, subgm: GraphModule, subg: Graph, jvp_graph: Graph,
         diff_arg_names: List[str],
-        jvp_input_primals: Dict[str, Union[_FxConst, Node, Sequence[Node]]],
+        jvp_input_primals: Dict[str, Union[FxConst, Node, Sequence[Node]]],
         jvp_input_tangents: Dict[str, Union[Node, Sequence[Node]]]         
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
