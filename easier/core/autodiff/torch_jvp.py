@@ -6,14 +6,16 @@
 
 import dataclasses
 import operator
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union
+from typing_extensions import OrderedDict
 
 import torch
 from torch.fx import Node
 
 import easier as esr
-from easier.core.autodiff.autodiff import FxConst
+from easier.core.autodiff.autodiff import FxConst, FxArg
 from easier.core.passes.utils import FX, fx_normalize_function_variant_into_kwargs
+from easier.core.runtime.metadata import Role, RuntimeTensorMeta, get_node_meta, set_node_meta
 
 @dataclasses.dataclass
 class Differentiability:
@@ -28,14 +30,19 @@ class Differentiability:
     # The second field is the default value.
     # NOTE A mandatory param without default value will still have the second
     # field be None, and will be overwritten by callsite non-None value.
+    # TODO ensure no common ops whose default argument of a non-scalar param
+    # (e.g. `float?`, `Tensor`) is not None.
     #
     # Generally the param names are not ordered within this dataclass.
-    other_params: List[Tuple[str, Union[int, float, str]]] = dataclasses.field(default_factory=list)
+    other_params: List[Tuple[str, FxConst]] = dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant, e.g.
     # `output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]`
     output: Union[Literal[True], List[bool]] = True
+
+    kwargs_normalizer: Callable[[Callable, tuple, dict], Dict[str, FxArg]] = \
+        fx_normalize_function_variant_into_kwargs
 
     def all_param_names(self) -> Set[str]:
         # For current handling of overloading resolution, a Set[str] suffices.
@@ -43,14 +50,18 @@ class Differentiability:
         params.update(self.diffable_params)
         params.update(k for k, v in self.other_params)
         return params
-
+    
 
 class DiffRuleBase:
-    normalize_to_kwargs_only: bool = True
+    fx_normalize_to_kwargs_only: bool = True
+    needs_result: bool = False
 
-    diff_params: Optional[List[str]] = None
+    # Only if normalize_to_kwargs_only.
+    # Especially for 'self' param in torch yaml, use 'input' instead.
+    diffable_params: Optional[List[str]] = None
 
-    def input_differentiability(self, *args, **kwargs) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
+
+    def input_differentiability(self) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         """
         Resolve inputs at the callsite, decide which inputs are differentiable.
 
@@ -61,17 +72,20 @@ class DiffRuleBase:
         # Default implementation:
         # - Resolve overloading via FX normalization;
         # - Decide input differentiability using simple param names list.
-        assert self.diff_params is not None
-        assert self.normalize_to_kwargs_only, \
+        assert self.diffable_params is not None
+        assert self.fx_normalize_to_kwargs_only, \
             "Only FX-normalizable torch-Python/torch.ops.aten operators can" \
             " simply use `diff_params` field for differentiability of inputs"
-        assert len(args) == 0  # effectively by normalize-only
 
-        assert len(set(self.diff_params) - kwargs.keys()) == 0, \
+        raw_kwargs = self.raw_normalized_kwargs
+
+        assert len(set(self.diffable_params) - raw_kwargs.keys()) == 0, \
             "All `diff_params` must be present in callsite arguments"
 
-        diff_kwargs = kwargs.fromkeys(self.diff_params)
-        return diff_kwargs  # type: ignore
+        raw_diff_kwargs = raw_kwargs.fromkeys(self.diffable_params)
+        assert list(raw_diff_kwargs.keys()) == self.diffable_params
+
+        return raw_diff_kwargs  # type: ignore
             
     
     def output_differentiability(self)->Union[Literal[True], List[bool]]:
@@ -84,95 +98,83 @@ class DiffRuleBase:
     def pushforward(self, *args, **kwargs):
         raise NotImplementedError("Derived class should implement this")
     
-    def __init__(self, node: Node, op: Callable) -> None:
-        self.node = node
+    def __init__(self, node: Node, op: Callable, raw_meta_ctor: Callable) -> None:
+        self.raw_node = node
         self.op = op
+        self.raw_meta_ctor = raw_meta_ctor
+
+        if self.fx_normalize_to_kwargs_only:
+            self.raw_normalized_kwargs = \
+                fx_normalize_function_variant_into_kwargs(
+                    self.op, self.raw_node.args, self.raw_node.kwargs
+                )
     
     def invoke(
         self,
-        handle_inputs_prepare_tangents: Callable[
-            [
-                Dict[str, Union[FxConst, Node, Sequence[Node]]],
-            ],
-            Tuple[
-                Dict[str, Union[FxConst, Node, Sequence[Node]]],
-                Dict[str, Union[FxConst, Node, Sequence[Node]]]
-            ]
-        ]
+        # If multi-res op, this param including non-diffable result item.
+        primal_result: Union[Node, Sequence[Node]],
+        diff_input_names: List[str],
+        tangents: List[Union[FxConst, Node, Sequence[Node]]]
     ):
-        assert self.node.op == FX.CALL_FUNCTION
+        assert self.raw_node.op == FX.CALL_FUNCTION
 
-        if self.normalize_to_kwargs_only:
-            kwargs = fx_normalize_function_variant_into_kwargs(self.op, self.node.args, self.node.kwargs)
-            diff_inputs = self.input_differentiability(self, **kwargs)
+        args = []
+        if self.needs_result:
+            args = [primal_result]
+
+        kw_tangents = dict(zip(diff_input_names, tangents))
+
+        if self.fx_normalize_to_kwargs_only:
+            pf_res = self.pushforward(*args, **self.raw_normalized_kwargs, **kw_tangents)
+
         else:
-            diff_inputs = self.input_differentiability(*self.node.args, **self.node.kwargs)
-
-
-        diff_inputs, _ = handle_inputs_prepare_tangents(diff_inputs)
-        tangents: Dict[str, Union[FxConst, Node, Sequence[Node]]] = {}
-        for param_name, primal in diff_inputs.items():
-            tangent_param = param_name + '_t'
-            assert tangent_param not in diff_inputs
-            assert tangent_param not in tangents
-
-
-        
-        if self.normalize_to_kwargs_only:
-            pf_res = self.pushforward(**kwargs, **tangents)
-        else:
-            pf_res = self.pushforward(*self.node.args, **self.node.kwargs, **tangents)
+            pf_res = self.pushforward(*args, *self.raw_node.args, **self.raw_node.kwargs, **kw_tangents)
         
 
 
-
-#
-# TODO before dispatch to Differentiability + torch.func.jvp,
-# certain ops must be handled specifically and manually
-#
-
-tangent_rules: Dict[Callable, List[Tuple[Differentiability, Callable]]] = {}
-
-# def tangent(
-#     target_op: Callable,
-#     diff_params: List[str], other_params: List[Tuple[str, Union[int, float, str]]] = [],
-#     output_differentiability: Union[Literal[True], List[bool]] = True
-# ):
-#     def wrapper(rule_func):
-#         tangent_rules.setdefault(target_op, []).append((
-#             Differentiability(
-#                 diff_params, other_params, output_differentiability
-#             ), rule_func
-#         ))
-#     return wrapper
+tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
 
 class SetitemRule(DiffRuleBase):
     normalize_to_kwargs_only = False
 
-    def pushforward(self, input, index, value):
+    def pushforward(self, target, index, input, target_t, input_t):
+        set_node_meta(self.raw_node, get_node_meta(target))
 
-# @tangent(operator.setitem)
-def setitem(
-    self_p, index, value_p,
-    value_t
-):
-    return value_t
+        target_t[index] = input_t
+        return target_t
+
+tangent_rule_registry[operator.setitem] = SetitemRule
 
 
-def esr_sum(
-    self_p, self_t
-):
-    return esr.sum(self_t)
+class EsrSumRule(DiffRuleBase):
+    normalize_to_kwargs_only = False
 
-# TODO add decorator on functions for these cases
-# tangent_rules[torch.div] = []
+    def pushforward(
+        self,
+        input, input_t
+    ):
+        imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
+        set_node_meta(self.raw_node, RuntimeTensorMeta(
+            Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
+        ))
 
-def div(
-    result,  # TODO needs result
-    self_p, other_p,
-    self_t, other_t
-):
-    return (self_t - other_t * result) / other_p
+        return esr.sum(input_t)
+
+tangent_rule_registry[esr.sum] = EsrSumRule
+
+class DivRule(DiffRuleBase):
+    needs_primal_result = True
+
+    def pushforward(
+        self,
+        result,  # TODO needs result
+        input, other,
+        input_t, other_t
+    ):
+        return (input_t - other_t * result) / other
+
+tangent_rule_registry[torch.div] = DivRule
+# tangent_rule_registry[torch.Tensor.div_] = DivRule
 
 
 
@@ -193,5 +195,19 @@ differentiabilities[torch.add] = [
     Differentiability(
         ['input', 'other'],
         [('alpha', 1)]
+    )
+]
+
+
+def _normalize_einsum_kwargs(op, args, kwargs):
+    def _match(equation, tensors):
+        return { 'equation': equation, 'tensors': tensors }
+    return _match(*args, **kwargs)
+
+differentiabilities[torch.einsum] = [
+    Differentiability(
+        ['tensors'],
+        [('equation', None)],
+        kwargs_normalizer=_normalize_einsum_kwargs
     )
 ]

@@ -513,7 +513,11 @@ def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef
 
     opdefs = list(filter(lambda d: d not in removed_inplace_ops, opdefs))
 
-    
+
+    for op in opdefs:
+        if 'Tensor[]' in op.param_list:
+            print(op)
+
 
     return opdefs, removed_inplace_ops
 
