@@ -10,12 +10,17 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 from typing_extensions import OrderedDict
 
 import torch
-from torch.fx import Node
+from torch.fx import Node, Graph
 
 import easier as esr
 from easier.core.autodiff.autodiff import FxConst, FxArg
-from easier.core.passes.utils import FX, fx_normalize_function_variant_into_kwargs
-from easier.core.runtime.metadata import Role, RuntimeTensorMeta, get_node_meta, set_node_meta
+from easier.core.passes.utils import FX, fx_normalize_function_variant_into_kwargs, tree_map
+from easier.core.runtime.metadata import Role, RuntimeTensorMeta, collect_meta, get_node_meta, set_node_meta
+
+
+class RequiredParam:
+    pass
+required = RequiredParam()
 
 @dataclasses.dataclass
 class Differentiability:
@@ -34,7 +39,7 @@ class Differentiability:
     # (e.g. `float?`, `Tensor`) is not None.
     #
     # Generally the param names are not ordered within this dataclass.
-    other_params: List[Tuple[str, FxConst]] = dataclasses.field(default_factory=list)
+    other_params: List[Tuple[str, Union[RequiredParam, FxConst]]] = dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant, e.g.
@@ -88,14 +93,39 @@ class DiffRuleBase:
         return raw_diff_kwargs  # type: ignore
             
     
-    def output_differentiability(self)->Union[Literal[True], List[bool]]:
-        # Default implmentation:
-        # - Single output and differentiable
+    # def output_differentiability(self)->Union[Literal[True], List[bool]]:
+    #     # Default implmentation:
+    #     # - Single output and differentiable
         
-        # TODO cover torch.to/aten._to_copy whose output diff is dynamic
-        return True
+    #     # TODO cover torch.to/aten._to_copy whose output diff is dynamic
+    #     return True
+
+    def output_meta(self, *args, **kwargs):
+        """
+        Calculate the metadata for primal result since we only symbolically
+        handle the Node without evaluate it.
+
+        Tangent, if present, shares the same metadata.
+
+        Inputs:
+        -   Input Nodes or constants
+
+        Returns:
+        -   RuntimeTensorMeta or a nested one
+        """
+        raise NotImplementedError("Derived class should implement this")
+
     
-    def pushforward(self, *args, **kwargs):
+    def jvp(self, *args, **kwargs):
+        """
+        Inputs:
+        -   EasierProxy for input Nodes
+        -   Constants remain constants
+
+        Returns:
+        -   Tensor/Proxy: A single result item with tangent
+        -   List[None | Tensor/Proxy]: Multiple items, some don't have tangent
+        """
         raise NotImplementedError("Derived class should implement this")
     
     def __init__(self, node: Node, op: Callable, raw_meta_ctor: Callable) -> None:
@@ -114,22 +144,47 @@ class DiffRuleBase:
         # If multi-res op, this param including non-diffable result item.
         primal_result: Union[Node, Sequence[Node]],
         diff_input_names: List[str],
+        raw2primal: Dict[Node, Node],
         tangents: List[Union[FxConst, Node, Sequence[Node]]]
-    ):
+    ) -> Union[Node, Sequence[Node]]:
         assert self.raw_node.op == FX.CALL_FUNCTION
 
-        args = []
+        from easier.core.jit import EasierProxy, EasierTracer
+
+        jvp_graph: Graph = collect_meta(
+            primal_result, lambda n: n.graph, leaf_type=Node
+        )[0]
+
+        tracer = EasierTracer()
+        tracer.graph = jvp_graph
+
+        primal_result_proxies = []
         if self.needs_result:
-            args = [primal_result]
+            primal_proxy = tree_map(primal_result, lambda n: tracer.proxy(n))
+            primal_result_proxies = [primal_proxy]
 
         kw_tangents = dict(zip(diff_input_names, tangents))
 
         if self.fx_normalize_to_kwargs_only:
-            pf_res = self.pushforward(*args, **self.raw_normalized_kwargs, **kw_tangents)
+            norm_kw_proxies = {
+                k: tree_map(raw, tracer.proxy)
+                for k, raw in self.raw_normalized_kwargs.items()
+            }
+            res_tangent = self.jvp(*primal_result_proxies, **norm_kw_proxies, **kw_tangents)
 
         else:
-            pf_res = self.pushforward(*args, *self.raw_node.args, **self.raw_node.kwargs, **kw_tangents)
+            args_proxies = tree_map(self.raw_node.args, tracer.proxy)
+            kw_proxies = {
+                k: tree_map(raw, tracer.proxy)
+                for k, raw in self.raw_node.kwargs.items()
+            }
+            res_tangent = self.jvp(*primal_result_proxies, *args_proxies, **kw_proxies, **kw_tangents)
         
+        assert get_node_meta(self.raw_node), \
+            f"Rule {self} should set metadata on the raw Node"
+        
+        res_tangent: Union[EasierProxy, Sequence[Union[None, EasierProxy]]]
+        return tree_map(res_tangent, lambda p: p.node)  # type: ignore
 
 
 tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
@@ -137,7 +192,10 @@ tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
 class SetitemRule(DiffRuleBase):
     normalize_to_kwargs_only = False
 
-    def pushforward(self, target, index, input, target_t, input_t):
+    def output_meta(self, target, index, input):
+        return get_node_meta(target)
+
+    def jvp(self, target, index, input, target_t, input_t):
         set_node_meta(self.raw_node, get_node_meta(target))
 
         target_t[index] = input_t
@@ -149,33 +207,20 @@ tangent_rule_registry[operator.setitem] = SetitemRule
 class EsrSumRule(DiffRuleBase):
     normalize_to_kwargs_only = False
 
-    def pushforward(
+    def output_meta(self, input):
+        imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
+        return RuntimeTensorMeta(
+            Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
+        )
+
+    def jvp(
         self,
         input, input_t
     ):
-        imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
-        set_node_meta(self.raw_node, RuntimeTensorMeta(
-            Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
-        ))
 
         return esr.sum(input_t)
 
 tangent_rule_registry[esr.sum] = EsrSumRule
-
-class DivRule(DiffRuleBase):
-    needs_primal_result = True
-
-    def pushforward(
-        self,
-        result,  # TODO needs result
-        input, other,
-        input_t, other_t
-    ):
-        return (input_t - other_t * result) / other
-
-tangent_rule_registry[torch.div] = DivRule
-# tangent_rule_registry[torch.Tensor.div_] = DivRule
-
 
 
 
@@ -198,6 +243,12 @@ differentiabilities[torch.add] = [
     )
 ]
 
+differentiabilities[torch.lt] = [
+    Differentiability(
+        [],
+        [('input', required), ('other', required), ('alpha', 1)]
+    )
+]
 
 def _normalize_einsum_kwargs(op, args, kwargs):
     def _match(equation, tensors):
@@ -207,7 +258,7 @@ def _normalize_einsum_kwargs(op, args, kwargs):
 differentiabilities[torch.einsum] = [
     Differentiability(
         ['tensors'],
-        [('equation', None)],
+        [('equation', required)],
         kwargs_normalizer=_normalize_einsum_kwargs
     )
 ]
