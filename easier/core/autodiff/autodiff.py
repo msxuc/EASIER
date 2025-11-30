@@ -163,16 +163,15 @@ class JvpTransformer(EasierInterpreter):
 
 
     def if_call_function(self, function: Callable) -> None:
-        # if function is operator.getitem:
-        #     container = self.current_node.args[0]
-        #     assert isinstance(container, Node)
-        #     imeta = get_node_meta(container)
+        if function is operator.getitem:
+            container = self.current_node.args[0]
+            assert isinstance(container, Node)
+            imeta = get_node_meta(container)
 
-        #     if isinstance(imeta, Sequence):
-        #         # This is the raw Node for unpacking a tuple
-        #         if container in self.nodemap_raw2primal:
-        #             # and the container Node has been handled  
-        #             1
+            if isinstance(imeta, Sequence):
+                # This is the raw Node for unpacking a tuple, has been handled
+                # when handling the multi-res raw Node.
+                return
 
         self._handle_operation(function)
         
@@ -204,85 +203,26 @@ class JvpTransformer(EasierInterpreter):
         self._try_init_tangent_for_inplace_target(target)
 
 
-        
-    def _handle_operation(self, function: Callable):
+    def _is_tangent_involved(self, raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]) -> bool:
         """
-        Handle the raw Node:
-        -   copy the raw Node to the primal Node into jvp Graph;
-        -   if the op is differentiable AND tangent flow appears on raw Node,
-            inject jvp sub-Graph.
+        By op category:
 
+        -   For operators that EASIER manually handles, DiffRule should parse
+            the raw Node and tell what raw ARGUMENTs are differentiable.
+            It's recorded in `raw_node_diff_args`.
+            
+            -   If the op is not differentiable, DiffRule unconditionally
+                returns empty dict.
+        
+        -   For auto-generated operators that are handled by torch.jvp,
+            the Differentiability record tells what PARAMETERS are statically
+            differentiable, and _handle_operation merge the static info and
+            actual info in the raw Node, and generate `raw_node_diff_args`.
 
-        An important extra property for inplace ops is:
-        the target Node, esr.Tensor instance or immediately result, may not
-        be bound with tangent initially.
-        It's at this inplace Node does the target starts to have tangent.
+        Remarks:
+
+        -   Tangent on non-diffable param is not counted.
         """
-        #
-        # Op category
-        #
-        if function in tangent_rule_registry:
-            rule_cls = tangent_rule_registry[function]
-            rule = rule_cls(self.current_node, function, self._fake_eval_meta_ctor)
-
-            raw_node_diff_args = rule.input_differentiability()
-
-            
-
-        else:
-        
-            # operator.xxx only appears in non-inplace CALL_FUNCTION Nodes.
-            # simply convert it to torch.xxx op.
-            if getattr(operator, function.__name__, None) is function:
-                function = getattr(torch, function.__name__)
-
-            #
-            # Handle using torch.func.jvp and tracing.
-            # This is not purely symbolic, must have proper shapes to work with.
-            #
-
-            if function not in differentiabilities:
-                raise NotImplementedError(
-                    f"Differentiation for operator {function} is not registered"
-                )
-            
-
-            # NOTE torch inplace ops with `out` param can be normalized, but are
-            # not supported by torch.jvp.
-
-            # TODO torch.einsum is not FX-norm-able, but should be handled by
-            # torch.jvp, as it's expanded to a lot of tensor manipulations
-            # and mul/sum calls.
-
-            # keys are strs, values are FX arguments, of RAW Graph
-            raw_node_normalized_kwargs: Dict[str, FxArg] = fx_normalize_function_variant_into_kwargs(
-                function, self.current_node.args, self.current_node.kwargs
-            )  # type: ignore
-            dfbs = differentiabilities[function]
-            for dfb in dfbs:
-                if dfb.all_param_names() == set(raw_node_normalized_kwargs.keys()):
-                    break
-            else:
-                assert False, \
-                    "Failed to resolve overloading:" \
-                    f" with Differentiabilities {dfbs}, get {raw_node_normalized_kwargs}"
-            
-            raw_node_diff_args = raw_node_normalized_kwargs.fromkeys(
-                dfb.diffable_params
-            )  # type: ignore
-        
-        # endif op category
-
-
-        # Mandatory context from all categories
-        raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]
-
-        
-        # If a diffable param happens to carry tangent
-        # -- tangent on non-diffable param is not counted.
-        #
-        # Also, in this noninplace handler we DO NOT count tangent appearance
-        # on inplace target. This is handled by the inplace handler.
         tangent_appear_flag: List[bool] = []
         for raw_node_diff_arg in raw_node_diff_args.values():
             if isinstance(raw_node_diff_arg, (Node, Sequence)):
@@ -292,32 +232,12 @@ class JvpTransformer(EasierInterpreter):
                     leaf_type=Node
                 )
                 tangent_appear_flag.extend(arg_flags)
+        
+        return any(tangent_appear_flag)
+    
+    def _prepare_diffable_primals_and_tangents(self, raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]):
 
-        if not any(tangent_appear_flag):
-            #
-            # No tangent computation for the noninplace part.
-            #
-            jvp_primal_node = self.jvp_graph.node_copy(
-                self.current_node, arg_transform=self.nodemap_raw2primal.__getitem__
-            )
-            self.nodemap_raw2primal[self.current_node] = jvp_primal_node
-
-            # TODO how to decide for non-diff / no-input-tangent ops?
-            set_node_meta(self.current_node, y_meta)
-
-            return
-
-
-        #
-        # Prepare primal and tangent Nodes for JVP calculation on this call.
-        #
-
-        # Initialize tangent after checking tangnet_appear_flag -- because the
-        # inplace target may not have a tangent, we need to prepare a zero
-        # tensor and bind it in the raw2tangent map.
-        self._try_init_tangent_for_inplace_op(function)
-
-        # Must be in the same (whatever) order as `raw_node_diff_args`
+      # Must be in the same (whatever) order as `raw_node_diff_args`
         input_primal_nodes: List[Union[FxConst, Node, Sequence[Node]]] = []
         input_tangent_nodes: List[Union[FxConst, Node, Sequence[Node]]] = []
 
@@ -365,59 +285,215 @@ class JvpTransformer(EasierInterpreter):
                     raw_node_diff_arg, _prepare_tangent_node
                 ))
 
+        return input_primal_nodes, input_tangent_nodes
+        
+    def _handle_operation(self, function: Callable):
+        """
+        Handle the raw Node:
+        -   copy the raw Node to the primal Node into jvp Graph;
+        -   if the op is differentiable AND tangent flow appears on raw Node,
+            inject jvp sub-Graph.
+
+
+        An important extra property for inplace ops is:
+        the target Node, esr.Tensor instance or immediately result, may not
+        be bound with tangent initially.
+        It's at this inplace Node does the target starts to have tangent.
+        """
         #
-        # Materialize JVP sub-Graph and copy into JVP full Graph
+        # Op category
         #
         if function in tangent_rule_registry:
-            rule: DiffRuleBase
+            rule_cls = tangent_rule_registry[function]
+            rule = rule_cls(self.current_node, function, self._fake_eval_meta_ctor)
 
+            #
+            # primal
+            #
             output_primal = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
 
-            # Rule is only charge of generating tangent calculations
-            output_tangent = rule.invoke(
-                output_primal,
-                list(raw_node_diff_args.keys()),
-                self.nodemap_raw2primal,
-                input_tangent_nodes
-            )
-            assert get_node_meta(self.current_node), \
-                "Rule should set metadata on the raw Node"
+            out_meta = rule.invoke_output_meta()
+            set_node_meta(self.current_node, out_meta)
 
-            # Must be a single Node
+            # TODO multi-res primal Node has this, but there is no strictly
+            # a multi-res tanget Node
             self.nodemap_raw2primal[self.current_node] = output_primal
 
-            if isinstance(output_tangent, Node):
-                #TODO likely a single Node
-                self.nodemap_raw2tangent[self.current_node] = output_tangent
-            else:
-                assert isinstance(output_tangent, Sequence)
-                # May have None item for non-diff-able items, say
-                # resultant indices in sort()
-                
+            if isinstance(out_meta, Sequence):  # multi-res Node
+                for raw_getitem in self.current_node.users:
+                    assert raw_getitem.target is operator.getitem
+                    _, item_i = raw_getitem.args
+                    assert isinstance(item_i, int)
 
-        
+                    primal_getitem = self.jvp_graph.node_copy(raw_getitem, self.nodemap_raw2primal.__getitem__)
+
+                    item_meta = out_meta[item_i]
+                    set_node_meta(raw_getitem, item_meta)
+
+                    self.nodemap_raw2primal[raw_getitem] = primal_getitem 
+
+            # TODO invoke_jvp may insert getitem Node again
+
+            #
+            # tangent
+            #
+            raw_node_diff_args = rule.input_differentiability()
+            tangent_involved = self._is_tangent_involved(raw_node_diff_args)
+
+            if tangent_involved:
+
+                # Initialize tangent after checking tangent_involved -- because
+                # inplace target may not have a tangent, we need to prepare a
+                # zero tensor and bind it in the raw2tangent map.
+                self._try_init_tangent_for_inplace_op(function)
+                    
+                _, input_tangent_nodes = self._prepare_diffable_primals_and_tangents(raw_node_diff_args)
+
+                # Rule is only charge of generating tangent calculations
+                output_tangent = rule.inject_jvp_subgraph(
+                    output_primal,
+                    list(raw_node_diff_args.keys()),
+                    self.nodemap_raw2primal,
+                    input_tangent_nodes
+                )
+
+                if isinstance(out_meta, RuntimeTensorMeta):
+                    assert isinstance(output_tangent, Node)
+                    self.nodemap_raw2tangent[self.current_node] = output_tangent
+
+                else:
+                    assert isinstance(output_tangent, Sequence)
+                    # May have None item for non-diff-able items, say
+                    # resultant indices in sort()
+                    #
+                    # The multi-res raw Node does not have tangent Node,
+                    # but its unpacking getitem Nodes have.
+
+                    for raw_getitem in self.current_node.users:
+                        assert raw_getitem.target is operator.getitem
+                        _, item_i = raw_getitem.args
+                        assert isinstance(item_i, int)
+
+                        tangent_item = output_tangent[item_i]
+                        if tangent_item is not None:
+                            # The unpacking getitem Nodes are required to be
+                            # generated by DiffRule.jvp() -- this is the most
+                            # general case, a multi-res tangent Node may not
+                            # always be available.
+                            self.nodemap_raw2tangent[raw_getitem] = output_tangent[item_i]
+                # endif output is multi-res
+            # endif tangent_involved
+
         else:
-            raw_node_normalized_kwargs: Dict[str, FxArg]
+        
+            # operator.xxx only appears in non-inplace CALL_FUNCTION Nodes.
+            # simply convert it to torch.xxx op.
+            if getattr(operator, function.__name__, None) is function:
+                function = getattr(torch, function.__name__)
 
-            gm, y_meta = self._generate_jvp_subgraph_using_torchfunc(
+            #
+            # Handle using torch.func.jvp and tracing.
+            # This is not purely symbolic, must have proper shapes to work with.
+            #
+
+            if function not in differentiabilities:
+                raise NotImplementedError(
+                    f"Differentiation for operator {function} is not registered"
+                )
+            
+
+            # NOTE torch inplace ops with `out` param can be normalized, but are
+            # not supported by torch.jvp.
+
+            # TODO torch.einsum is not FX-norm-able, but should be handled by
+            # torch.jvp, as it's expanded to a lot of tensor manipulations
+            # and mul/sum calls.
+
+            # keys are strs, values are FX arguments, of RAW Graph
+            raw_node_normalized_kwargs: Dict[str, FxArg] = fx_normalize_function_variant_into_kwargs(
+                function, self.current_node.args, self.current_node.kwargs
+            )  # type: ignore
+            dfbs = differentiabilities[function]
+            for dfb in dfbs:
+                if dfb.all_param_names() == set(raw_node_normalized_kwargs.keys()):
+                    break
+            else:
+                assert False, \
+                    "Failed to resolve overloading:" \
+                    f" with Differentiabilities {dfbs}, get {raw_node_normalized_kwargs}"
+            
+            raw_node_diff_args = raw_node_normalized_kwargs.fromkeys(
+                dfb.diffable_params  # type: ignore
+            )
+            tangent_involved = self._is_tangent_involved(
+                raw_node_diff_args  # type: ignore
+            )
+
+            # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
+            # NOTE this op may be a undifferentiable op, but we still need its
+            # primal part
+            gm, out_meta = self._generate_jvp_subgraph_using_torchfunc(
                 function, dfb, raw_node_normalized_kwargs
             )
-            subg = simplify_torchfunc_fx_graph(gm.graph)
-            copier = _TorchJvpSubGraphCopier(
-                gm, subg, self.jvp_graph, diff_arg_names, input_primal_nodes, input_tangent_nodes
-            ).run()
+            set_node_meta(self.current_node, out_meta)
 
-            set_node_meta(self.current_node, y_meta)
+            if not tangent_involved:
+                # maybe:
+                # - the op is not differentiable at all;
+                # - no input differentiable arguments are with tangents
+                # then copy the primal Node only.
+                output_primal = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
+                self.nodemap_raw2primal[self.current_node] = output_primal
+            
+            else:
+                # copy the whole torch.func.jvp sub-Graph, it includes both
+                # the primal part and the tangent part
 
-            assert isinstance(copier.output_primal, Node), "no multi-res support yet"
-            assert isinstance(copier.output_tangent, Node), "no multi-res support yet"
+                self._try_init_tangent_for_inplace_op(function)
+            
+                subg = simplify_torchfunc_fx_graph(gm.graph)
 
-            #TODO likely collections of Nodes
-            self.nodemap_raw2primal[self.current_node] = copier.output_primal
-            self.nodemap_raw2tangent[self.current_node] = copier.output_tangent
+                copier = _TorchJvpSubGraphCopier(
+                    gm, subg, self.jvp_graph, diff_arg_names, input_primal_nodes, input_tangent_nodes
+                ).run()
 
+                # torch.jvp sub-Graph is likely to result in explicit unpacking
+                # getitem Nodes on both primal and tangent.
 
-        # return (copier.output_primal, copier.output_tangent)
+                out_diff = dfb.output_differentiability
+
+                if isinstance(out_diff, bool):
+                    assert isinstance(copier.output_primal, Node)
+                    assert isinstance(copier.output_tangent, Node)
+                    assert out_diff == True
+                    self.nodemap_raw2primal[self.current_node] = copier.output_primal
+                    self.nodemap_raw2tangent[self.current_node] = copier.output_tangent
+                
+                else:
+                    assert isinstance(copier.output_primal, Sequence)
+                    assert isinstance(copier.output_tangent, Sequence)
+                    assert isinstance(out_diff, Sequence)
+
+                    # NOTE it's likely the RAW multi-res Node doesn't have
+                    # explicit primal/tangent counterpart Nodes, so we can only
+                    # set up binding on the unpacking getitem Nodes.
+
+                    for raw_getitem in self.current_node.users:
+                        assert raw_getitem.target is operator.getitem
+                        _, item_i = raw_getitem.args
+                        assert isinstance(item_i, int)
+
+                        self.nodemap_raw2primal[raw_getitem] = copier.output_primal[item_i]
+
+                        # If an output item is not differentiable, torch.jvp
+                        # generates zero tangent. We don't bind it.
+                        if out_diff[item_i]:
+                            self.nodemap_raw2tangent[raw_getitem] = copier.output_tangent[item_i]
+                # endif out_diff
+            # endif tangent_involved
+        
+        # endif op category
+
     
     def if_call_method(self, method_name: str):
         function = getattr(torch, method_name)

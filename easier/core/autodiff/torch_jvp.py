@@ -44,7 +44,7 @@ class Differentiability:
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant, e.g.
     # `output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]`
-    output: Union[Literal[True], List[bool]] = True
+    output_differentiability: Union[Literal[True], List[bool]] = True
 
     kwargs_normalizer: Callable[[Callable, tuple, dict], Dict[str, FxArg]] = \
         fx_normalize_function_variant_into_kwargs
@@ -102,13 +102,13 @@ class DiffRuleBase:
 
     def output_meta(self, *args, **kwargs):
         """
-        Calculate the metadata for primal result since we only symbolically
+        Calculate the metadata for raw/primal result since we only symbolically
         handle the Node without evaluate it.
 
-        Tangent, if present, shares the same metadata.
+        Tangent, if present, will share the same metadata.
 
         Inputs:
-        -   Input Nodes or constants
+        -   RAW input Nodes or constants to the RAW Node
 
         Returns:
         -   RuntimeTensorMeta or a nested one
@@ -139,7 +139,17 @@ class DiffRuleBase:
                     self.op, self.raw_node.args, self.raw_node.kwargs
                 )
     
-    def invoke(
+    def invoke_output_meta(self):
+        if self.fx_normalize_to_kwargs_only:
+            ometa = self.output_meta(**self.raw_normalized_kwargs)
+
+        else:
+            ometa = self.output_meta(*self.raw_node.args, **self.raw_node.kwargs)
+        
+        return ometa
+        
+    
+    def inject_jvp_subgraph(
         self,
         # If multi-res op, this param including non-diffable result item.
         primal_result: Union[Node, Sequence[Node]],
