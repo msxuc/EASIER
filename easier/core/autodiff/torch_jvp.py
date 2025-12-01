@@ -187,6 +187,7 @@ class DiffRuleBase:
                 return tracer.proxy(arg)
 
 
+        # Tangent parameters are suffixed by _t .e.g input_t, other_t
         kw_tangents_proxies = dict(zip(
             (n + '_t' for n in diff_input_names),
             map(_arg_proxy, tangents)

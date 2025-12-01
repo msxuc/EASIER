@@ -16,11 +16,10 @@ from torch.fx.node import Argument as FxArg, BaseArgumentTypes as _FxConstBase
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.modules import Module
 
-from easier.core.jit import EasierTracer
 import easier.core.module as esr
 from easier.core.passes.collective_initialization import collectively_initialize_and_validate
 from easier.core.passes.tensor_grouping import group_tensors, get_node_tensor_group
-from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
+# from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta, StructuredTensorMeta, collect_meta, set_node_meta, get_node_meta, get_runtime_metadata_from_scalar
 from easier.core.passes.utils import \
     FX, EasierInterpreter, OrderedSet, SubmodNameAllocator, get_easier_objects, isinst_checker, normalize_reducer_call_into_args, \
@@ -83,9 +82,24 @@ class JvpTransformer(EasierInterpreter):
         self.nodemap_raw2tangent: Dict[Node, Node] = {}
 
         # Not only supporting submod, any kinds of attributes are OK.
+        self.primal_name_allocator = SubmodNameAllocator('primal')
         self.tangent_name_allocator = SubmodNameAllocator('tangent')
+        self.primitive_name_allocator = SubmodNameAllocator('esrobj')
 
 
+    def _ensure_primitive_object(
+        self, raw_object: Union[esr.Tensor, esr.Selector, esr.Reducer],
+        name_allocator: SubmodNameAllocator,
+        attrname_hint: str
+    ) -> str:
+        for primal_attrname, primal_obj in self.jvp_module.__dict__.items():
+            if primal_obj is raw_object:
+                break
+        else:
+            primal_attrname = name_allocator.alloc_name(self.jvp_module, attrname_hint)
+            setattr(self.jvp_module, primal_attrname, raw_object)
+
+        return primal_attrname
 
     def _fake_eval_meta_ctor(self, shape, dtype):
         # Special function needed by get_value_runtime_info, to provide
@@ -124,24 +138,28 @@ class JvpTransformer(EasierInterpreter):
     
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
+        from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
         runtime_meta = get_value_runtime_info(
             self.current_node, attr_val, self._fake_eval_meta_ctor
         )
         set_node_meta(self.current_node, runtime_meta)
 
-        primal_node = self.jvp_graph.node_copy(self.current_node)
+        primal_attrname = self._ensure_primitive_object(attr_val, self.primal_name_allocator, attr_name)
+        primal_node = self.jvp_graph.get_attr(primal_attrname)
+
         self.nodemap_raw2primal[self.current_node] = primal_node
+
 
         if attr_val in self.initial_tangent_tensors:
             # Simplified: it's unlikely the same primal tensor has GET_ATTR
             # Nodes multiple times, therefore it's OK to inject GET_ATTR Nodes
             # for tangent each time.
             tangent_tensor = self.initial_tangent_tensors[attr_val]
-            tangent_name = self.tangent_name_allocator.alloc_name(self.jvp_module, attr_name)
-            setattr(self.jvp_module, tangent_name, tangent_tensor)
+
+            tangent_attrname = self._ensure_primitive_object(tangent_tensor, self.tangent_name_allocator, attr_name)
 
             # Inject tangent node
-            tangent_node = self.jvp_graph.get_attr(tangent_name)
+            tangent_node = self.jvp_graph.get_attr(tangent_attrname)
 
             # Bind primal-tangent
             self.nodemap_raw2tangent[self.current_node] = tangent_node
@@ -488,6 +506,13 @@ class JvpTransformer(EasierInterpreter):
         self._handle_operation(function)
 
     def if_call_module(self, submod: Module):
+
+        jvpmod_submod_attrname = self._ensure_primitive_object(
+            submod,  # type: ignore
+            self.primitive_name_allocator,
+            cast(str, self.current_node.target)
+        )
+
         if isinstance(submod, esr.Module):
             raise NotImplementedError()
             # Nested easier.Module, must be JVP-ed.
@@ -501,6 +526,8 @@ class JvpTransformer(EasierInterpreter):
 
             # Copy primal
             primal_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
+            primal_node.target = jvpmod_submod_attrname
+
             self.nodemap_raw2primal[self.current_node] = primal_node
             
             # NOTE the fake batch size is not affected by S.idx.shape[0]
@@ -509,6 +536,8 @@ class JvpTransformer(EasierInterpreter):
             # Inject JVP if tangent appears
             if input in self.nodemap_raw2tangent:
                 tangent_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2tangent.__getitem__)
+                tangent_node.target = jvpmod_submod_attrname
+
                 self.nodemap_raw2tangent[self.current_node] = tangent_node
 
         elif isinstance(submod, esr.Reducer):
@@ -521,6 +550,8 @@ class JvpTransformer(EasierInterpreter):
 
             # Copy primal
             primal_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
+            primal_node.target = jvpmod_submod_attrname
+
             self.nodemap_raw2primal[self.current_node] = primal_node
 
             # NOTE the fake batch size is not affected by S.idx.shape[0]
@@ -533,6 +564,8 @@ class JvpTransformer(EasierInterpreter):
                     self._try_init_tangent_for_inplace_target(out)
 
                 tangent_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2tangent.__getitem__)
+                tangent_node.target = jvpmod_submod_attrname
+
                 self.nodemap_raw2tangent[self.current_node] = tangent_node
 
 
@@ -727,6 +760,7 @@ class JvpTransformer(EasierInterpreter):
         else:
             role = Role.DISTRIBUTED
 
+        from easier.core.runtime.jit_engine.jit_engine import get_value_runtime_info
         y_meta = get_value_runtime_info(self.current_node, y, self._fake_eval_meta_ctor)
         jvp_meta = get_value_runtime_info(self.current_node, jvp_res, self._fake_eval_meta_ctor)
         assert y_meta == jvp_meta
@@ -839,7 +873,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
 
 
 class Jvp(esr.Module):
-    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor]):
+    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor], vectors: Optional[Sequence[esr.Tensor]] = None):
         super().__init__()
 
         self._check_dup_args(inputs, 'inputs')
@@ -853,11 +887,15 @@ class Jvp(esr.Module):
         self.outputs: Sequence[esr.Tensor] = \
             torch.nn.ParameterList(outputs)  # type: ignore
 
+        if vectors is not None:
+            self._check_dup_args(vectors, 'vectors')
 
-        # TODO how about tangents_in tangents_out?
-        self.vectors: Sequence[esr.Tensor] = torch.nn.ParameterList(
-            self._args_zerolike(inputs, 'inputs')
-                          )  # type: ignore
+            self.vectors = vectors
+
+        else:
+            self.vectors: Sequence[esr.Tensor] = torch.nn.ParameterList(
+                self._args_zerolike(inputs, 'inputs')
+            )  # type: ignore
         self.products: Sequence[esr.Tensor] = torch.nn.ParameterList(
             self._args_zerolike(outputs, 'outputs')
         )  # type: ignore
@@ -901,8 +939,9 @@ class Jvp(esr.Module):
 def jvp(
     module: esr.Module,
     inputs: Sequence[esr.Tensor],
-    outputs: Sequence[esr.Tensor]
-) -> Tuple[Jvp, Sequence[esr.Tensor], Sequence[esr.Tensor]]:
+    outputs: Sequence[esr.Tensor],
+    vectors: Optional[Sequence[esr.Tensor]] = None
+) -> Jvp:
     """
     Remarks:
     -   Input and output easier.Tensors are all mutable.
@@ -931,4 +970,4 @@ def jvp(
     # - Jvp.inputs, like `x` if input is InputModule.x
     # - Jvp.vector, like `tan_x`
 
-    return jvpm, jvpm.vectors, jvpm.products
+    return jvpm
