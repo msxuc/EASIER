@@ -50,12 +50,9 @@ class JvpTransformer(EasierInterpreter):
         self,
         module: esr.Module,
         jvp_module: 'Jvp',
-        initial_tangent_tensors: Dict[esr.Tensor, esr.Tensor]
     ):
-        # TODO move outside
         [module], [graph] = collectively_initialize_and_validate([module])
         [module], [graph] = group_tensors([module], [graph])
-
 
         _getattr_vals = set()
         class _SingleGetAttrValidator(EasierInterpreter):
@@ -75,30 +72,61 @@ class JvpTransformer(EasierInterpreter):
         super().__init__([module], [graph])
 
         self.jvp_module = jvp_module
-        self.initial_tangent_tensors = initial_tangent_tensors
 
         self.jvp_graph = Graph()
         self.nodemap_raw2primal: Dict[Node, Node] = {}
         self.nodemap_raw2tangent: Dict[Node, Node] = {}
 
-        # Not only supporting submod, any kinds of attributes are OK.
+        self.tensormap_primal2tangent: Dict[esr.Tensor, esr.Tensor] = {}
+        
+        # Primal inputs/outputs, tangent inputs/outputs have been setattr-ed
+        # to Jvp Module in its `.inputs/.outputs/.vectors/.products`
+        # torch.nn.ParamList fields, we need to rebind the attr paths.
+        #
+        # NOTE currently if an esr.Tensor/GET_ATTR-Node gets written with
+        # tangent, we only 1) ensure its GET_ATTR Node is unique; 2) inject a
+        # zero_like Node for GET_ATTR Node.
+        # I.e. we don't allocate an esr.Tensor for such immediate tangents.
+        self.tensors_attrpaths: Dict[esr.Tensor, str] = {}
+
+        for i, (input, vector) in enumerate(zip(jvp_module.inputs, jvp_module.vectors)):
+            self.tensormap_primal2tangent[input] = vector
+
+            self.tensors_attrpaths[input] = f'inputs.{i}'
+            self.tensors_attrpaths[vector] = f'vectors.{i}'
+
+
+        for i, (output, product) in enumerate(zip(jvp_module.outputs, jvp_module.products)):
+            self.tensormap_primal2tangent[output] = product
+
+            self.tensors_attrpaths[output] = f'outputs.{i}'
+            self.tensors_attrpaths[product] = f'products.{i}'
+
+
+        # There are still esr.Tensors not in jvp.inputs/outputs, but also
+        # primal, we allocate names and bind them lazily.
         self.primal_name_allocator = SubmodNameAllocator('primal')
-        self.tangent_name_allocator = SubmodNameAllocator('tangent')
-        self.primitive_name_allocator = SubmodNameAllocator('esrobj')
-        self.obj_attrpaths: Dict[Union[esr.Tensor, str]] = {}
+
+        # Attr name for Selector/Reducer to setattr on jvp
+        self.primitive_name_allocator = SubmodNameAllocator('esrprim')
 
 
-    def _ensure_primitive_object(
-        self, raw_object: Union[esr.Tensor, esr.Selector, esr.Reducer],
+    def _ensure_jvp_attr_obj(
+        self, raw_obj: Union[esr.Tensor, esr.Selector, esr.Reducer],
         name_allocator: SubmodNameAllocator,
         attrname_hint: str
     ) -> str:
+        if raw_obj in self.tensors_attrpaths:
+            return self.tensors_attrpaths[raw_obj]  # type: ignore
+
+        # Lazily bound non-IO primal tensors, or S/R.
+        # These attributes will be directly in the Jvp Module's fields.
         for primal_attrname, primal_obj in self.jvp_module.__dict__.items():
-            if primal_obj is raw_object:
+            if primal_obj is raw_obj:
                 break
         else:
             primal_attrname = name_allocator.alloc_name(self.jvp_module, attrname_hint)
-            setattr(self.jvp_module, primal_attrname, raw_object)
+            setattr(self.jvp_module, primal_attrname, raw_obj)
 
         return primal_attrname
 
@@ -145,23 +173,19 @@ class JvpTransformer(EasierInterpreter):
         )
         set_node_meta(self.current_node, runtime_meta)
 
-        primal_attrname = self._ensure_primitive_object(attr_val, self.primal_name_allocator, attr_name)
+        primal_attrname = self._ensure_jvp_attr_obj(attr_val, self.primal_name_allocator, attr_name)
         primal_node = self.jvp_graph.get_attr(primal_attrname)
 
         self.nodemap_raw2primal[self.current_node] = primal_node
 
-
-        
-
-        if attr_val in self.initial_tangent_tensors:
+        if attr_val in self.tensormap_primal2tangent:
             # Simplified: it's unlikely the same primal tensor has GET_ATTR
             # Nodes multiple times, therefore it's OK to inject GET_ATTR Nodes
             # for tangent each time.
-            tangent_tensor = self.initial_tangent_tensors[attr_val]
-
-            tangent_attrname = self._ensure_primitive_object(tangent_tensor, self.tangent_name_allocator, attr_name)
+            tangent_tensor = self.tensormap_primal2tangent[attr_val]
 
             # Inject tangent node
+            tangent_attrname = self.tensors_attrpaths[tangent_tensor]
             tangent_node = self.jvp_graph.get_attr(tangent_attrname)
 
             # Bind primal-tangent
@@ -510,7 +534,7 @@ class JvpTransformer(EasierInterpreter):
 
     def if_call_module(self, submod: Module):
 
-        jvpmod_submod_attrname = self._ensure_primitive_object(
+        jvpmod_submod_attrname = self._ensure_jvp_attr_obj(
             submod,  # type: ignore
             self.primitive_name_allocator,
             cast(str, self.current_node.target)
@@ -876,12 +900,17 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
 
 
 class Jvp(esr.Module):
-    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor], vectors: Optional[Sequence[esr.Tensor]] = None):
+    def __init__(
+        self,
+        inputs: Sequence[esr.Tensor],
+        outputs: Sequence[esr.Tensor],
+        vectors: Optional[Sequence[esr.Tensor]] = None
+    ):
         super().__init__()
 
         # A single list does not have duplicates, but the two lists can overlap
-        self._check_dup_args(inputs, 'inputs')
-        self._check_dup_args(outputs, 'outputs')
+        self._check_args_nondup_and_dtype(inputs, 'inputs')
+        self._check_args_nondup_and_dtype(outputs, 'outputs')
 
 
         # nn.ParamList is not actually a Sequence[Tensor] because it lacks
@@ -892,44 +921,63 @@ class Jvp(esr.Module):
             torch.nn.ParameterList(outputs)  # type: ignore
 
         if vectors is not None:
-            self._check_dup_args(vectors, 'vectors')
+            self._check_args_nondup_and_dtype(vectors, 'vectors')
 
-            self.vectors = vectors
+            if len(vectors) != len(inputs):
+                raise ValueError(
+                    f"The number of vectors {len(vectors)} does not match the"
+                    f" number of inputs {len(inputs)}"
+                )
+
+            _s = set(inputs).union(outputs)
+            for pos, v in enumerate(vectors):
+                if v in _s:
+                    raise ValueError(
+                        f"The {pos}-th vector esr.Tensor also appears in"
+                        f" inputs/outputs"
+                    )
+
+            self.vectors = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
+                vectors
+            ))
 
         else:
-            self.vectors: Sequence[esr.Tensor] = torch.nn.ParameterList(
-                self._args_zerolike(inputs, 'inputs')
-            )  # type: ignore
+            self.vectors = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
+                esr.Tensor(
+                    esr.zeros_like(input),
+                    mode=('partition' if input.is_partition else 'replicate')
+                )
+                for input in inputs
+            ))
 
-        # NOTE inputs and outputs may have overlap.
-        _lst_inputs = list(inputs)
         products = []
         for output in self.outputs:
-            if output in _lst_inputs:
-                overlap_input_i = _lst_inputs.index(output)
-                products.append(self.vectors[overlap_input_i])
-            else:
+            # If a specified output also appears in input, it reuses the
+            # tangent tensor for that input.
+            for overlap_input_i, input in enumerate(inputs):
+                if output is input:
+                    products.append(self.vectors[overlap_input_i])
+                    break
+            else:  # when not an overlapped output
                 products.append(esr.Tensor(
                     esr.zeros_like(output),
                     mode=('partition' if output.is_partition else 'replicate')
                 ))
 
-        self.products: Sequence[esr.Tensor] = torch.nn.ParameterList(
+        self.products = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
             products
-        )  # type: ignore
+        ))
 
     
-    def get_initial_tangent_tensors_map(self) -> Dict[esr.Tensor, esr.Tensor]:
-        mapping = {}
-        for i, v in zip(self.inputs, self.vectors):
-            mapping[i] = v
-        for o, p in zip(self.outputs, self.products):
-            mapping[o] = p
-        return mapping
-    
-    def _check_dup_args(self, args: Sequence[esr.Tensor], param_name: str):
+    def _check_args_nondup_and_dtype(self, args: Sequence[esr.Tensor], param_name: str):
         counts = {}
-        for arg in args:
+        for pos, arg in enumerate(args):
+            if not arg.dtype.is_floating_point:
+                raise ValueError(
+                    f"The {pos}-th easier.Tensor does not have floating-point"
+                    f" dtype in {param_name}"
+                )
+
             counts.setdefault(arg, 0)
             counts[arg] += 1
         for arg, c in counts.items():
@@ -939,20 +987,7 @@ class Jvp(esr.Module):
                     f"The {pos}-th easier.Tensor gets specified {c} times"
                     f" in {param_name}"
                 )
-    
-    def _args_zerolike(self, args: Sequence[esr.Tensor], param_name: str):
-        for pos, arg in enumerate(args):
-            if not arg.dtype.is_floating_point:
-                raise ValueError(
-                    f"The {pos}-th easier.Tensor does not have floating-point"
-                    f" dtype in {param_name}"
-                )
-
-            yield esr.Tensor(
-                esr.zeros_like(arg),
-                mode=('partition' if arg.is_partition else 'replicate')
-            )
-
+        
 
 def jvp(
     module: esr.Module,
@@ -973,16 +1008,29 @@ def jvp(
         specified twice.
     """
 
-    # Create a local class for each jvp call.
+    # To make Jvp Module FX-traceable, where FX picks the entrance `forward`
+    # method on the CLASS instead of an Jvp Module instance, we need to
+    # create a local class for each jvp call to provide class-level `forward`.
     class _Jvp(Jvp):
-        pass
+        def __init__(
+            self,
+            inputs: Sequence[esr.Tensor],
+            outputs: Sequence[esr.Tensor],
+            vectors: Optional[Sequence[esr.Tensor]] = None
+        ):
+            super().__init__(inputs, outputs, vectors)
 
-    jvpm = _Jvp(inputs, outputs)
-    jvp_transformer = JvpTransformer(
-        module, jvpm, jvpm.get_initial_tangent_tensors_map()
-    ).run()
+            self.graph_module: GraphModule
 
-    jvpm.forward = GraphModule(jvpm, jvp_transformer.jvp_graph).forward
+        def forward(self):
+            self.graph_module()
+            
+
+    jvpm = _Jvp(inputs, outputs, vectors)
+    jvp_transformer = JvpTransformer(module, jvpm).run()
+
+    gm = GraphModule(jvpm, jvp_transformer.jvp_graph)
+    jvpm.graph_module = gm
 
     # TODO assign meaningful names to:
     # - Jvp.inputs, like `x` if input is InputModule.x

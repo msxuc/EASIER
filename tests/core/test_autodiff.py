@@ -70,7 +70,6 @@ class TestJvp:
                 super().__init__()
 
                 p = torch.randperm(ne)
-                p = torch.arange(ne)
                 nnz2 = nnz[p]
                 s_idx = nnz2 % nx
                 r_idx = nnz2 // nx
@@ -88,22 +87,25 @@ class TestJvp:
                 )
                 self.y[:] = y
         
+        tangent_x_datasrc = torch.rand_like(x)
+
         raw = SpMV()
-
-        initial_tx = torch.rand_like(x)
-        tx = esr.Tensor(initial_tx, mode='partition')
-
+        tx = esr.Tensor(tangent_x_datasrc, mode='partition')
         jvp = esr.jvp(raw, [raw.x], [raw.y], vectors=[tx])
-        [jvp] = esr.compile([jvp], backend='none') # type: ignore
+        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
         jvp: Jvp
 
         jvp()
 
-        esr_y = raw.y.collect()
+        esr_y = jvp.outputs[0].collect()
         esr_ty = jvp.products[0].collect()
 
-        # classical mm and jvp grounding
-        torch_y, torch_ty = torch.func.jvp(torch.mv, (A, x), (torch.zeros_like(A), initial_tx) )
+        # classical mv and jvp grounding
+        torch_y, torch_ty = torch.func.jvp(  # type: ignore
+            torch.mv,
+            primals=(A, x),
+            tangents=(torch.zeros_like(A), tangent_x_datasrc)
+        )
 
         torch.testing.assert_close(esr_y, torch_y)
         torch.testing.assert_close(esr_ty, torch_ty)
