@@ -85,6 +85,7 @@ class JvpTransformer(EasierInterpreter):
         self.primal_name_allocator = SubmodNameAllocator('primal')
         self.tangent_name_allocator = SubmodNameAllocator('tangent')
         self.primitive_name_allocator = SubmodNameAllocator('esrobj')
+        self.obj_attrpaths: Dict[Union[esr.Tensor, str]] = {}
 
 
     def _ensure_primitive_object(
@@ -149,6 +150,8 @@ class JvpTransformer(EasierInterpreter):
 
         self.nodemap_raw2primal[self.current_node] = primal_node
 
+
+        
 
         if attr_val in self.initial_tangent_tensors:
             # Simplified: it's unlikely the same primal tensor has GET_ATTR
@@ -876,6 +879,7 @@ class Jvp(esr.Module):
     def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor], vectors: Optional[Sequence[esr.Tensor]] = None):
         super().__init__()
 
+        # A single list does not have duplicates, but the two lists can overlap
         self._check_dup_args(inputs, 'inputs')
         self._check_dup_args(outputs, 'outputs')
 
@@ -896,8 +900,22 @@ class Jvp(esr.Module):
             self.vectors: Sequence[esr.Tensor] = torch.nn.ParameterList(
                 self._args_zerolike(inputs, 'inputs')
             )  # type: ignore
+
+        # NOTE inputs and outputs may have overlap.
+        _lst_inputs = list(inputs)
+        products = []
+        for output in self.outputs:
+            if output in _lst_inputs:
+                overlap_input_i = _lst_inputs.index(output)
+                products.append(self.vectors[overlap_input_i])
+            else:
+                products.append(esr.Tensor(
+                    esr.zeros_like(output),
+                    mode=('partition' if output.is_partition else 'replicate')
+                ))
+
         self.products: Sequence[esr.Tensor] = torch.nn.ParameterList(
-            self._args_zerolike(outputs, 'outputs')
+            products
         )  # type: ignore
 
     

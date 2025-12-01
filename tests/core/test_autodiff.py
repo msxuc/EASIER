@@ -63,7 +63,7 @@ class TestJvp:
 
         # matrix form
         A = torch.zeros([ny, nx], dtype=torch.float64)
-        A[nnz // ny, nnz % nx] = Ae
+        A.flatten()[nnz] = Ae
 
         class SpMV(esr.Module):
             def __init__(self):
@@ -72,7 +72,7 @@ class TestJvp:
                 p = torch.randperm(ne)
                 p = torch.arange(ne)
                 nnz2 = nnz[p]
-                s_idx = nnz2 % ny
+                s_idx = nnz2 % nx
                 r_idx = nnz2 // nx
 
                 self.Ae = esr.Tensor(Ae[p], mode='partition')
@@ -94,7 +94,7 @@ class TestJvp:
         tx = esr.Tensor(initial_tx, mode='partition')
 
         jvp = esr.jvp(raw, [raw.x], [raw.y], vectors=[tx])
-        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
+        [jvp] = esr.compile([jvp], backend='none') # type: ignore
         jvp: Jvp
 
         jvp()
@@ -103,10 +103,10 @@ class TestJvp:
         esr_ty = jvp.products[0].collect()
 
         # classical mm and jvp grounding
-        torch_y, torch_ty = torch.func.jvp(torch.mm, (A, x[:, None]), (torch.zeros_like(A), initial_tx[:, None]) )
+        torch_y, torch_ty = torch.func.jvp(torch.mv, (A, x), (torch.zeros_like(A), initial_tx) )
 
-        torch.testing.assert_close(esr_y[:, None], torch_y)
-        torch.testing.assert_close(esr_ty[:, None], torch_ty)
+        torch.testing.assert_close(esr_y, torch_y)
+        torch.testing.assert_close(esr_ty, torch_ty)
 
 
 
