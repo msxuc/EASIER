@@ -59,7 +59,11 @@ class TestJvp:
 
         Ae = torch.rand_like(nnz, dtype=torch.float64)
         x = torch.rand(nx, dtype=torch.float64)
-        y = torch.rand(ny, dtype=torch.float64)
+        y = torch.zeros(ny, dtype=torch.float64)
+
+        # matrix form
+        A = torch.zeros([ny, nx], dtype=torch.float64)
+        A[nnz % ny, nnz // nx] = Ae
 
         class SpMV(esr.Module):
             def __init__(self):
@@ -81,31 +85,70 @@ class TestJvp:
                 y = self.reducer(
                     self.selector(self.x) * self.Ae
                 )
-                # self.y[:] = y
+                self.y[:] = y
         
         raw = SpMV()
 
-        raw_jvp = Jvp()
+        raw_jvp = Jvp([raw.x], [raw.y])
         t_x = esr.Tensor(x, mode='partition')
+        t_y = esr.Tensor(y, mode='partition')
 
-        jvp_transfomer = JvpTransformer(raw, raw_jvp, { raw.x: t_x}).run()
+        jvp_transfomer = JvpTransformer(raw, raw_jvp, { raw.x: t_x, raw.y: t_y }).run()
         jvp_g = jvp_transfomer.jvp_graph
 
+        """
+graph():
+%x : [num_users=1] = get_attr[target=x]
+%tangent0x : [num_users=1] = get_attr[target=tangent0x]
 
-        [jvp], [tx], [ty] = esr.jvp([raw], [raw.x], [raw.y])
+%selector : [num_users=2] = call_module[target=selector](args = (%x,), kwargs = {})
+%selector_1 : [num_users=1] = call_module[target=selector](args = (%tangent0x,), kwargs = {})
 
-        # [jvp] = esr.compile([jvp], backend='torch')
+%ae : [num_users=3] = get_attr[target=Ae]
 
+%zeros_like : [num_users=1] = call_function[target=torch.zeros_like](args = (%ae,), kwargs = {})
+%mul : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%selector, %ae), kwargs = {})
+%mul_1 : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%selector_1, %ae), kwargs = {})
+%mul_2 : [num_users=1] = call_function[target=torch.ops.aten.mul.Tensor](args = (%zeros_like, %selector), kwargs = {})
+%add : [num_users=1] = call_function[target=torch.ops.aten.add.Tensor](args = (%mul_2, %mul_1), kwargs = {})
 
-        raw_f = raw.forward
-        [raw] = esr.compile([raw], backend='none')
+%reducer : [num_users=1] = call_module[target=reducer](args = (%mul,), kwargs = {})
+%reducer_1 : [num_users=1] = call_module[target=reducer](args = (%add,), kwargs = {})
 
-        # NoneBackendEngine adds extra computation
-        raw.forward = raw_f
+%y : [num_users=1] = get_attr[target=y]
+%tangent1y : [num_users=1] = get_attr[target=tangent1y]
 
-        def _classic(input_x: torch.Tensor):
-            1
+%setitem : [num_users=0] = call_function[target=operator.setitem](args = (%y, slice(None, None, None), %reducer), kwargs = {})
+%setitem_1 : [num_users=0] = call_function[target=operator.setitem](args = (%tangent1y, slice(None, None, None), %reducer_1), kwargs = {})
+"""
+        initial_tx = torch.rand_like(x)
+        class TxSetter(esr.Module):
+            def __init__(self, tx: esr.Tensor):
+                super().__init__()
+                self.tx = tx
+                self.initial_tx = esr.Tensor(initial_tx, mode='partition')
+            def forward(self):
+                self.tx[:] = self.initial_tx
 
+        raw: SpMV
+        jvp, [tx], [ty] = esr.jvp(raw, [raw.x], [raw.y])
+        tx_setter = TxSetter(tx)
+        [jvp, tx_setter] = esr.compile([jvp, tx_setter], backend='torch') # type: ignore
+
+        jvp: Jvp
+        tx_setter: TxSetter
+
+        tx_setter()
+        jvp()
+
+        esr_y = raw.y.collect()
+        esr_ty = ty.collect()
+
+        # classical mm and jvp grounding
+        torch_y, torch_ty = torch.func.jvp(torch.mm, (x, A), (tx, torch.zeros_like(A)) )
+
+        torch.testing.assert_close(esr_y, torch_y)
+        torch.testing.assert_close(esr_ty, torch_ty)
 
 
 

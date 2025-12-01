@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from .core.autodiff.autodiff import jvp
 from .core.dump import dump
 from .core.module import (
     Tensor,

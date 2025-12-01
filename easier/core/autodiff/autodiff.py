@@ -5,13 +5,14 @@ import contextlib
 import dataclasses
 import itertools
 import operator
+from types import EllipsisType
 from typing import Callable, Collection, Dict, List, Literal, Optional, Self, Sequence, Tuple, TypeAlias, Union, cast
 from typing_extensions import OrderedDict
 
 import more_itertools
 import torch
 from torch.fx import Node, Graph, GraphModule
-from torch.fx.node import Argument as FxArg
+from torch.fx.node import Argument as FxArg, BaseArgumentTypes as _FxConstBase
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.modules import Module
 
@@ -31,24 +32,9 @@ from easier.core.autodiff.utils import simplify_torchfunc_fx_graph
 
 from .torch_jvp import DiffRuleBase, Differentiability, tangent_rule_registry, differentiabilities
 
-class Jvp(esr.Module):
-    """
-    """
-    def __init__(self):
-        super().__init__()
 
-        inputs: Sequence[esr.Tensor]
-        outputs: Sequence[esr.Tensor]
-
-        vector: Sequence[esr.Tensor]
-        product: Sequence[esr.Tensor]
-        # TODO how about tangents_in tangents_out?
-    
-    def forward(self):
-        raise EasierJitException()
-
-
-FxConst: TypeAlias = Union[int, float, str]
+# e.g. int, float, dtype, device, slice, range, etc.
+FxConst: TypeAlias = Union[_FxConstBase, slice, range]
 
 
 
@@ -64,7 +50,7 @@ class JvpTransformer(EasierInterpreter):
     def __init__(
         self,
         module: esr.Module,
-        jvp_module: Jvp,
+        jvp_module: 'Jvp',
         initial_tangent_tensors: Dict[esr.Tensor, esr.Tensor]
     ):
         # TODO move outside
@@ -337,7 +323,7 @@ class JvpTransformer(EasierInterpreter):
             #
             # tangent
             #
-            raw_node_diff_args = rule.input_differentiability()
+            raw_node_diff_args = rule.input_differentiability(*self.current_node.args, **self.current_node.kwargs)
             tangent_involved = self._is_tangent_involved(raw_node_diff_args)
 
             if tangent_involved:
@@ -422,17 +408,18 @@ class JvpTransformer(EasierInterpreter):
                     "Failed to resolve overloading:" \
                     f" with Differentiabilities {dfbs}, get {raw_node_normalized_kwargs}"
             
-            raw_node_diff_args = raw_node_normalized_kwargs.fromkeys(
-                dfb.diffable_params  # type: ignore
-            )
-            tangent_involved = self._is_tangent_involved(
-                raw_node_diff_args  # type: ignore
-            )
+            raw_node_diff_args: Dict[
+                str, Union[FxConst, Node, Sequence[Node]]
+            ] = {
+                p: raw_node_normalized_kwargs[p] for p in dfb.diffable_params
+            }  # type: ignore
+
+            tangent_involved = self._is_tangent_involved(raw_node_diff_args)
 
             # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
             # NOTE this op may be a undifferentiable op, but we still need its
             # primal part
-            gm, out_meta = self._generate_jvp_subgraph_using_torchfunc(
+            gm, out_meta, flatten_tree = self._generate_jvp_subgraph_using_torchfunc(
                 function, dfb, raw_node_normalized_kwargs
             )
             set_node_meta(self.current_node, out_meta)
@@ -446,15 +433,16 @@ class JvpTransformer(EasierInterpreter):
                 self.nodemap_raw2primal[self.current_node] = output_primal
             
             else:
+                self._try_init_tangent_for_inplace_op(function)
+
+                # Unflattened structure
+                input_primal_nodes, input_tangent_nodes = self._prepare_diffable_primals_and_tangents(raw_node_diff_args)
+
                 # copy the whole torch.func.jvp sub-Graph, it includes both
                 # the primal part and the tangent part
-
-                self._try_init_tangent_for_inplace_op(function)
-            
                 subg = simplify_torchfunc_fx_graph(gm.graph)
-
                 copier = _TorchJvpSubGraphCopier(
-                    gm, subg, self.jvp_graph, diff_arg_names, input_primal_nodes, input_tangent_nodes
+                    gm, subg, self.jvp_graph, flatten_tree, input_primal_nodes, input_tangent_nodes
                 ).run()
 
                 # torch.jvp sub-Graph is likely to result in explicit unpacking
@@ -497,9 +485,7 @@ class JvpTransformer(EasierInterpreter):
     
     def if_call_method(self, method_name: str):
         function = getattr(torch, method_name)
-        kwargs = fx_normalize_function_variant_into_kwargs(function, self.current_node.args, self.current_node.kwargs)
-
-        assert False
+        self._handle_operation(function)
 
     def if_call_module(self, submod: Module):
         if isinstance(submod, esr.Module):
@@ -507,13 +493,18 @@ class JvpTransformer(EasierInterpreter):
             # Nested easier.Module, must be JVP-ed.
             # sub_jvp_transformer = JvpTransformer(self.root_jvp, submod).run()
 
+        # TODO make Selector/Reducer rules.
 
         elif isinstance(submod, esr.Selector):
             input = normalize_selector_call_into_args(*self.current_node.args, **self.current_node.kwargs)
+            assert isinstance(input, Node)
 
             # Copy primal
             primal_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
             self.nodemap_raw2primal[self.current_node] = primal_node
+            
+            # NOTE the fake batch size is not affected by S.idx.shape[0]
+            set_node_meta(self.current_node, get_node_meta(input))
 
             # Inject JVP if tangent appears
             if input in self.nodemap_raw2tangent:
@@ -525,11 +516,15 @@ class JvpTransformer(EasierInterpreter):
                 raise NotImplementedError()
 
             input, out = normalize_reducer_call_into_args(*self.current_node.args, **self.current_node.kwargs)
+            assert isinstance(input, Node)
             assert out is None or isinstance(out, Node)
 
             # Copy primal
             primal_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
             self.nodemap_raw2primal[self.current_node] = primal_node
+
+            # NOTE the fake batch size is not affected by S.idx.shape[0]
+            set_node_meta(self.current_node, get_node_meta(input))
 
             # Inject JVP if tangent appears
             if input in self.nodemap_raw2tangent or out in self.nodemap_raw2tangent:
@@ -544,20 +539,12 @@ class JvpTransformer(EasierInterpreter):
         else:
             assert False, 'unreachable'
 
-        assert isinstance(input, Node)
-        imeta = get_node_meta(input)
-        assert isinstance(imeta, RuntimeTensorMeta)
-        ometa = self._fake_eval_meta_ctor(imeta.shape, imeta.dtype)
-        set_node_meta(self.current_node, ometa)
-        
-        primal_node = self.jvp_graph.node_copy(self.current_node, self.nodemap_raw2primal.__getitem__)
-        self.nodemap_raw2primal[self.current_node] = primal_node
 
 
     def _generate_jvp_subgraph_using_torchfunc(
         self,
         function: Callable, dfb: Differentiability, raw_normalized_kwargs: Dict[str, FxArg],
-    ) -> Tuple[GraphModule, StructuredTensorMeta]:
+    ) -> Tuple[GraphModule, StructuredTensorMeta, List[List[int]]]:
         """
         We need to note that torch.func.jvp API only leverage the order of
         parameters -- via `diff_arg_names: List[str]`,
@@ -698,16 +685,16 @@ class JvpTransformer(EasierInterpreter):
 
             
 
-        flattened_primal_pos, flattened_primal_vals = _flatten(diff_primal_vals)
-        flattened_tangent_pos, flattened_tangent_vals = _flatten(tangent_vals)
-        assert flattened_primal_pos == flattened_tangent_pos
+        flattened_primal_tree, flattened_primal_vals = _flatten(diff_primal_vals)
+        flattened_tangent_tree, flattened_tangent_vals = _flatten(tangent_vals)
+        assert flattened_primal_tree == flattened_tangent_tree
 
         # Other non-differentiable parameters must NOT be passed via jvp()
         # API param list, but via function closure.
 
         def _primal_func(*flattened_primals: torch.Tensor):
             # There preparations are not part of FX Proxy and won't be traced
-            unfltd_primals = _unflatten(flattened_primal_pos, flattened_primals)
+            unfltd_primals = _unflatten(flattened_primal_tree, flattened_primals)
 
             kw = {}
             for diff_arg_name, v in zip(diff_arg_names, unfltd_primals):
@@ -745,27 +732,33 @@ class JvpTransformer(EasierInterpreter):
         assert y_meta == jvp_meta
 
         # TODO return bijective position mapping
-        return gm, y_meta
+        return gm, y_meta, flattened_primal_tree
 
 class _TorchJvpSubGraphCopier(EasierInterpreter):
     def __init__(
         self, subgm: GraphModule, subg: Graph, jvp_graph: Graph,
-        diff_arg_names: List[str],
-        jvp_input_primals: Dict[str, Union[FxConst, Node, Sequence[Node]]],
-        jvp_input_tangents: Dict[str, Union[Node, Sequence[Node]]]         
+        flatten_tree: List[List[int]],
+        jvp_input_primals: List[Union[FxConst, Node, Sequence[Node]]],
+        jvp_input_tangents: List[Union[FxConst, Node, Sequence[Node]]],
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
         self.jvp_graph = jvp_graph
-        self.diff_arg_names = diff_arg_names
+        # self.diff_arg_names = diff_arg_names
         self.jvp_input_primals = jvp_input_primals
         self.jvp_input_tangents = jvp_input_tangents
+        assert len(jvp_input_primals) == len(jvp_input_tangents)
+
+        self.flatten_tree = flatten_tree
 
         self.nested_arg_bijective_pos = {}
 
         self.placeholder_i = 0  # totally 2*len(diff_arg_names)
 
-        self.nodemap_subg2jvp: Dict[Node, Union[Node, int, float]] = {}
+        # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
+        # allow constants, but the subgraph assumes all inputs are Nodes,
+        # making it erroneous to call torch function/method on constants.
+        self.nodemap_subg2jvp: Dict[Node, Union[Node, FxConst]] = {}
 
         self.output_primal: Union[Node, Sequence[Node]]
         self.output_tangent: Union[Node, Sequence[Node]]
@@ -775,18 +768,31 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         """
         Same as torch.func.jvp requirements, the PLACEHOLDER Nodes only differ
         in their positions and the order.
+
+        All placeholders are formed by first flattening the args of the raw
+        Node, e.g. torch.cat([A,B,C]) will have 3 placeholders A, B, C.
         """
         # param_name would be "primals_1" "tangents_2" (from `def _jvp` above)
         # and not usable.
-        is_primal = self.placeholder_i < len(self.diff_arg_names)
+        is_primal = self.placeholder_i < len(self.jvp_input_primals)
+
+        def _from_flatten(jvp_inputs: List[Union[FxConst, Node, Sequence[Node]]], tree: List[int]) -> Union[Node, FxConst]:
+            if len(tree) == 1:
+                [i] = tree
+                return jvp_inputs[i]  # type: ignore
+            else:
+                [i, ii] = tree
+                return jvp_inputs[i][ii] # type: ignore
 
         if is_primal:
-            pos = self.placeholder_i
-            jvp_primal = self.jvp_input_primals[self.diff_arg_names[pos]]
+            ph_pos = self.placeholder_i
+
+            jvp_primal = _from_flatten(self.jvp_input_primals, self.flatten_tree[ph_pos])
             self.nodemap_subg2jvp[self.current_node] = jvp_primal
         else:
-            pos = self.placeholder_i - len(self.diff_arg_names)
-            jvp_tangent = self.jvp_input_tangents[self.diff_arg_names[pos]]
+            ph_pos = self.placeholder_i - len(self.jvp_input_primals)
+
+            jvp_tangent = _from_flatten(self.jvp_input_tangents, self.flatten_tree[ph_pos])
             self.nodemap_subg2jvp[self.current_node] = jvp_tangent
 
         self.placeholder_i += 1
@@ -832,16 +838,12 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         )
 
 
-class LazyJvpModule(esr.Module):
-    def __init__(self, primal_module: esr.Module, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor]):
+class Jvp(esr.Module):
+    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor]):
         super().__init__()
 
         self._check_dup_args(inputs, 'inputs')
         self._check_dup_args(outputs, 'outputs')
-
-        
-        # TODO the primal module may also be a placeholder JvpModule
-        self.easier_primal_module: esr.Module = primal_module
 
 
         # nn.ParamList is not actually a Sequence[Tensor] because it lacks
@@ -859,7 +861,15 @@ class LazyJvpModule(esr.Module):
         self.products: Sequence[esr.Tensor] = torch.nn.ParameterList(
             self._args_zerolike(outputs, 'outputs')
         )  # type: ignore
+
     
+    def get_initial_tangent_tensors_map(self) -> Dict[esr.Tensor, esr.Tensor]:
+        mapping = {}
+        for i, v in zip(self.inputs, self.vectors):
+            mapping[i] = v
+        for o, p in zip(self.outputs, self.products):
+            mapping[o] = p
+        return mapping
     
     def _check_dup_args(self, args: Sequence[esr.Tensor], param_name: str):
         counts = {}
@@ -886,16 +896,13 @@ class LazyJvpModule(esr.Module):
                 esr.zeros_like(arg),
                 mode=('partition' if arg.is_partition else 'replicate')
             )
-    
-    def forward(self):
-        assert False, "not callable"
 
 
 def jvp(
     module: esr.Module,
     inputs: Sequence[esr.Tensor],
     outputs: Sequence[esr.Tensor]
-) -> LazyJvpModule:
+) -> Tuple[Jvp, Sequence[esr.Tensor], Sequence[esr.Tensor]]:
     """
     Remarks:
     -   Input and output easier.Tensors are all mutable.
@@ -909,10 +916,19 @@ def jvp(
         specified twice.
     """
 
-    jvpm = LazyJvpModule(module, inputs, outputs)
+    # Create a local class for each jvp call.
+    class _Jvp(Jvp):
+        pass
+
+    jvpm = _Jvp(inputs, outputs)
+    jvp_transformer = JvpTransformer(
+        module, jvpm, jvpm.get_initial_tangent_tensors_map()
+    ).run()
+
+    jvpm.forward = GraphModule(jvpm, jvp_transformer.jvp_graph).forward
 
     # TODO assign meaningful names to:
     # - Jvp.inputs, like `x` if input is InputModule.x
     # - Jvp.vector, like `tan_x`
 
-    return jvpm
+    return jvpm, jvpm.vectors, jvpm.products
