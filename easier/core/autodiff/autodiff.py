@@ -949,6 +949,9 @@ class Jvp(esr.Module):
                 )
                 for input in inputs
             ))
+        
+
+        self.nonoverlapping_products = torch.nn.ParameterList()
 
         products = []
         for output in self.outputs:
@@ -959,14 +962,18 @@ class Jvp(esr.Module):
                     products.append(self.vectors[overlap_input_i])
                     break
             else:  # when not an overlapped output
-                products.append(esr.Tensor(
+                nonoverlapping_product = esr.Tensor(
                     esr.zeros_like(output),
                     mode=('partition' if output.is_partition else 'replicate')
-                ))
+                )
+                products.append(nonoverlapping_product)
+
+                self.nonoverlapping_products.append(nonoverlapping_product)
 
         self.products = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
             products
         ))
+
 
     
     def _check_args_nondup_and_dtype(self, args: Sequence[esr.Tensor], param_name: str):
@@ -1023,6 +1030,10 @@ def jvp(
             self.graph_module: GraphModule
 
         def forward(self):
+
+            for p in self.nonoverlapping_products:
+                p.zero_()
+
             self.graph_module()
             
 

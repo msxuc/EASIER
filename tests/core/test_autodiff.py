@@ -91,7 +91,7 @@ class TestJvp:
 
         raw = SpMV()
         tx = esr.Tensor(tangent_x_datasrc, mode='partition')
-        jvp = esr.jvp(raw, [raw.x], [raw.y], vectors=[tx])
+        jvp = esr.jvp(raw, [raw.x], [raw.y, raw.Ae], vectors=[tx])
         [jvp] = esr.compile([jvp], backend='torch') # type: ignore
         jvp: Jvp
 
