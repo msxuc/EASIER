@@ -464,7 +464,9 @@ class JvpTransformer(EasierInterpreter):
         
             # operator.xxx only appears in non-inplace CALL_FUNCTION Nodes.
             # simply convert it to torch.xxx op.
-            if getattr(operator, function.__name__, None) is function:
+            if function is operator.truediv:
+                function = torch.div
+            elif getattr(operator, function.__name__, None) is function:
                 function = getattr(torch, function.__name__)
 
             #
@@ -538,18 +540,24 @@ class JvpTransformer(EasierInterpreter):
                         raw_node_diff_args
                     )
 
+                out_diff = dfb.output_differentiability
+
+                n_flattened_primal_outputs = 1
+                if isinstance(out_diff, Sequence):
+                    n_flattened_primal_outputs = len(out_diff)
+
                 # copy the whole torch.func.jvp sub-Graph, it includes both
                 # the primal part and the tangent part
                 subg = simplify_torchfunc_fx_graph(gm.graph)
                 copier = _TorchJvpSubGraphCopier(
                     gm, subg, self.jvp_graph,
-                    flatten_tree, input_primal_nodes, input_tangent_nodes
+                    flatten_tree, input_primal_nodes, input_tangent_nodes,
+                    n_flattened_primal_outputs
                 ).run()
 
                 # torch.jvp sub-Graph is likely to result in explicit unpacking
                 # getitem Nodes on both primal and tangent.
 
-                out_diff = dfb.output_differentiability
 
                 if isinstance(out_diff, bool):
                     assert isinstance(copier.output_primal, Node)
@@ -589,7 +597,7 @@ class JvpTransformer(EasierInterpreter):
 
     
     def if_call_method(self, method_name: str):
-        function = getattr(torch, method_name)
+        function = getattr(torch.ops.aten, method_name)
         self._handle_operation(function)
 
     def if_call_module(self, submod: Module):
@@ -704,12 +712,6 @@ class JvpTransformer(EasierInterpreter):
             diff_param: str
             raw_node_diff_arg = raw_normalized_kwargs[diff_param]
 
-            # e.g. cat([A, B, C])  -> jvp(lambda A,B,C: cat([A, B, C])
-            # There Nodes ABC in the tuple should be captured indivdually
-            # into the callable to jvp().
-            assert not isinstance(raw_node_diff_arg, Sequence), \
-                "Nested input to torch.cat etc. must be bijectively flattened"
-
             if not isinstance(raw_node_diff_arg, (Node, Sequence)):
                 # const scalars
                 assert isinstance(raw_node_diff_arg, (int, float, str))
@@ -729,9 +731,9 @@ class JvpTransformer(EasierInterpreter):
 
                 # for a list-typed arg, we assume no mix of Node and scalar.
                 jvp_diff_primal_vals[diff_param] = \
-                    self._create_zero_val(raw_node_diff_arg)
+                    self._create_zero_val(raw_node_diff_arg)  # type: ignore
                 jvp_tangent_vals[diff_param] = \
-                    self._create_zero_val(raw_node_diff_arg)
+                    self._create_zero_val(raw_node_diff_arg)  # type: ignore
 
         #
         # Non-differentiable parts of raw inputs, primal inputs
@@ -754,7 +756,8 @@ class JvpTransformer(EasierInterpreter):
                 raise NotImplementedError("Captured non-differentiable arg")
 
             else:
-                assert isinstance(raw_node_nondiff_arg, (int, float, str))
+                assert raw_node_nondiff_arg is None \
+                    or isinstance(raw_node_nondiff_arg, (int, float, str))
                 jvp_nondiff_val = raw_node_nondiff_arg
 
             # TODO this takes effect even user specifies the value to be
@@ -771,7 +774,9 @@ class JvpTransformer(EasierInterpreter):
                 assert not isinstance(default_arg, RequiredParam)
                 jvp_nondiff_val = default_arg
             
-            jvp_nondiff_env_vals[nondiff_param] = jvp_nondiff_val
+            jvp_nondiff_env_vals[
+                nondiff_param
+            ] = jvp_nondiff_val  # type: ignore
 
         
         # Differentiable Tensor-type parameters, must be passed via jvp()
@@ -834,6 +839,8 @@ class JvpTransformer(EasierInterpreter):
         # Other non-differentiable parameters must NOT be passed via jvp()
         # API param list, but via function closure.
 
+        is_aten_api = 'aten' in function.__module__
+
         def _primal_func(*flattened_primals: torch.Tensor):
             # There preparations are not part of FX Proxy and won't be traced
             unfltd_primals = _unflatten(
@@ -842,6 +849,10 @@ class JvpTransformer(EasierInterpreter):
 
             kw = {}
             for diff_arg_name, v in zip(diff_arg_names, unfltd_primals):
+
+                if is_aten_api and diff_arg_name == 'input':
+                    diff_arg_name = 'self'
+
                 kw[diff_arg_name] = v
             for other_arg_name, v in jvp_nondiff_env_vals.items():
                 kw[other_arg_name] = v
@@ -865,8 +876,6 @@ class JvpTransformer(EasierInterpreter):
         )
         y, jvp_res = gm(flattened_primal_vals, flattened_tangent_vals)
 
-        assert isinstance(y, torch.Tensor), "TODO multi-res"
-
         ng = get_node_tensor_group(self.current_node)
         if ng is None:
             role = Role.REPLICATED
@@ -889,9 +898,10 @@ class JvpTransformer(EasierInterpreter):
 class _TorchJvpSubGraphCopier(EasierInterpreter):
     def __init__(
         self, subgm: GraphModule, subg: Graph, jvp_graph: Graph,
-        flatten_tree: List[List[int]],
+        input_flatten_tree: List[List[int]],
         jvp_input_primals: List[Union[FxConst, Node, Sequence[Node]]],
         jvp_input_tangents: List[Union[FxConst, Node, Sequence[Node]]],
+        n_flattened_primal_outputs: int
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
@@ -901,9 +911,10 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         self.jvp_input_tangents = jvp_input_tangents
         assert len(jvp_input_primals) == len(jvp_input_tangents)
 
-        self.flatten_tree = flatten_tree
+        self.input_flatten_tree = input_flatten_tree
+        self.n_flattened_primal_inputs = len(input_flatten_tree)
 
-        self.nested_arg_bijective_pos = {}
+        self.n_flattened_primal_outputs =  n_flattened_primal_outputs
 
         self.placeholder_i = 0  # totally 2*len(diff_arg_names)
 
@@ -926,7 +937,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         """
         # param_name would be "primals_1" "tangents_2" (from `def _jvp` above)
         # and not usable.
-        is_primal = self.placeholder_i < len(self.jvp_input_primals)
+        is_primal = self.placeholder_i < self.n_flattened_primal_inputs
 
         def _from_flatten(
             jvp_inputs: List[Union[FxConst, Node, Sequence[Node]]],
@@ -943,14 +954,14 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
             ph_pos = self.placeholder_i
 
             jvp_primal = _from_flatten(
-                self.jvp_input_primals, self.flatten_tree[ph_pos]
+                self.jvp_input_primals, self.input_flatten_tree[ph_pos]
             )
             self.nodemap_subg2jvp[self.current_node] = jvp_primal
         else:
-            ph_pos = self.placeholder_i - len(self.jvp_input_primals)
+            ph_pos = self.placeholder_i - self.n_flattened_primal_inputs
 
             jvp_tangent = _from_flatten(
-                self.jvp_input_tangents, self.flatten_tree[ph_pos]
+                self.jvp_input_tangents, self.input_flatten_tree[ph_pos]
             )
             self.nodemap_subg2jvp[self.current_node] = jvp_tangent
 
@@ -970,23 +981,29 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
     
     def if_output(self):
         """
-        TODO When without AD, a multi-res Node stands individually, it's from
+        When without AD, a multi-res Node stands individually, it's from
         tensor metadata level can we know it's multi-res.
 
         However, in torch.func.jvp sub-Graph, the primal multi-res Node will
         first be unpacked, then all primal result items are put in OUTPUT
         Node's args[0] list, making it NO LONGER an individual Node.
         When copying the sub-Graph into jvp Graph, we need to handle this.
-
-        TODO Discard raw getitem Nodes and keep getitem Nodes in the sub-Graph.
         """
-        subg_primals, subg_tangents = cast(
-            Sequence[Union[Node, Sequence[Node]]], self.current_node.args[0]
-        )
+        jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
+        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs
 
         convert = self.nodemap_subg2jvp.__getitem__
-        self.output_primal = tree_map(subg_primals, convert)
-        self.output_tangent = tree_map(subg_tangents, convert)
+
+        if self.n_flattened_primal_outputs == 1:
+            self.output_primal = tree_map(jvp_subgraph_out[0], convert)
+            self.output_tangent = tree_map(jvp_subgraph_out[1], convert)
+        else:
+            self.output_primal = tree_map(
+                jvp_subgraph_out[:self.n_flattened_primal_outputs], convert
+            )
+            self.output_tangent = tree_map(
+                jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
+            )
     
     def if_call_method(self, method_name: str):
         raise NotImplementedError(
@@ -1026,6 +1043,12 @@ class Jvp(esr.Module):
                     f"The number of vectors {len(vectors)} does not match the"
                     f" number of inputs {len(inputs)}"
                 )
+            
+            for i, v in zip(inputs, vectors):
+                if i.dtype != v.dtype or i.shape != v.shape:
+                    raise ValueError(
+                        "Vector's dtype/shape does not match the input"
+                    )
 
             self.vectors = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
                 vectors

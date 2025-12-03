@@ -15,7 +15,8 @@ import pyparsing
 
 import torch
 
-from easier.core.autodiff.autodiff_rule import Differentiability
+from easier.core.autodiff.autodiff_rule import Differentiability, RequiredParam
+from easier.core.autodiff.utils import FxConst
 
 
 """
@@ -91,490 +92,6 @@ therefore can be categorized:
 
 """
 
-@dataclasses.dataclass
-class Param:
-    type: str
-    name: Optional[str]
-    
-    # NOTE `p=None` in yaml results in default="None" -- a str, not Python nil
-    default: Optional[str]
-
-    kind: Literal['positional', 'keyword', 'return']
-
-@dataclasses.dataclass
-class OpDef:
-    # name is without overloading suffix
-    name: str
-
-    # may be empty
-    overloading_suffix: str
-
-    # e.g. (Tensor self, int param) -> Tensor
-    func_type: str
-
-    # e.g. (Tensor self, int param)
-    param_list: str
-
-    # e.g. Tensor
-    return_type: str
-
-    named_params: List[Param]
-
-    # certain ops do not have results, generally should be excluded in EASIER
-    named_return: Union[Param, List[Param], None]
-
-    
-
-    # decision: Literal['']
-
-    # variants: List[Literal['function', 'method']]
-
-    def get_name_with_suffix(self):
-        if self.overloading_suffix:
-            return f'{self.name}.{self.overloading_suffix}'
-        else:
-            return self.name
-    
-    def __repr__(self) -> str:
-        return f'{self.get_name_with_suffix()}{self.func_type}'
-    
-    def __hash__(self) -> int:
-        return hash(self.get_name_with_suffix())
-
-@dataclasses.dataclass
-class DerivativeDefinition:
-    name: str
-    result: Union[str, Dict[int, str]]
-
-@dataclasses.dataclass
-class ExceptionalDefinition:
-    name: str
-    reason: Literal[
-        'no_result_rule',
-        
-        'torch_functional_only',
-        'tensor_method_only', # TODO REALLY?
-        'native_function_only',
-    ]
-
-
-"""
-TODO
-1.  tensordot is only defined in native_functions.yaml, but not mentioned in derivatives.yaml
-    The behavior of functorch.jvp seems to inline aten::tensordot which is a composition of operators
-    (those in native_functions.yaml and with `tags: core` -- those will remain after aten-to-aten decomposition)
-"""
-
-def _parse_op_def(funcsig: str) -> OpDef:
-    # Extreme cases are like:
-    # split.Tensor(Tensor(a -> *) self, SymInt split_size, \
-    #       int dim=0) -> Tensor(a)[]
-    func_type_str = '(' + '('.join(funcsig.split('(')[1:])
-    ast_level = 0
-    for i, c in enumerate(func_type_str):
-        if c == '(':
-            # First char in func_type is always '(' so AST level begins
-            # with 1.
-            ast_level += 1
-        if c == ')':
-            ast_level -= 1
-        
-        if ast_level == 0:
-            break
-    param_list_str = func_type_str[:(i+1)]
-    assert param_list_str[0] == '('
-    assert param_list_str[-1] == ')'
-
-    from_arrow = func_type_str[(i+1):].strip()
-    assert from_arrow.startswith('-> ')
-    return_type = from_arrow[len('-> '):]
-
-    name_w_suffix = funcsig.split('(')[0]
-    name_wo_suffix = name_w_suffix.split('.')[0]
-    overloading_suffix = name_w_suffix[(len(name_wo_suffix)+1):]
-
-    params = param_list_str[1:-1].split(', ')
-    named_params: List[Param] = []
-
-    param_kind = 'positional'
-
-    for param in params:
-
-        if param == '*':
-            param_kind = 'keyword'
-            continue
-
-        defaults = param.split('=')
-        assert len(defaults) <= 2
-
-        if len(defaults) == 2:
-            default = defaults[1]  # maybe str "None"
-        else:
-            default = None  # Python nil object None
-        
-        type_name = defaults[0]
-        segs = type_name.split(' ')
-        param_name = segs[-1]
-        param_type = ' '.join(segs[:-1])  # e.g 
-        named_param = Param(param_type, param_name, default, param_kind)
-        named_params.append(named_param)
-
-    if return_type == '()':
-        named_return = None
-    
-    elif return_type.startswith('('):
-        return_items = return_type[1:-1].split(', ')
-
-        named_return = []
-        for return_item in return_items:
-            assert '=' not in return_item
-            segs = return_item.split(' ')
-            assert len(segs) <= 2
-            if len(segs) == 2:
-                item_name = segs[1]
-            else:
-                item_name = None
-            item_type = segs[0]
-            named_item = Param(item_type, item_name, None, 'return')
-            named_return.append(named_item)
-
-
-    else:
-        segs = return_type.split(' ')
-        assert len(segs) <= 2
-        if len(segs) == 2:
-            item_name = segs[1]
-        else:
-            item_name = None
-        item_type = segs[0]
-        named_return = Param(item_type, item_name, None, 'return')
-
-    return OpDef(
-        name=name_wo_suffix,
-        overloading_suffix=overloading_suffix,
-        func_type=func_type_str,
-        param_list=param_list_str,
-        return_type=return_type,
-        named_params=named_params,
-        named_return=named_return
-    )
-
-
-
-_audit_nondecompable_backward_ops = set()
-
-# Get all public, traceable, non-backprop operator definitions, e.g.
-# "all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
-def parse_native_functions_yaml(args: 'CliArgs') -> Tuple[List[OpDef], Set[OpDef]]:
-    nf_yaml_fp = os.path.join(
-        args.pytorch_codebase, 'aten/src/ATen/native/native_functions.yaml'
-    )
-
-    with open(nf_yaml_fp, 'r') as yaml_fs:
-        funcdefs: list = yaml.safe_load(yaml_fs)
-
-    opdefs: List[OpDef] = []
-
-
-#
-##########################
-
-    decomp_able_namesuffix = set()
-    import torch.nn.functional
-    import torch._decomp as _D
-    import torch._inductor.decomposition as _ID
-    # for decomp_k, decomp_v in _ID.decompositions.items():
-    for decomp_k, decomp_v in _D.decomposition_table.items():
-        if decomp_k.namespace != 'aten':
-            continue
-
-        if decomp_k._can_decompose:
-            name = decomp_k._opname
-            overload = decomp_k._overloadname
-            if overload == 'default':
-                overload = ''
-            decomp_able_namesuffix.add((name, overload))
-        
-##########################
-#
-
-
-    # Collect all public, traceable ops
-    for funcdef in funcdefs:
-        funcdef: dict
-
-        funcsig: str = funcdef['func']
-
-        # torch internal operators, skip, e.g.
-        # "_unsafe_index.Tensor(Tensor self, Tensor?[] indices) -> Tensor"
-        if funcsig.startswith('_'):
-            continue
-
-        opdef = _parse_op_def(funcsig)
-
-        # Exclude backprop-only ops
-        if opdef.name.endswith('_backward'):
-
-            k = (opdef.name, opdef.overloading_suffix)
-            if k not in decomp_able_namesuffix:
-                _audit_nondecompable_backward_ops.add(opdef)
-
-            # continue
-
-
-        # Exclude Tensor-creators like zeros/eye etc. as they don't get traced
-        # or appear on FX Graph.
-        #
-        # However, some Tensor-creators may have `out=` parameter e.g.
-        # eye.m_out(SymInt n, SymInt m, *, Tensor(a!) out) -> Tensor(a!)
-        if 'Tensor' not in opdef.param_list:
-            continue
-
-        opdefs.append(opdef)
-    
-    # quick lookup table
-    key=lambda d: d.name
-    opdefs_by_name: Dict[str, List[OpDef]] = {
-        k: list(v) for k, v in
-        itertools.groupby(sorted(opdefs, key=key), key=key)
-    }
-
-
-    # Filter out some op defs
-    removed_inplace_ops: Set[OpDef] = set()
-    for inp_opdef in opdefs:
-        #
-        # For inplace ops, if there exist non-inplace versions and the only
-        # difference is '_'-in-name or `out`-parameter, such kind of inplace
-        # ops can be handled by EASIER like their non-inplace versions plus
-        # setitem.
-        #
-        if inp_opdef.name.endswith('_'):
-            # The 1st param is inplace, e.g.
-            # add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) \
-            #   -> Tensor(a!)
-            noninplace_name = inp_opdef.name[:-1]
-
-        elif '!' in inp_opdef.param_list:
-            # Generally the last param(s) is inplace, e.g.
-            # addmv.out(Tensor self, Tensor mat, Tensor vec, *, \
-            #   Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
-            noninplace_name = inp_opdef.name
-
-            # When check the non-inplace version, we should note that
-            # the inplace version has an extra '*' delimiter in the params.
-
-        else:
-            continue
-
-        if noninplace_name in opdefs_by_name:
-            noninplace_versions = opdefs_by_name[noninplace_name]
-
-            #
-            # If a sequence of terms `Tensor(x!) param` appear in the parameter
-            # list and in the result, too, we treat this inplace operator as
-            # SIMPLE inplace op;
-            # and if a counterpart with the same parameter list, but
-            # not inplace, we treat that inplace op as INCREMENTAL inplace op.
-            #
-            params = inp_opdef.param_list[1:-1].split(', ')
-
-            def _validate_param(param: str):
-                segs = param.split('=')
-                assert len(segs) <= 2  # if have defaults
-
-                # not expecting cases like `Tensor(x!)? p=None` that's both
-                # inplace and optional.
-                assert not ('!' in param and '?' in param)  
-
-                assert ',' not in segs[0]
-
-            for p in params:
-                _validate_param(p)
-
-            #
-            # Find out `out` parameters
-            #
-            # If a `out=` parameter is a tuple/list, it's like
-            # split_copy.Tensor_out(Tensor self, SymInt split_size, \
-            #   int dim=0, *, Tensor(a!)[] out) -> ()
-            #                 ~~~~~~~~~~~~
-            # If multiple parameters are inplace, they may not be named as
-            # `out` in their definitions (but their Python APIs will have `out`
-            # parameter of a tuple of Tensors):
-            # cummax.out(Tensor self, int dim, *, \
-            #   Tensor(a!) values, Tensor(b!) indices) \
-            #   -> (Tensor(a!) values, Tensor(b!) indices)
-
-            inp_params: List[Tuple[int, str]] = []
-            prev_inp_param_pos = -1
-            for i, p in enumerate(params):
-                # e.g. Tensor(a!) Tensor(b!) Tensor(c!)
-                inp_id = chr(ord('a') + len(inp_params))
-                inp_tensor_type = f'Tensor({inp_id}!)'
-                if p.startswith(inp_tensor_type):
-                    inp_params.append((i, p))
-                
-                    # If multiple inplace args, they must be sequential. 
-                    if prev_inp_param_pos >= 0:
-                        assert i == prev_inp_param_pos + 1
-                    prev_inp_param_pos = i
-                
-
-            # Check if inplace func type is symmetric:
-            # (Tensor(a!) arg) -> Tensor(a!)
-            #
-            # Modify the inplace part in the param list to get the result type.
-            # The convention is, the result of an inplace op must be also the
-            # inplace parameters.
-            #
-            if len(inp_params) == 1:
-                is_symmetric_inp_op = inp_opdef.return_type == 'Tensor(a!)'
-                noninp_res_type = 'Tensor'
-            else:
-                # e.g. ['Tensor(a!)', 'Tensor(b!)']
-                #
-                # Some ops do not follow the convention e.g.
-                # max.dim_max(Tensor self, int dim, bool keepdim=False, *, \
-                #   Tensor(a!) max, Tensor(b!) max_values) -> ( \
-                #   Tensor(a!) values, Tensor(b!) indices)
-                # But the result item names take no effect in resolution.
-                if not (
-                    inp_opdef.return_type[0] == '(' \
-                        or inp_opdef.return_type[-1] == ')'
-                ):
-                    is_symmetric_inp_op = False
-                    noninp_res_type = 'WHATEVER'
-
-                else:
-                    # Ignore result item names, only check if type lists match.
-                    is_symmetric_inp_op = \
-                        list(
-                            p.split(' ')[0] for i, p in inp_params
-                        ) == list(
-                            p.split(' ')[0] for p
-                            in inp_opdef.return_type[1:-1].split(', ')
-                        )
-
-                    noninp_res_type = re.sub(
-                        '\\(\\w!\\)', '', inp_opdef.return_type
-                    )
-
-
-            if is_symmetric_inp_op:
-                #
-                # Remove (a!) for memory alias -- inplace target -- in the
-                # param/result types
-                #
-                if inp_opdef.name.endswith('_'):
-                    # Expect the inplace param to be the 1st
-                    assert prev_inp_param_pos == 0
-                    assert len(inp_params) == 1
-
-                    noninp_params = list(params)
-                    for i, p in inp_params:
-                        noninp_params[i] = re.sub('\\(\\w!\\)', '', p)
-                
-                else:
-                    # Inplace version has keyword `out` param, we should remove
-                    # keyword delimiter * in the param list.
-                    assert len(inp_params) >= 1
-
-                    noninp_params = list(params)
-                    for maxi, p in sorted(inp_params, key=lambda ip: ip[0], reverse=True):
-                        noninp_params.pop(maxi)
-                    if noninp_params[-1] == '*':
-                        noninp_params.pop()
-
-                noninp_func_type = '('  + ', '.join(noninp_params) + ') -> ' + noninp_res_type
-
-
-                for noninp in noninplace_versions:
-                    if noninp.func_type == noninp_func_type:
-
-                        removed_inplace_ops.add(inp_opdef)
-
-                        break
-                else:
-                    print(
-                        f'{inp_opdef}\n\tis not an INCREMENTAL inplace op'
-                    )
-            else:
-                # An extra kind of inplace ops: non-symmetric
-                # where the inplace arguments are not returned.
-                print(
-                    f'{inp_opdef}\n\tdoes not have a SYMMETRIC noninplace'
-                    ' version'
-                )
-
-        else:  # !if noninplace_name in opdefs_by_name:
-            print(
-                f'{inp_opdef}\n\tdoes not have noninplace version'
-            )
-        
-
-    opdefs = list(filter(lambda d: d not in removed_inplace_ops, opdefs))
-
-
-    for op in opdefs:
-        if 'Tensor[]' in op.param_list:
-            print(op)
-
-
-    return opdefs, removed_inplace_ops
-
-
-TangentField: TypeAlias = Literal['RESULT', 'RESULT_N', 'NAMED_RESULT', 'UNKNOWN']
-
-_torch_ad_functions_manual: Set[str] = set()
-_audit_involve_backward: Set[OpDef] = set()
-
-_audit_op_only_derivs: Set[OpDef] = set()
-
-def _parse_derivative_expression2(opdef: OpDef, field: TangentField, auto: bool, cpp_expr: str):
-    vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
-    assert len(vars) > 0
-
-    op_derived_terms = set()
-    for p in opdef.named_params:
-        op_derived_terms.add(p.name)
-        op_derived_terms.add(f'{p.name}_p')
-        op_derived_terms.add(f'{p.name}_t')
-        op_derived_terms.add(f'original_{p.name}_p')
-        op_derived_terms.add(f'original_{p.name}_t')
-    
-
-    for v in vars:
-        if v not in op_derived_terms:
-            if '_backward' in v and v not in _torch_ad_functions_manual:
-                _audit_involve_backward.add(opdef)
-
-            if '_vjp' in v or '_backward' in v:
-                break
-            if not (hasattr(torch, v) or v in ['maybe_multiply']):
-                break
-
-            assert not v.startswith('_')
-    else:
-        _audit_op_only_derivs.add(opdef)
-
-        
-
-
-    # for named_param in opdef.named_params
-
-    return vars
-
-def _parse_differentiability(
-    schema: torch._C.FunctionSchema, cpp_expr: str, is_auto_element_wise: bool
-) -> Differentiability:
-    vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
-    assert len(vars) > 0
-
-    # if auto_element_wise, `grad` becomes `self_t` or `original_self_t`
-    for param in schema.arguments:
-        1
-
 
 # May include TorchScript JIT system specific ops.
 schemas: Dict[str, List[torch._C.FunctionSchema]] = {}
@@ -586,12 +103,53 @@ for schema in torch._C._jit_get_all_schemas():
         schemas.setdefault(name, []).append(schema)
 
 
+def _parse_differentiability(
+    schema: torch._C.FunctionSchema, cpp_expr: str, is_auto_element_wise: bool
+) -> Differentiability:
+    vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
+    assert len(vars) > 0
+
+    diffable_params: List[str] = []
+    other_params: List[Tuple[str, Union[RequiredParam, FxConst]]] = []
+
+    # if auto_element_wise, `grad` becomes `self_t` or `original_self_t`
+    for i_p, arg in enumerate(schema.arguments):
+        if is_auto_element_wise and i_p == 0:
+            assert arg.name == 'self', 'a convention'
+            assert 'grad' in vars
+            diffable_params.append('input')
+
+        else:
+            diffable = False
+            for possible_tangent_var in [f'{arg.name}_t', f'original_{arg.name}_t']:
+                if possible_tangent_var in vars:
+                    diffable = True
+        
+            if arg.name == 'self':
+                param_name = 'input'
+            else:
+                param_name = arg.name
+            
+            if diffable:
+                diffable_params.append(param_name)
+            else:
+                if not arg.has_default_value():
+                    default = RequiredParam()
+                else:
+                    default = arg.default_value
+                
+                other_params.append((param_name, default))  # type: ignore
+    
+    return Differentiability(diffable_params, other_params)
+
+
 @dataclasses.dataclass
 class DerivEntry:
     schema: torch._C.FunctionSchema
 
     # To dump to Python code directly
     differentiability: Differentiability
+
 
 def parse_derivatives_yaml(
     args: 'CliArgs', # opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
@@ -602,6 +160,7 @@ def parse_derivatives_yaml(
 #   Parse derivatives.yaml   #
 ##############################
 """)
+    result_entries: List[DerivEntry] = []
 
     derivatives_yaml_fp = os.path.join(
         args.pytorch_codebase, 'tools/autograd/derivatives.yaml'
@@ -729,215 +288,131 @@ def parse_derivatives_yaml(
                 tangent_expr: str = yaml_derivdef['result']
                 tangent_expr = tangent_expr.strip()
                 if tangent_expr == 'auto_linear':
-                    1
-                    
-                # 'grad' becomes 'self_t' or 'original_self_t'
-                is_auto_element_wise = tangent_expr == 'auto_element_wise'
-
-                if is_auto_element_wise:
-                    assert 'self' in yaml_derivdef, \
-                        f'{deriv_op_sig}\n\tis auto but does not have "self"' \
-                        f' tangent defined' \
-                        f'\n\t{yaml_derivdef}\n' \
-                    
-                    tangent_expr = yaml_derivdef['self']
-
-                tangent_expr = tangent_expr.strip()
-                _parse_differentiability(upper_schema, tangent_expr, is_auto_element_wise)
-
-        
-        if True:
-            1
-        else:
-
-            # Check output_differentiabilty
-            if 'output_differentiability' in yaml_derivdef:
-                output_diffables: List[bool] = yaml_derivdef['output_differentiability']
-                if isinstance(deriv_opdef.named_return, list):
-                    assert len(output_diffables) == len(deriv_opdef.named_return)
+                    assert upper_schema.arguments[0].name == 'self'
+                    differentiability = _parse_differentiability(upper_schema, 'self_t', False)
+                    result_entries.append(DerivEntry(
+                        upper_schema, differentiability
+                    ))
+                
                 else:
-                    assert len(output_diffables) == 1
+                        
+                    # 'grad' becomes 'self_t' or 'original_self_t'
+                    is_auto_element_wise = tangent_expr == 'auto_element_wise'
 
-                if not any(output_diffables):
-                    # No output propagate tangents
-                    # print(
-                    #     f'{deriv_op_sig}\n\tdoes not have differentiable output'
-                    #     f'\n\t{yaml_derivdef}\n'
-                    # )
-                    continue
+                    if is_auto_element_wise:
+                        assert 'self' in yaml_derivdef, \
+                            f'{deriv_op_sig}\n\tis auto but does not have "self"' \
+                            f' tangent defined' \
+                            f'\n\t{yaml_derivdef}\n' \
+                        
+                        tangent_expr = yaml_derivdef['self']
 
-            # Check if input is marked non-diff-able, or its type is effectively non-diff-able
-            # NOTE this does not fully identify non-diff-able inputs
-            input_marked_as_non_diffables = []
-            special_type_nondiffable_input = False
-            for p in deriv_opdef.named_params:
-                if 'Tensor' not in p.type:
-                    _audit_non_diffable_input_types.setdefault(p.type, []).append(deriv_opdef)
-                    special_type_nondiffable_input = True
-                    input_marked_as_non_diffables.append(True)
-                else:
-                    input_marked_as_non_diffables.append(
-                        yaml_derivdef.get(p.name, "") == "non_differentiable"
-                    )
-            if all(input_marked_as_non_diffables):
-                # No input propagate tangents
+                    tangent_expr = tangent_expr.strip()
+                    differentiability = _parse_differentiability(upper_schema, tangent_expr, is_auto_element_wise)
 
-                # if special_type_nondiffable_input:
-                #     # Only warn to ensure `'Tensor' not in` assumption.
-                #     print(
-                #         f'{deriv_op_sig}\n\tdoes not have differentiable input (w/ special input type)'
-                #         f'\n\t{yaml_derivdef}\n'
-                #     )
+                    result_entries.append(DerivEntry(
+                        upper_schema, differentiability
+                    ))
 
-                continue
-            
-            # field in [RESULT, RESULT_N] are handled before
-            for k in yaml_derivdef.keys():
-                assert not k.startswith('result')
-            
-            # If an input is still diffable and handled, its field in yaml
-            # is its name.
-            inputs_handled = [False] * len(deriv_opdef.named_params)
-            for i, (marked_non_diffable, p) in enumerate(
-                more_itertools.zip_equal(
-                    input_marked_as_non_diffables, deriv_opdef.named_params
-                )
-            ):
-                if marked_non_diffable:
-                    continue
+    return result_entries
 
-                if p.name in yaml_derivdef:
-                    inputs_handled[i] = True
-            
-            if all(
-                nondiff or handled for nondiff, handled
-                in more_itertools.zip_equal(
-                    input_marked_as_non_diffables, inputs_handled
-                )
-            ):
-                continue
-        
-            else:
 
-                print(
-                    f'{deriv_op_sig}\n\ttangent unknown'
-                    f'\n\t{yaml_derivdef}\n'
-                )
-                continue
-
-            # endif  # field in [RESULT, ...]
-
-        # endif special inplace
-
-    # endfor  #derive rule
-
-    print('Nondiffable input types:', list(_audit_non_diffable_input_types.keys()))
-
-    # print(sorted(_vars))
-
-    # print(len(_auto))
-    # print(len(_simple_results))
-
-    print(
-        len(_audit_op_only_derivs),
-        sorted(set(op.get_name_with_suffix() for op in _audit_op_only_derivs))
+def dump_torch_jvp_differentiabilities_file(all_entries: List[DerivEntry]):
+    by_names: Dict[str,  List[DerivEntry]] = {}
+    for entry in all_entries:
+        entries = by_names.setdefault(entry.schema.name[6:], [])
+        entries.append(entry)
+    
+    fp = os.path.join(
+        os.path.dirname(__file__),
+        '../../easier/core/autodiff/torch_jvp_differentiabilities.py'
     )
+    with open(fp, 'w') as fs:
+        fs.write(
+            """# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
-    print(
-        len(_audit_involve_backward),
-        sorted(set(op.get_name_with_suffix() for op in _audit_involve_backward))
-    )
+#
+# GENERATED by tools/autodiff/gen_autodiff.py
+#
 
-    _op_multi_overloads = {}
-    _deriv_op_names = set(do.get_name_with_suffix() for do in _audit_deriv_ops)
-    for op in opdefs:
-        _op_multi_overloads.setdefault(op.name, []).append(op)
-    for name, ops in _op_multi_overloads.items():
-        if len(ops) > 1:
-            missing = False
-            for oo in ops:
-                if oo.get_name_with_suffix() not in _deriv_op_names:
-                    print(f'NO DERIV {oo}')
-                    missing = True
+import torch
+
+from .autodiff_rule import Differentiability, required, differentiabilities
+"""
+        )
+
+        for op_name, entries in sorted(by_names.items(), key=lambda kv: kv[0]):
+            fs.write(f"""
+
+differentiabilities[torch.{op_name}] = differentiabilities[torch.ops.aten.{op_name}] = ["""
+            )
+
+            for entry in entries:
+                fs.write("""
+    Differentiability(
+        ["""
+                )
+                for diff_param in entry.differentiability.diffable_params:
+                    fs.write(f"'{diff_param}', ")
+                fs.write(
+        "],"
+                )
+
+                fs.write("""
+        ["""
+                )
+                for other_param, default in entry.differentiability.other_params:
+                    if isinstance(default, RequiredParam):
+                        default_str = 'required'
+                    else:
+                        default_str = repr(default)
+                    fs.write(f"('{other_param}', {default_str}), ")
+                fs.write(
+        "],"
+                )
             
-            if missing:
-                for oo in ops:
-                    if oo.get_name_with_suffix() in _deriv_op_names:
-                        print(f'W/ DERIV {oo}')
-                print('\n')
+                fs.write("""
+    ),""")
 
-    # for nondecomp_bw_op in sorted(
-    #     _audit_nondecompable_backward_ops, key=lambda p: p.name
-    # ):
-    #     print("Nondecompable backward op", nondecomp_bw_op.get_name_with_suffix())
-
-    # for nondecomp_bw_op in sorted(filter(
-    #     lambda op: op not in _audit_backward_ops_in_deriv,
-    #     _audit_nondecompable_backward_ops 
-    # ), key=lambda p: p.name):
-    #     print("Nondiffable backward op", nondecomp_bw_op.get_name_with_suffix())
-
-    return ([], [])
+            fs.write("""
+]""")
 
 
 
 
-
+op_names = [
+    'abs',
+    'add',
+    'add_',
+    'clone',
+    'concat',
+    'div',
+    'exp',
+    'lt',
+    'mul',
+    'neg',
+    'pow',
+    'sign',
+    'sub',
+    'sub_',
+    'sum',
+    'sort',
+    'where',
+]
 
 
 @dataclasses.dataclass
 class CliArgs:
     pytorch_codebase: str
-    mode: Literal['collect_op_names', 'generate_rules']
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('--pytorch_codebase', type=str)
-    parser.add_argument(
-        '--mode',
-        choices=['collect_op_names', 'generate_rules'],
-        default='generate_rules',
-        help="""Which phase of the generation to run:
-
-collect_op_names: Collect all `name` field of `dertivatives.yaml` into
-    `names.yaml`.
-    Devs can edit the name list to choose which operators are for
-    `generate_rules` phase to handle.
-
-generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
-"""
-    )
 
     cliargs = CliArgs(**vars(parser.parse_args()))
 
-    # if args.mode == 'collect_op_names':
-    if True:
-        """
-        The `names.yaml` is important because it marks what operators are
-        known by EASIER: they are either differentiable or not.
-
-        With the assumption that PyTorch never changes the op names and the
-        overloading suffixes, the `names.yaml` incrementally grows as new
-        PyTorch versions come out.
-
-        If an op not in `names.yaml` is used, EASIER cannot be sure it's
-        differentiable or not, so autodiff process will be interrupted and
-        the user can define a custom derivative rule as a temporary solution.
-        """
-        opdefs, removed_inplace_ops = parse_native_functions_yaml(cliargs)
-
-        # op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
-        # with open(op_names_fp, 'w') as op_names_fs:
-        #     yaml.safe_dump(
-        #         list(map(dataclasses.asdict, opdefs)),
-        #         op_names_fs,
-        #         sort_keys=False,
-        #         width=float("inf")
-        #     )
-        
-
-
-    
-        parse_derivatives_yaml(cliargs, ['div'])
+    result_entries = parse_derivatives_yaml(cliargs, op_names)
+    dump_torch_jvp_differentiabilities_file(result_entries)

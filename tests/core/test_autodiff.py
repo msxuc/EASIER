@@ -20,8 +20,13 @@ from easier.core.utils import get_random_str
 from ..utils import \
     torchrun_singlenode, assert_tensor_list_equal, \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
-    import_poisson, MESH, POISSON
+    import_poisson, import_shallow_water_equation, MESH, POISSON, SW
 
+
+Poisson = import_poisson()
+from assemble_poisson import PoissonInitializer  # type: ignore
+
+ShallowWaterEquation = import_shallow_water_equation()
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestJvpTransformation:
@@ -110,23 +115,24 @@ class TestJvpTransformation:
         jvpm: Jvp
 
         v, tv, v0, tv0, v1, tv1, cat, tcat, \
-            sort, sort0, sort1, tcat_idx, neg, \
+            sort, sort0, sort1, tcat_idx, zero, \
             = jvpm.graph_module.graph.nodes
         
         assert tv0.target == operator.getitem and tv0.args[0] == tv
         assert tv1.target == operator.getitem and tv1.args[0] == tv
-        assert tcat.target == torch.concat and tcat.args[0] == [tv0, tv1]
+
+        # torch.jvp expands to `torch.ops.aten.cat.default` API
+        assert 'cat' in str(tcat.target) and tcat.args[0] == [tv0, tv1]
 
         assert sort0.target == operator.getitem and sort0.args == (sort, 0)
         assert sort1.target == operator.getitem and sort1.args == (sort, 1)
 
-        assert tcat_idx.target == operator.getitem \
-            and tcat_idx.args == (tcat, sort1)
+        # torch.jvp expands to `torch.ops.aten.gather.default` API
+        assert 'gather' in str(tcat_idx.target) \
+            and tcat_idx.args == (tcat, 1, sort1)
         
-        # Fake node for indication only
-        assert neg.target == torch.neg and neg.args == (tcat_idx,)
-
         # the 2nd res item for sort has no tangent
+        assert 'zeros_like' in str(zero.target) and zero.args == (sort1,)
     
 
 @pytest.mark.usefixtures('dummy_dist_env')
@@ -194,7 +200,67 @@ class TestJvp:
 
 
     def test_smoke__assemble_poisson(self):
-        pass
+        init = PoissonInitializer(POISSON, MESH)
+        
+        from easier.core.passes import collectively_initialize_and_validate
+        from easier.core.passes.utils import fx_normalize_function_variant_into_kwargs
+        _, [g] = collectively_initialize_and_validate([init])
+        op_ids = set()
+        for n in g.nodes:
+            try:
+                if n.op == 'call_function':
+                    f = n.target
+                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+                    op_ids.add(f.__name__ + str(list(d.keys())))
+                elif n.op == 'call_method':
+                    f = getattr(torch, n.target)
+                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+                    op_ids.add(n.target + str(list(d.keys())))
+            except:
+                op_ids.add(str(n.target))
+        print(list(op_ids))
+                
+        tpoints = esr.Tensor(torch.rand_like(init.points), mode='partition')
+        jvp = esr.jvp(init, [init.points], [init.b, init.Ac, init.Af], vectors=[tpoints])
+        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
+        jvp: Jvp
+
+        jvp()
+
+        esr_b = jvp.outputs[0].collect()
+        esr_Ac = jvp.outputs[1].collect()
+        esr_Af = jvp.outputs[2].collect()
+        esr_tb = jvp.products[0].collect()
+        esr_tAc = jvp.products[1].collect()
+        esr_tAf = jvp.products[2].collect()
+
+    def test_smoke__swe_main(self):
+        eqn = ShallowWaterEquation(MESH, SW)
+        
+        from easier.core.passes import collectively_initialize_and_validate
+        from easier.core.passes.utils import fx_normalize_function_variant_into_kwargs
+        _, [g] = collectively_initialize_and_validate([eqn])
+        op_ids = set()
+        for n in g.nodes:
+            try:
+                if n.op == 'call_function':
+                    f = n.target
+                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+                    op_ids.add(f.__name__ + str(list(d.keys())))
+                elif n.op == 'call_method':
+                    f = getattr(torch.ops.aten, n.target)
+                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+                    op_ids.add(n.target + str(list(d.keys())))
+            except:
+                op_ids.add(str(n.target))
+        print(list(op_ids))
+                
+        tx = esr.Tensor(torch.rand_like(eqn.x), mode='partition')
+        jvp = esr.jvp(eqn, [eqn.x], [eqn.h], vectors=[tx])
+        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
+        jvp: Jvp
+
+        jvp()
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',

@@ -16,6 +16,7 @@ import easier.core.runtime.dist_env as _DM
 
 MESH = os.path.expanduser('~/.easier/triangular_100.hdf5')
 POISSON = os.path.expanduser('~/.easier/Poisson_100.hdf5')
+SW = os.path.expanduser('~/.easier/SW_100.hdf5')
 
 
 def import_poisson():
@@ -32,6 +33,23 @@ def import_poisson():
     from poisson_main import Poisson  # type: ignore
 
     return Poisson
+
+def import_shallow_water_equation():
+    assert os.path.exists(MESH), \
+        "Run `python tutorial/create_triangular_mesh.py 100`"
+    assert os.path.exists(SW), \
+        "Run " \
+        "`torchrun tutorial/shallow_water_equation/assemble_shallow_water.py" \
+        " MESH SW`"
+
+    esr_dir = os.path.dirname(easier.__file__)
+    path = os.path.join(esr_dir, '..', 'tutorial', 'shallow_water_equation')
+    if path not in sys.path:
+        sys.path.append(path)
+
+    from swe_main import ShallowWaterEquation  # type: ignore
+
+    return ShallowWaterEquation
 
 
 have_cuda = pytest.mark.skipif(

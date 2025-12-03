@@ -16,6 +16,7 @@ from easier.core.passes.utils import \
 from easier.core.runtime.metadata import \
     Role, RuntimeTensorMeta, collect_meta, get_node_meta
 from easier.core.autodiff.utils import FxConst
+from easier.core.utils import EasierJitException
 
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ class Differentiability:
     # (e.g. `float?`, `Tensor`) is not None.
     #
     # Generally the param names are not ordered within this dataclass.
-    other_params: List[Tuple[str, Union[RequiredParam, FxConst]]] = \
+    other_params: List[Tuple[str, Union[RequiredParam, FxConst, None]]] = \
         dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
@@ -246,6 +247,11 @@ class DiffRuleBase:
 
 
 tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
+differentiabilities: Dict[Callable, List[Differentiability]] = {}
+
+#
+# Custom DiffRule
+#
 
 class SetitemRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = False
@@ -270,12 +276,6 @@ class SetitemRule(DiffRuleBase):
 
 tangent_rule_registry[operator.setitem] = SetitemRule
 
-differentiabilities: Dict[Callable, List[Differentiability]] = {}
-
-
-#
-# Custom DiffRule
-#
 
 class GetitemRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = False
@@ -318,6 +318,40 @@ class EsrSumRule(DiffRuleBase):
 tangent_rule_registry[esr.sum] = EsrSumRule
 
 
+class _NonDiffable(DiffRuleBase):
+    # no matter normalizable or not, we don't need to do normalization
+    fx_normalize_to_kwargs_only = False  
+
+    def input_differentiability(self, *args, **kwargs):
+        return {}
+    def output_meta(self, *args, **kwargs):
+        roles = []
+        def _make(x):
+            if isinstance(x, Node):
+                meta = get_node_meta(x)
+                assert isinstance(meta, RuntimeTensorMeta), \
+                    "Value of arg Node cannot be nested structure"
+
+                roles.append(meta.role)
+
+                return torch.zeros(meta.shape, dtype=meta.dtype)
+            else:
+                return x
+
+        vals = tree_map(args, _make)
+        kwvals = { k: tree_map(v,  _make) for k, v in kwargs.items() }
+        res = self.op(*vals, **kwvals)
+        assert isinstance(res, torch.Tensor)
+
+        role = \
+            Role.DISTRIBUTED if Role.DISTRIBUTED in roles else Role.REPLICATED
+        return RuntimeTensorMeta(role, tuple(res.shape), res.dtype)
+
+    def jvp(self, *args, **kwargs):
+        raise EasierJitException("unreachable")
+
+tangent_rule_registry[operator.lt] = _NonDiffable
+
 #
 # Custom torch op Differentiability for torch.func.jvp()
 #
@@ -335,6 +369,20 @@ tangent_rule_registry[esr.sum] = EsrSumRule
 #   It's easier to manual define Differentiability for them.
 #
 
+differentiabilities[torch.ops.aten.add_] = [
+    Differentiability(
+        ['input', 'other'],
+        [('alpha', 1)]
+    )
+]
+
+differentiabilities[torch.concat] = [
+    Differentiability(
+        ['tensors'],
+        [('dim', 0)]
+    )
+]
+
 def _normalize_einsum_kwargs(op, args, kwargs):
     def _match(equation, tensors):
         return { 'equation': equation, 'tensors': tensors }
@@ -346,4 +394,31 @@ differentiabilities[torch.einsum] = [
         [('equation', required)],
         kwargs_normalizer=_normalize_einsum_kwargs
     )
+]
+
+differentiabilities[torch.lt] = [
+    Differentiability(
+        [],
+        [('input', required), ('other', required)]
+    )
+]
+
+differentiabilities[torch.ops.aten.sub_] = [
+    Differentiability(
+        ['input', 'other'],
+        [('alpha', 1)]
+    )
+]
+
+differentiabilities[torch.sort] = [
+    Differentiability(
+        ['input'],
+        [('dim', -1), ('descending', False)],
+        output_differentiability=[True, False]
+    ),
+    # Differentiability(
+    #     ['input'],
+    #     [('stable', None), ('dim', -1), ('descending', False)]
+    #     output_differentiability=[True, False]
+    # )
 ]
