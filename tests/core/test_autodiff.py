@@ -1,50 +1,132 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Union
+import operator
+import os
+import tempfile
+from typing import Callable, Dict, List, Sequence, Type, Union
+from unittest.mock import patch
 import pytest
 import torch
+from torch.fx import Node
 
 import easier as esr
-from easier.core.autodiff.autodiff import Jvp, JvpTransformer
-from easier.numeric import linsys
+from easier.core.autodiff.autodiff import FxConst, Jvp, JvpTransformer
+from easier.core.autodiff.autodiff_rule import \
+    DiffRuleBase, Differentiability, tangent_rule_registry, differentiabilities
+from easier.core.runtime.metadata import Role, RuntimeTensorMeta
+from easier.core.utils import get_random_str
+
+from ..utils import \
+    torchrun_singlenode, assert_tensor_list_equal, \
+    when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
+    import_poisson, MESH, POISSON
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestJvpTransformation:
-    def test_mul_t_t(self):
+    
+    def test_rule(self):
+        # nest args; multi-res
+        reg: Dict[Callable, Type[DiffRuleBase]] = dict(tangent_rule_registry)
+
+        class _Cat(DiffRuleBase):
+            diffable_params = ['tensors']
+            
+            def output_meta(self, tensors, dim):
+                return RuntimeTensorMeta(Role.DISTRIBUTED, (10, 2), torch.float32)
+            
+            def jvp(self, tensors, dim, tensors_t):
+                return torch.concat(tensors_t, dim)
+        reg[torch.concat] = _Cat
+
+        class _Sort(DiffRuleBase):
+            needs_result = True
+            diffable_params = ['input']
+
+            def output_meta(self, input, dim, descending):
+                m1 = RuntimeTensorMeta(Role.DISTRIBUTED, (10, 2), torch.float32)
+                m2 = RuntimeTensorMeta(Role.DISTRIBUTED, (10, 2), torch.int64)
+                return (m1, m2)
+            
+            def jvp(self, result, input, dim, descending, input_t):
+                (_sort, idxes) = result
+                return (torch.neg(input_t[idxes]), None)
+        reg[torch.sort] = _Sort
+
         class M(esr.Module):
             def __init__(self):
                 super().__init__()
+                self.v = esr.Tensor(esr.zeros([10, 3], dtype=torch.float32), mode='partition')
 
-                # have tangent
-                self.v1 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
-                self.v2 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
-                self.r1 = esr.Tensor(torch.rand(3).double(), mode='replicate')
+            def forward(self):
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
 
-                # no tangent
-                self.v3 = esr.Tensor(torch.rand(10, 3).double(), mode='partition')
-                self.r2 = esr.Tensor(torch.rand(3).double(), mode='replicate')
+                sort, idxes = torch.sort(vc, dim=1)
 
-                self.res = esr.Tensor(esr.zeros([10, 3], dtype=torch.float64), mode='partition')
+        with patch(f'{JvpTransformer.__module__}.tangent_rule_registry', new=reg):
 
+            m = M()
+            jvpm = esr.jvp(m, [m.v], [])
+            jvpm: Jvp
+
+            v, tv, v0, tv0, v1, tv1, cat, tcat, \
+                sort, sort0, sort1, tcat_idx, neg, \
+                = jvpm.graph_module.graph.nodes
             
-            def forward(self):
-                v2 = self.v1 * self.v2
-                v3 = self.v1 * self.v3
-                r1 = self.v1 * self.r1
-                r2 = self.v1 * self.r2
-                c1 = self.v1 * 5
+            assert tv0.target == operator.getitem and tv0.args[0] == tv
+            assert tv1.target == operator.getitem and tv1.args[0] == tv
+            assert tcat.target == torch.concat and tcat.args[0] == [tv0, tv1]
 
-                self.res[:] = v2 + v3 + r1 + r2 + c1
-        
-        raw = M()
-        jvp_transfomer = JvpTransformer(raw, raw).run()
-    
-    def test_nest_arg_tangent_appear_and_not_appear(self):
+            assert sort0.target == operator.getitem and sort0.args == (sort, 0)
+            assert sort1.target == operator.getitem and sort1.args == (sort, 1)
+
+            assert tcat_idx.target == operator.getitem \
+                and tcat_idx.args == (tcat, sort1)
+            
+            # Fake node for indication only
+            assert neg.target == torch.neg and neg.args == (tcat_idx,)
+
+            # the 2nd res item for sort has no tangent
+
+    def test_torch_jvp_ops(self):
+        # nest args; multi-res
         class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.v = esr.Tensor(esr.zeros([10, 3], dtype=torch.float32), mode='partition')
+    
             def forward(self):
-                return torch.concat([x1, x2, x3], dim=1)
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
+
+                sort, idxes = torch.sort(vc, dim=1)
+
+        m = M()
+        jvpm = esr.jvp(m, [m.v], [])
+        jvpm: Jvp
+
+        v, tv, v0, tv0, v1, tv1, cat, tcat, \
+            sort, sort0, sort1, tcat_idx, neg, \
+            = jvpm.graph_module.graph.nodes
+        
+        assert tv0.target == operator.getitem and tv0.args[0] == tv
+        assert tv1.target == operator.getitem and tv1.args[0] == tv
+        assert tcat.target == torch.concat and tcat.args[0] == [tv0, tv1]
+
+        assert sort0.target == operator.getitem and sort0.args == (sort, 0)
+        assert sort1.target == operator.getitem and sort1.args == (sort, 1)
+
+        assert tcat_idx.target == operator.getitem \
+            and tcat_idx.args == (tcat, sort1)
+        
+        # Fake node for indication only
+        assert neg.target == torch.neg and neg.args == (tcat_idx,)
+
+        # the 2nd res item for sort has no tangent
     
 
 @pytest.mark.usefixtures('dummy_dist_env')
@@ -111,113 +193,47 @@ class TestJvp:
         torch.testing.assert_close(esr_ty, torch_ty)
 
 
+    def test_smoke__assemble_poisson(self):
+        pass
 
-@pytest.mark.skip
-@pytest.mark.usefixtures('dummy_dist_env')
-class TestTangentFlowProp:
-    def test_forward_prop(self):
-        irrelevant = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        input = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_outer1 = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_outer2 = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_midonce1 = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_midmulti1 = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
+@pytest.mark.parametrize('dev_type', [
+    'cpu',
+    pytest.param('cuda', marks=when_ngpus_ge_2)
+])
+def test_dump_jvp(dev_type: str):
+    dumpdir = os.path.join(tempfile.gettempdir(), "easier", "tests",
+                               get_random_str())
+        
+    torch.manual_seed(2345)
+    model_dev = torch.device(dev_type)
 
-        class Inner(esr.Module):
-            def __init__(self):
-                super().__init__()
-            1
+    m = Model(3, model_dev)  # type: ignore
 
-        class Middle(esr.Module):
-            def __init__(self, late_carrier_mid_1: esr.Tensor, late_carrier_mid_2: esr.Tensor):
-                super().__init__()
+    jm1, = esr.compile([m], 'torch', partition_mode='evenly')  # type: ignore
+    esr.dump([jm1], dumpdir)
+    jm1: Model
 
-                # InnerOnce gets called multi times in MidMulti,
-                # so it won't be treated as really Module that's called once.
-                self.inner_once = Inner()
+    torch.manual_seed(2345)
+    m = Model(3, model_dev)  # type: ignore
+    jm2, = esr.compile(
+        [m], 'torch', load_dir=dumpdir, partition_mode='evenly'  # type: ignore
+    )
+    jm2: Model
 
-                self.inner_multi =  Inner()
+    _equal_jitted_selector(jm1.selector_src, jm2.selector_src)
+    _equal_jitted_selector(jm1.selector_dst, jm2.selector_dst)
+    _equal_jitted_selector(
+        getattr(jm1, 'csr_selector0reducer_src'),
+        getattr(jm2, 'csr_selector0reducer_src')
+    )
+    _equal_jitted_reducer(jm1.reducer_src, jm2.reducer_src)
+    _equal_jitted_reducer(jm1.reducer_dst, jm2.reducer_dst)
 
-                self.irrelevant = irrelevant
-                self.input = input
-                self.late_carrier_mid_1 = late_carrier_mid_1
-                self.late_carrier_mid_2 = late_carrier_mid_2
-            
-            def forward(self):
-                _middle_outer_template(self, self.late_carrier_mid_1, self.late_carrier_mid_2,
-                                       self.inner_once, self.inner_multi)
-
-        class Outer(esr.Module):
-            def __init__(self):
-                super().__init__()
-                self.mid_once = Middle()
-                self.mid_multi = Middle()
-
-                self.irrelevant = irrelevant
-                self.input = input
-                self.late_carrier_outer1 = late_carrier_outer1
-                self.late_carrier_outer2 = late_carrier_outer2
-            
-            def forward(self):
-                _middle_outer_template(self, self.late_carrier_outer1, self.late_carrier_outer2,
-                                       self.mid_once, self.mid_multi)
-
-
-        def _middle_outer_template(
-            self: Union['Middle', 'Outer'],
-            late_carrier_1: esr.Tensor, late_carrier_2: esr.Tensor,
-            nested_once: esr.Module, nested_multi: esr.Module,
-        ):
-            v1 = torch.sin(self.input)
-            late_carrier_1.add_(self.irrelevant)
-            v2 = torch.cos(v1)
-            late_carrier_1.add_(v2)
-
-            nested_once()
-
-            nested_multi()
-            nested_multi()
-            nested_multi()
-
-            late_carrier_2.add_(self.irrelevant)
-            v3 = torch.neg(self.input)
-            late_carrier_2.add_(v3)
-
-
-
-    def test_late_carrier_and_alias(self):
-        input = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_outer = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-        late_carrier_inner = esr.Tensor(esr.arange(100, dtype=torch.float64), mode='partition')
-
-        class Inner(esr.Module):
-            def __init__(self):
-                super().__init__()
-
-                self.input = input
-                self.late_carrier_outer = late_carrier_outer
-                self.late_carrier_inner = late_carrier_inner
-            
-            def forward(self):
-                inner_v1 = self.late_carrier_outer * 3
-                self.late_carrier_inner.sub_(inner_v1)
-
-
-        class Outer(esr.Module):
-            def __init__(self):
-                super().__init__()
-
-                self.input = input
-                self.late_carrier_outer = late_carrier_outer
-
-                self.inner = Inner()
-            
-            def forward(self):
-                v1 = torch.sin(self.late_carrier_outer)
-                self.late_carrier_outer.add_(self.input)
-
-                self.inner()
-
-                v2 = torch.exp(self.late_carrier_outer)
-                v3 = self.inner.late_carrier_inner / 5
-    
+    _equal_jitted_selector(
+        getattr(jm1, 'reordering_selector0reducer_dst'),
+        getattr(jm2, 'reordering_selector0reducer_dst'),
+    )
+    _equal_jitted_selector(
+        getattr(jm1, 'reordering_selector1reducer_src'),
+        getattr(jm2, 'reordering_selector1reducer_src'),
+    )

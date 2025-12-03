@@ -15,6 +15,8 @@ import pyparsing
 
 import torch
 
+from easier.core.autodiff.autodiff_rule import Differentiability
+
 
 """
 Empirically, FX-traceable PyTorch operators have following properties,
@@ -563,244 +565,265 @@ def _parse_derivative_expression2(opdef: OpDef, field: TangentField, auto: bool,
 
     return vars
 
+def _parse_differentiability(
+    schema: torch._C.FunctionSchema, cpp_expr: str, is_auto_element_wise: bool
+) -> Differentiability:
+    vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', cpp_expr)
+    assert len(vars) > 0
+
+    # if auto_element_wise, `grad` becomes `self_t` or `original_self_t`
+    for param in schema.arguments:
+        1
+
+
+# May include TorchScript JIT system specific ops.
+schemas: Dict[str, List[torch._C.FunctionSchema]] = {}
+
+
+for schema in torch._C._jit_get_all_schemas():
+    if schema.name.startswith('aten::'):
+        name = schema.name[6:]
+        schemas.setdefault(name, []).append(schema)
+
+
+@dataclasses.dataclass
+class DerivEntry:
+    schema: torch._C.FunctionSchema
+
+    # To dump to Python code directly
+    differentiability: Differentiability
 
 def parse_derivatives_yaml(
-    args: 'CliArgs', opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
-) -> Tuple[List[DerivativeDefinition], List[ExceptionalDefinition]]:
+    args: 'CliArgs', # opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
+    op_names: List[str]
+) -> List[DerivEntry]:
     print("""
 ##############################
 #   Parse derivatives.yaml   #
 ##############################
 """)
-    
-    functions_manual_fp = os.path.join(
-        args.pytorch_codebase, 'torch/csrc/autograd/FunctionsManual.h'
-    )
-    with open(functions_manual_fp, 'r') as fm_fs:
-        fm_header_str = fm_fs.read()
-    header_vars: List[str] = re.findall(R'([A-Za-z][A-Za-z0-9_:]*)', fm_header_str)
-    _torch_ad_functions_manual.update(header_vars)
 
     derivatives_yaml_fp = os.path.join(
         args.pytorch_codebase, 'tools/autograd/derivatives.yaml'
     )
 
-    # TODO some op result item has alias like Q K V, and does not have 'result' field
+    # TODO some op result item has alias like Q K V,
+    # and does not have 'result' field
     with open(derivatives_yaml_fp, 'r') as yaml_fs:
         torch_derivatives: list = yaml.safe_load(yaml_fs)
     
-    opdef_by_sig = { 
-        f'{opdef.get_name_with_suffix()}{opdef.func_type}': opdef
-        for opdef in opdefs
-    }
-    removed_incr_inp_by_sig = {
-        f'{opdef.get_name_with_suffix()}{opdef.func_type}': opdef
-        for opdef in removed_incremental_inplace_ops
-    }
 
-    _audit_non_diffable_input_types: Dict[str, List[OpDef]] = {}
-
-    _vars = set()
-
-    _simple_results = set()
-    _auto = set()
-
-    _audit_backward_ops_in_deriv = set()
-
-    _audit_deriv_ops: List[OpDef] = []
+    schemas_and_yamldefs_by_opname: \
+        Dict[str, List[Tuple[torch._C.FunctionSchema, dict]]] = {}
 
     for yaml_derivdef in torch_derivatives:
         yaml_derivdef: dict
 
+        # e.g.
+        # clamp.Tensor(Tensor self, ...) -> Tensor
         deriv_op_sig = cast(str, yaml_derivdef['name'])
 
         # torch internal operators
         if deriv_op_sig.startswith('_'):
             continue
 
-        deriv_opdef = _parse_op_def(deriv_op_sig)
+        deriv_op_name, derive_op_overload_name, *_ = \
+            deriv_op_sig.split('(')[0].split('.') + ['']
 
-        if deriv_opdef.name.endswith('_backward'):
-
-            _audit_backward_ops_in_deriv.add(deriv_opdef)
-
+        if deriv_op_name not in op_names:
             continue
 
-        if 'dispatch' in yaml_derivdef:
-            yaml_derivdef = yaml_derivdef['dispatch']['Default']
+        for overloading_schema in schemas[deriv_op_name]:
+            # Not accepted by torch.jvp()
+            if any(arg.is_out for arg in schema.arguments):
+                continue
 
-        field: TangentField
-        if 'result' in yaml_derivdef:
-            field = 'RESULT'
-        elif 'result0' in yaml_derivdef:
-            field = 'RESULT_N'
-        elif isinstance(deriv_opdef.named_return, list) and any(
-                named_res_item.name in yaml_derivdef
-                for named_res_item in deriv_opdef.named_return
-            ):
-            field = 'NAMED_RESULT'
+            if overloading_schema.overload_name == derive_op_overload_name:
+                schemas_and_yamldefs_by_opname.setdefault(
+                    deriv_op_name, []
+                ).append(
+                    (overloading_schema, yaml_derivdef)
+                )
+                break
         else:
-            field = 'UNKNOWN'  # matmul alike
+            assert False, f'Schema not found for {deriv_op_sig}'
 
 
+    print("""
+#   Ops not in derivatives.yaml (custom DiffRule or Differentiability needed):
+""")
+    for op_name in op_names:
+        if op_name not in schemas_and_yamldefs_by_opname:
+            print(op_name)
+        
+    print("""
+#   Ops in derivatives.yaml but needing manual handling
+""")
+    
+    for _, schemas_and_yamldefs in schemas_and_yamldefs_by_opname.items():
+        # For those overloading whose param names (w/ types) are the same,
+        # merge Scalar-type-param version into Tensor-type-param version.
+        by_param_names: Dict[
+            str,  # e.g. input@other@alpha -- whatever hashable identifer
+            List[Tuple[torch._C.FunctionSchema, dict]]
+        ] = {}
 
-        if deriv_op_sig in removed_incr_inp_by_sig:
-            assert field == 'RESULT' or field == 'UNKNOWN'
-            #
-            # Why derivatives.yaml still has rules for INCREMENTAL inplace ops?
-            # Check if there's anything special
-            #
-            if field == 'RESULT':
-                tangent_expr: str = yaml_derivdef['result']
-                if tangent_expr in ['auto_element_wise', 'auto_linear', 'self_t.zero_()']:
-                    continue
-                    # else: default cases, follow EASIER rules:
-                    # 1) calculate tangent as non-inplace, 2) setitem.
+        for kv in schemas_and_yamldefs:
+            overloading_schema, yamldef = kv
+            param_name_comb = '@'.join(arg.name for arg in overloading_schema.arguments)
+            by_param_names.setdefault(param_name_comb, []).append(kv)
+        
+        def _schema_lt(
+            s1: torch._C.FunctionSchema, s2: torch._C.FunctionSchema
+        ):
+            all_lt = []
+            for a1, a2 in more_itertools.zip_equal(s1.arguments, s2.arguments):
+                t1 = str(a1.type)
+                t2 = str(a2.type)
+                if t1 != t2:
+                    if t1 == 'number' and t2 == 'Tensor':
+                        all_lt.append(True)
+                    elif t1 == 'Tensor' and t2 == 'number':
+                        all_lt.append(False)
+                    else:
+                        assert False, \
+                            'Not mergeable arguments are not equal in' \
+                            f' {s1} and {s2}'
 
-                else:
-                    print(
-                        f'{deriv_op_sig}\n\tinplace but does not have TRIVIAL result tangent:'
-                        f'\n\t{tangent_expr}\n'
-                    )
-                    continue
+            assert len(all_lt) > 0, f'{s1} and {s2}'
+            assert len(set(all_lt)) == 1, f'{s1} and {s2}'
+
+            return all_lt[0]
+
+        
+        # For each group with same param names (ignoring types),
+        # try to merge schema
+        # param type Scalar into Tensor.
+        for _, mergeable_schemas_and_yamldefs in by_param_names.items():
+            upperbound = mergeable_schemas_and_yamldefs[0]
+
+            if len(mergeable_schemas_and_yamldefs) > 1:
+                # effectively form a lattice
+                for candidate in mergeable_schemas_and_yamldefs[1:]:
+                    if _schema_lt(upperbound[0], candidate[0]):
+                        upperbound = candidate
+                
+            upper_schema, yaml_derivdef = upperbound
+            
+            if 'dispatch' in yaml_derivdef:
+                yaml_derivdef = yaml_derivdef['dispatch']['Default']
+
+            if 'result' not in yaml_derivdef:
+                # Some simple and common cases are of this kind: the op itself
+                # is not diff-able.
+                # We need to parse the derivative.yaml entry and explicitly add
+                # a non-diff-able rule for EASIER.
+
+                # Otherwise, it is multi-res or has no tangent rule (composed),
+                # we'd better skip it and add diff rule for it manually in EASIER.
+
+                print(f'{upper_schema} does not have "result" field')
+                continue
 
             else:
+                tangent_expr: str = yaml_derivdef['result']
+                tangent_expr = tangent_expr.strip()
+                if tangent_expr == 'auto_linear':
+                    1
+                    
+                # 'grad' becomes 'self_t' or 'original_self_t'
+                is_auto_element_wise = tangent_expr == 'auto_element_wise'
+
+                if is_auto_element_wise:
+                    assert 'self' in yaml_derivdef, \
+                        f'{deriv_op_sig}\n\tis auto but does not have "self"' \
+                        f' tangent defined' \
+                        f'\n\t{yaml_derivdef}\n' \
+                    
+                    tangent_expr = yaml_derivdef['self']
+
+                tangent_expr = tangent_expr.strip()
+                _parse_differentiability(upper_schema, tangent_expr, is_auto_element_wise)
+
+        
+        if True:
+            1
+        else:
+
+            # Check output_differentiabilty
+            if 'output_differentiability' in yaml_derivdef:
+                output_diffables: List[bool] = yaml_derivdef['output_differentiability']
+                if isinstance(deriv_opdef.named_return, list):
+                    assert len(output_diffables) == len(deriv_opdef.named_return)
+                else:
+                    assert len(output_diffables) == 1
+
+                if not any(output_diffables):
+                    # No output propagate tangents
+                    # print(
+                    #     f'{deriv_op_sig}\n\tdoes not have differentiable output'
+                    #     f'\n\t{yaml_derivdef}\n'
+                    # )
+                    continue
+
+            # Check if input is marked non-diff-able, or its type is effectively non-diff-able
+            # NOTE this does not fully identify non-diff-able inputs
+            input_marked_as_non_diffables = []
+            special_type_nondiffable_input = False
+            for p in deriv_opdef.named_params:
+                if 'Tensor' not in p.type:
+                    _audit_non_diffable_input_types.setdefault(p.type, []).append(deriv_opdef)
+                    special_type_nondiffable_input = True
+                    input_marked_as_non_diffables.append(True)
+                else:
+                    input_marked_as_non_diffables.append(
+                        yaml_derivdef.get(p.name, "") == "non_differentiable"
+                    )
+            if all(input_marked_as_non_diffables):
+                # No input propagate tangents
+
+                # if special_type_nondiffable_input:
+                #     # Only warn to ensure `'Tensor' not in` assumption.
+                #     print(
+                #         f'{deriv_op_sig}\n\tdoes not have differentiable input (w/ special input type)'
+                #         f'\n\t{yaml_derivdef}\n'
+                #     )
+
+                continue
+            
+            # field in [RESULT, RESULT_N] are handled before
+            for k in yaml_derivdef.keys():
+                assert not k.startswith('result')
+            
+            # If an input is still diffable and handled, its field in yaml
+            # is its name.
+            inputs_handled = [False] * len(deriv_opdef.named_params)
+            for i, (marked_non_diffable, p) in enumerate(
+                more_itertools.zip_equal(
+                    input_marked_as_non_diffables, deriv_opdef.named_params
+                )
+            ):
+                if marked_non_diffable:
+                    continue
+
+                if p.name in yaml_derivdef:
+                    inputs_handled[i] = True
+            
+            if all(
+                nondiff or handled for nondiff, handled
+                in more_itertools.zip_equal(
+                    input_marked_as_non_diffables, inputs_handled
+                )
+            ):
+                continue
+        
+            else:
+
                 print(
-                    f'{deriv_op_sig}\n\tinplace but does not have "result" tangent defined'
+                    f'{deriv_op_sig}\n\ttangent unknown'
                     f'\n\t{yaml_derivdef}\n'
                 )
                 continue
-        
-        else:
-            #
-            # TODO currently we don't parse deriv rule by ourselves
-            #
-
-            _audit_deriv_ops.append(deriv_opdef)
-
-            continue
-            
-
-            # not for inplace ops
-            if field == 'RESULT':
-                tangent_expr: str = yaml_derivdef['result']
-                auto = tangent_expr in ['auto_element_wise', 'auto_linear']
-
-                if auto:
-                    if 'self' not in yaml_derivdef:
-                        print(
-                            f'{deriv_op_sig}\n\tis auto but does not have "self" tangent defined'
-                            f'\n\t{yaml_derivdef}\n'
-                        )
-                        continue
-                    
-                    else:
-                        tangent_expr = yaml_derivdef['self']
-                
-                else:
-                    pass
-
-                tangent_expr = tangent_expr.strip()
-                vars = _parse_derivative_expression2(deriv_opdef, field, auto, tangent_expr)
-            
-            elif field == 'RESULT_N':
-                assert isinstance(deriv_opdef.named_return, list)
-
-                for i in range(len(deriv_opdef.named_return)):
-
-                    if f'result{i}' not in yaml_derivdef:
-                        # Not used but check it's consistent
-                        if 'output_differentiability' in yaml_derivdef:
-                            output_diffables: List[bool] = yaml_derivdef['output_differentiability']
-                            assert output_diffables[i] == False
-                        # Assert no mixed use of resultN and result item name
-                        assert deriv_opdef.named_return[i].name not in yaml_derivdef
-                        continue
-
-                    tangent_expr_i: str = yaml_derivdef[f'result{i}']
-                    tangent_expr_i = tangent_expr_i.strip()
-
-                    assert not tangent_expr_i.startswith('auto')
-                    auto = False
-
-                    vars = _parse_derivative_expression2(deriv_opdef, field, auto, tangent_expr_i)
-                
-            else:
-
-                # Check output_differentiabilty
-                if 'output_differentiability' in yaml_derivdef:
-                    output_diffables: List[bool] = yaml_derivdef['output_differentiability']
-                    if isinstance(deriv_opdef.named_return, list):
-                        assert len(output_diffables) == len(deriv_opdef.named_return)
-                    else:
-                        assert len(output_diffables) == 1
-
-                    if not any(output_diffables):
-                        # No output propagate tangents
-                        # print(
-                        #     f'{deriv_op_sig}\n\tdoes not have differentiable output'
-                        #     f'\n\t{yaml_derivdef}\n'
-                        # )
-                        continue
-
-                # Check if input is marked non-diff-able, or its type is effectively non-diff-able
-                # NOTE this does not fully identify non-diff-able inputs
-                input_marked_as_non_diffables = []
-                special_type_nondiffable_input = False
-                for p in deriv_opdef.named_params:
-                    if 'Tensor' not in p.type:
-                        _audit_non_diffable_input_types.setdefault(p.type, []).append(deriv_opdef)
-                        special_type_nondiffable_input = True
-                        input_marked_as_non_diffables.append(True)
-                    else:
-                        input_marked_as_non_diffables.append(
-                            yaml_derivdef.get(p.name, "") == "non_differentiable"
-                        )
-                if all(input_marked_as_non_diffables):
-                    # No input propagate tangents
-
-                    # if special_type_nondiffable_input:
-                    #     # Only warn to ensure `'Tensor' not in` assumption.
-                    #     print(
-                    #         f'{deriv_op_sig}\n\tdoes not have differentiable input (w/ special input type)'
-                    #         f'\n\t{yaml_derivdef}\n'
-                    #     )
-
-                    continue
-                
-                # field in [RESULT, RESULT_N] are handled before
-                for k in yaml_derivdef.keys():
-                    assert not k.startswith('result')
-                
-                # If an input is still diffable and handled, its field in yaml
-                # is its name.
-                inputs_handled = [False] * len(deriv_opdef.named_params)
-                for i, (marked_non_diffable, p) in enumerate(
-                    more_itertools.zip_equal(
-                        input_marked_as_non_diffables, deriv_opdef.named_params
-                    )
-                ):
-                    if marked_non_diffable:
-                        continue
-
-                    if p.name in yaml_derivdef:
-                        inputs_handled[i] = True
-                
-                if all(
-                    nondiff or handled for nondiff, handled
-                    in more_itertools.zip_equal(
-                        input_marked_as_non_diffables, inputs_handled
-                    )
-                ):
-                    continue
-            
-                else:
-
-                    print(
-                        f'{deriv_op_sig}\n\ttangent unknown'
-                        f'\n\t{yaml_derivdef}\n'
-                    )
-                    continue
 
             # endif  # field in [RESULT, ...]
 
@@ -861,18 +884,6 @@ def parse_derivatives_yaml(
 
 
 
-def parse_pushforward_info():
-    """
-    Given all @pushforward definitions, 
-
-    NOTE the `x_t is None` check to omit tangent component term for
-    zero input tangent will never be triggered, as during FX tracing here all
-    arguments are `fx.Proxy(op='placeholder')` and not None.
-    Therefore we can get all parameter names and then by checking `_t` suffix
-    we know which parameters can be differentiated.
-    """
-    from easier.core.autodiff.pushforward import pushforward_registry
-
 
 @dataclasses.dataclass
 class CliArgs:
@@ -917,16 +928,16 @@ generate_rules: Generate EASIER autodiff rules for operators in `names.yaml`.
         """
         opdefs, removed_inplace_ops = parse_native_functions_yaml(cliargs)
 
-        op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
-        with open(op_names_fp, 'w') as op_names_fs:
-            yaml.safe_dump(
-                list(map(dataclasses.asdict, opdefs)),
-                op_names_fs,
-                sort_keys=False,
-                width=float("inf")
-            )
+        # op_names_fp = os.path.join(os.path.dirname(__file__), 'names.yaml')
+        # with open(op_names_fp, 'w') as op_names_fs:
+        #     yaml.safe_dump(
+        #         list(map(dataclasses.asdict, opdefs)),
+        #         op_names_fs,
+        #         sort_keys=False,
+        #         width=float("inf")
+        #     )
         
 
 
     
-        parse_derivatives_yaml(cliargs, opdefs, removed_inplace_ops)
+        parse_derivatives_yaml(cliargs, ['div'])

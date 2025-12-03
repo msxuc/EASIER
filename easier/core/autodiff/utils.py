@@ -2,13 +2,18 @@
 # Licensed under the MIT License.
 
 
-from typing import Callable, cast
+from typing import Callable, TypeAlias, Union, cast
 
 import torch
 from torch.fx import Graph, Node
+from torch.fx.node import BaseArgumentTypes as _FxConstBase
 from torch.nn.modules import Module
 
 from easier.core.passes.utils import EasierInterpreter
+
+
+# e.g. int, float, dtype, device, slice, range, etc.
+FxConst: TypeAlias = Union[_FxConstBase, slice, range]
 
 
 class _TorchFuncGraphSimplifer(EasierInterpreter):

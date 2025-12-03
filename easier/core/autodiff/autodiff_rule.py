@@ -1,24 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-
-
-
 import dataclasses
 import operator
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union, TYPE_CHECKING, cast
-from typing_extensions import OrderedDict
+from typing import Callable, Dict, List, Literal, Optional, Sequence, \
+    Set, Tuple, Type, Union, TYPE_CHECKING
 
 import torch
 from torch.fx import Node, Graph
+from torch.fx.node import Argument as FxArg
 
 import easier as esr
-from easier.core.passes.utils import FX, fx_normalize_function_variant_into_kwargs, tree_map
-from easier.core.runtime.metadata import Role, RuntimeTensorMeta, collect_meta, get_node_meta, set_node_meta
+from easier.core.passes.utils import \
+    FX, fx_normalize_function_variant_into_kwargs, tree_map
+from easier.core.runtime.metadata import \
+    Role, RuntimeTensorMeta, collect_meta, get_node_meta
+from easier.core.autodiff.utils import FxConst
+
 
 if TYPE_CHECKING:
-    from easier.core.jit import EasierTracer, EasierProxy
-    from easier.core.autodiff.autodiff import FxConst, FxArg
+    from easier.core.jit import EasierProxy
 
 
 class RequiredParam:
@@ -42,14 +43,17 @@ class Differentiability:
     # (e.g. `float?`, `Tensor`) is not None.
     #
     # Generally the param names are not ordered within this dataclass.
-    other_params: List[Tuple[str, Union[RequiredParam, 'FxConst']]] = dataclasses.field(default_factory=list)
+    other_params: List[Tuple[str, Union[RequiredParam, FxConst]]] = \
+        dataclasses.field(default_factory=list)
 
     # TODO certain ops like aten::_to_copy has this field a function rather
     # than a constant, e.g.
     # `output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]`
+    # and `torch.split` or `torch.ops.aten.split_with_sizes` return as many
+    # items as input items.
     output_differentiability: Union[Literal[True], List[bool]] = True
 
-    kwargs_normalizer: Callable[[Callable, tuple, dict], Dict[str, 'FxArg']] = \
+    kwargs_normalizer: Callable[[Callable, tuple, dict], Dict[str, FxArg]] = \
         fx_normalize_function_variant_into_kwargs
 
     def all_param_names(self) -> Set[str]:
@@ -69,7 +73,9 @@ class DiffRuleBase:
     diffable_params: Optional[List[str]] = None
 
 
-    def input_differentiability(self, *args, **kwargs) -> Dict[str, Union['FxConst', Node, Sequence[Node]]]:
+    def input_differentiability(
+        self, *args, **kwargs
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         """
         Resolve inputs at the callsite, decide which inputs are differentiable.
 
@@ -122,16 +128,27 @@ class DiffRuleBase:
     def jvp(self, *args, **kwargs):
         """
         Inputs:
+        -   Optional Union[EasierProxy, Tuple[EasierProxy]] for primal result
+            if needed.
+
+            NOTE: for multi-res op, this param for result is an explicit tuple,
+            not a single Node such that indexing it will result in extra
+            getitem Nodes.
+
         -   EasierProxy for input Nodes
         -   Constants remain constants
 
         Returns:
         -   Tensor/Proxy: A single result item with tangent
-        -   List[None | Tensor/Proxy]: Multiple items, some don't have tangent
+
+        -   List[None | Tensor/Proxy]:
+            Resultant tangent items for a multiple-result operator.
+            For primal item that doesn't have a tangent, the result item should
+            be None.
         """
         raise NotImplementedError("Derived class should implement this")
     
-    def __init__(self, node: Node, op: Callable, raw_meta_ctor: Callable) -> None:
+    def __init__(self, node: Node, op: Callable, raw_meta_ctor: Callable):
         self.raw_node = node
         self.op = op
         self.raw_meta_ctor = raw_meta_ctor
@@ -144,10 +161,14 @@ class DiffRuleBase:
     
     def invoke_output_meta(self):
         if self.fx_normalize_to_kwargs_only:
-            ometa = self.output_meta(**self.raw_normalized_kwargs)
+            ometa = self.output_meta(
+                *self.raw_normalized_kwargs
+            )
 
         else:
-            ometa = self.output_meta(*self.raw_node.args, **self.raw_node.kwargs)
+            ometa = self.output_meta(
+                *self.raw_node.args, **self.raw_node.kwargs
+            )
         
         return ometa
         
@@ -198,7 +219,10 @@ class DiffRuleBase:
                 k: tree_map(raw, _arg_proxy)
                 for k, raw in self.raw_normalized_kwargs.items()
             }
-            res_tangent = self.jvp(*primal_result_proxies, **norm_kw_proxies, **kw_tangents_proxies)
+            res_tangent = self.jvp(
+                *primal_result_proxies,
+                **norm_kw_proxies, **kw_tangents_proxies
+            )
 
         else:
             args_proxies = tree_map(self.raw_node.args, _arg_proxy)
@@ -206,13 +230,19 @@ class DiffRuleBase:
                 k: tree_map(raw, _arg_proxy)
                 for k, raw in self.raw_node.kwargs.items()
             }
-            res_tangent = self.jvp(*primal_result_proxies, *args_proxies, **kwargs_proxies, **kw_tangents_proxies)
+            res_tangent = self.jvp(
+                *primal_result_proxies, *args_proxies,
+                **kwargs_proxies, **kw_tangents_proxies
+            )
         
         assert get_node_meta(self.raw_node), \
             f"Rule {self} should set metadata on the raw Node"
         
         res_tangent: Union[EasierProxy, Sequence[Union[None, EasierProxy]]]
-        return tree_map(res_tangent, lambda p: p.node)  # type: ignore
+        return tree_map(
+            res_tangent,
+            lambda p: None if p is None else p.node
+        )  # type: ignore
 
 
 tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
@@ -220,23 +250,39 @@ tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
 class SetitemRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = False
 
-    def input_differentiability(self, target, index, input) -> Dict[str, int | float | str | Node | Sequence[Node]]:
+    def input_differentiability(
+        self, target, index, input
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'target': target, 'input': input}
 
     def output_meta(self, target, index, input):
         return get_node_meta(target)
 
-    def jvp(self, target, index, input, target_t: 'EasierProxy', input_t: 'EasierProxy'):
-        target_t.node.graph.call_function(operator.setitem, (target_t.node, index, input_t.node))
+    def jvp(
+        self,
+        target, index, input,
+        target_t: 'EasierProxy', input_t: 'EasierProxy'
+    ):
+        target_t.node.graph.call_function(
+            operator.setitem, (target_t.node, index, input_t.node)
+        )
         return target_t
 
 tangent_rule_registry[operator.setitem] = SetitemRule
 
+differentiabilities: Dict[Callable, List[Differentiability]] = {}
+
+
+#
+# Custom DiffRule
+#
 
 class GetitemRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = False
 
-    def input_differentiability(self, input, index) -> Dict[str, int | float | str | Node | Sequence[Node]]:
+    def input_differentiability(
+        self, input, index
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'input': input}
 
     def output_meta(self, input, index):
@@ -255,7 +301,9 @@ tangent_rule_registry[operator.getitem] = GetitemRule
 class EsrSumRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = False
 
-    def input_differentiability(self, input) -> Dict[str, int | float | str | Node | Sequence[Node]]:
+    def input_differentiability(
+        self, input
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'input': input}
 
     def output_meta(self, input):
@@ -270,32 +318,22 @@ class EsrSumRule(DiffRuleBase):
 tangent_rule_registry[esr.sum] = EsrSumRule
 
 
-
-differentiabilities: Dict[Callable, List[Differentiability]] = {}
-
 #
-# GENERATED by tools/autodiff/gen_autodiff.py
+# Custom torch op Differentiability for torch.func.jvp()
 #
-
-differentiabilities[torch.mul] = [
-    Differentiability(
-        ['input', 'other']
-    )
-]
-
-differentiabilities[torch.add] = [
-    Differentiability(
-        ['input', 'other'],
-        [('alpha', 1)]
-    )
-]
-
-differentiabilities[torch.lt] = [
-    Differentiability(
-        [],
-        [('input', required), ('other', required), ('alpha', 1)]
-    )
-]
+# Mainly for:
+# - Composed torch.aten ops not in derivatives.yaml
+#   (i.e. in native_functions.yaml they don't have 'core' tag)
+#
+#   But if they are accepted by torch.jvp(), we can simply add
+#   Differentiability entries for them.
+#
+# - torch.aten ops accepted by torch.jvp(), but minor preprocess is needed,
+#   e.g. torch.einsum.
+#
+# - torch.aten ops in derivatives.yaml but requiring special parsing.
+#   It's easier to manual define Differentiability for them.
+#
 
 def _normalize_einsum_kwargs(op, args, kwargs):
     def _match(equation, tensors):
