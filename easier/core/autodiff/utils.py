@@ -2,18 +2,23 @@
 # Licensed under the MIT License.
 
 
-from typing import Callable, TypeAlias, Union, cast
+from typing import Callable, Dict, TypeAlias, Union, cast
 
 import torch
-from torch.fx import Graph, Node
+from torch.fx import Graph, Node, GraphModule
 from torch.fx.node import BaseArgumentTypes as _FxConstBase
 from torch.nn.modules import Module
 
-from easier.core.passes.utils import FX, EasierInterpreter
+from easier.core.passes.utils import FX, EasierInterpreter, tree_map
 
 
 # e.g. int, float, dtype, device, slice, range, etc.
 FxConst: TypeAlias = Union[_FxConstBase, slice, range]
+
+
+def strict_node_copy(src_node: Node, dst_graph: Graph, src2dst: Dict[Node, Node]):
+    # TODO
+    pass
 
 
 class _TorchFuncGraphSimplifer(EasierInterpreter):
@@ -41,7 +46,7 @@ class _TorchFuncGraphSimplifer(EasierInterpreter):
             self.current_graph.erase_node(self.current_node)
 
 
-def simplify_torchfunc_fx_graph(jvp_gm: 'GraphModule') -> Graph:
+def simplify_torchfunc_fx_graph(jvp_gm: GraphModule) -> Graph:
     """
     The Graph (both FX or TorchScript) from torch.func.jvp() will have many
     internal, annotation-only Nodes from torch.func, for EASIER AD usage

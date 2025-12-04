@@ -537,7 +537,7 @@ class JvpTransformer(EasierInterpreter):
                 assert False, \
                     "Failed to resolve overloading:" \
                     f" with Differentiabilities {dfbs}," \
-                    f" get {raw_node_normalized_kwargs}"
+                    f" got {raw_node_normalized_kwargs}"
             
             raw_node_diff_args: Dict[
                 str, Union[FxConst, Node, Sequence[Node]]
@@ -577,7 +577,7 @@ class JvpTransformer(EasierInterpreter):
                 # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
                 # NOTE this op may be a undifferentiable op, but we still need its
                 # primal part
-                gm, out_meta, flatten_tree, nondiff_inputs = \
+                gm, out_meta, flatten_tree, nondiff_inputs_attrname2raw = \
                     self._generate_jvp_subgraph_using_torchfunc(
                         function, dfb, raw_node_normalized_kwargs
                     )
@@ -596,6 +596,11 @@ class JvpTransformer(EasierInterpreter):
                 n_flattened_primal_outputs = 1
                 if isinstance(out_diff, Sequence):
                     n_flattened_primal_outputs = len(out_diff)
+                
+                nondiff_inputs_attrname2jvp = {
+                    k: self.nodemap_raw2primal[v]
+                    for k, v in nondiff_inputs_attrname2raw.items()
+                }
 
                 # copy the whole torch.func.jvp sub-Graph, it includes both
                 # the primal part and the tangent part
@@ -604,7 +609,7 @@ class JvpTransformer(EasierInterpreter):
                     gm, subg, self.jvp_graph,
                     flatten_tree, input_primal_nodes, input_tangent_nodes,
                     n_flattened_primal_outputs,
-                    nondiff_inputs
+                    nondiff_inputs_attrname2jvp
                 ).run()
 
                 # torch.jvp sub-Graph is likely to result in explicit unpacking
@@ -646,6 +651,9 @@ class JvpTransformer(EasierInterpreter):
             # endif tangent_involved
         
         # endif op category
+    
+    def _strict_copy_raw_to_jvp(self, raw: Node):
+        pass
 
     
     def if_call_method(self, method_name: str):
@@ -742,7 +750,8 @@ class JvpTransformer(EasierInterpreter):
     ) -> Tuple[
         GraphModule,
         StructuredTensorMeta,
-        List[List[int]]
+        List[List[int]],
+        Dict[str, Node]
     ]:
         """
         We need to note that torch.func.jvp API only leverage the order of
@@ -801,7 +810,7 @@ class JvpTransformer(EasierInterpreter):
         #
         # The order should be strictly maintained by jvp-resultant
         # GraphModule's _tensor_constantsN fields.
-        nondiff_val2node: Dict[torch.Tensor, Node] = {}
+        nondiff_val2raw: Dict[torch.Tensor, Node] = {}
 
         jvp_nondiff_env_vals: Dict[str, Union[torch.Tensor, FxConst]] = {}
         for nondiff_param_name, default_arg in dfb.other_params:
@@ -816,7 +825,7 @@ class JvpTransformer(EasierInterpreter):
                 jvp_nondiff_val = self._create_zero_val(raw_node_nondiff_arg)
                 assert isinstance(jvp_nondiff_val, torch.Tensor)
 
-                nondiff_val2node[jvp_nondiff_val] = raw_node_nondiff_arg
+                nondiff_val2raw[jvp_nondiff_val] = raw_node_nondiff_arg
 
             else:
                 assert raw_node_nondiff_arg is None \
@@ -977,45 +986,54 @@ class JvpTransformer(EasierInterpreter):
         assert y_meta == jvp_meta
 
         # Connect jvp() assigned _tensor_constantsN fields with nondiff Nodes
-        nondiff_jvp_submod_attrnames = {}
+        jvp_nondiff_attrname2raw: Dict[str, Node] = {}
         for const_name, nondiff_val in gm.named_buffers():
-            nondiff_jvp_submod_attrnames[const_name] = nondiff_val2node[nondiff_val]
-
+            jvp_nondiff_attrname2raw[const_name] = \
+                nondiff_val2raw[nondiff_val]
+        
         # TODO return bijective position mapping
-        return gm, y_meta, flattened_primal_tree, nondiff_jvp_submod_attrnames
+        return gm, y_meta, flattened_primal_tree, jvp_nondiff_attrname2raw
 
 class _TorchJvpSubGraphCopier(EasierInterpreter):
     def __init__(
         self, subgm: GraphModule, subg: Graph, jvp_graph: Graph,
+        #
+        # Structural info about diff-able inputs
+        #
         input_flatten_tree: List[List[int]],
         jvp_input_primals: List[Union[FxConst, Node, Sequence[Node]]],
         jvp_input_tangents: List[Union[FxConst, Node, Sequence[Node]]],
+        #
+        # Structural info about outputs
+        #
         n_flattened_primal_outputs: int,
-        nondiff_jvp_submod_attrnames: Dict[str, Node]
+        #
+        # Structural info about non-diff-able inputs
+        #
+        jvp_input_nondiff_attrname2node: Dict[str, Node]
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
         self.jvp_graph = jvp_graph
-        # self.diff_arg_names = diff_arg_names
+
+        self.input_flatten_tree = input_flatten_tree
         self.jvp_input_primals = jvp_input_primals
         self.jvp_input_tangents = jvp_input_tangents
         assert len(jvp_input_primals) == len(jvp_input_tangents)
-
-        self.input_flatten_tree = input_flatten_tree
         self.n_flattened_primal_inputs = len(input_flatten_tree)
 
         self.n_flattened_primal_outputs =  n_flattened_primal_outputs
 
-        self.nondiff_jvp_submod_attrnames = nondiff_jvp_submod_attrnames
+        # Keys look like _tensor_constant0
+        self.jvp_input_nondiff_attr2node = jvp_input_nondiff_attrname2node
 
-        self.placeholder_i = 0  # totally 2*len(diff_arg_names)
 
-        # self.nondiff_getattr_i = 0  # totally len(nondiff_inputs)
+        self._placeholder_i = 0  # totally 2*len(diff_arg_names)
 
         # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
         # allow constants, but the subgraph assumes all inputs are Nodes,
         # making it erroneous to call torch function/method on constants.
-        self.nodemap_subg2jvp: Dict[Node, Union[Node, FxConst]] = {}
+        self._nodemap_subg2jvp: Dict[Node, Union[Node, FxConst]] = {}
 
         self.output_primal: Union[Node, Sequence[Node]]
         self.output_tangent: Union[Node, Sequence[Node]]
@@ -1031,7 +1049,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         """
         # param_name would be "primals_1" "tangents_2" (from `def _jvp` above)
         # and not usable.
-        is_primal = self.placeholder_i < self.n_flattened_primal_inputs
+        is_primal = self._placeholder_i < self.n_flattened_primal_inputs
 
         def _from_flatten(
             jvp_inputs: List[Union[FxConst, Node, Sequence[Node]]],
@@ -1045,34 +1063,35 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
                 return jvp_inputs[i][ii] # type: ignore
 
         if is_primal:
-            ph_pos = self.placeholder_i
+            ph_pos = self._placeholder_i
 
             jvp_primal = _from_flatten(
                 self.jvp_input_primals, self.input_flatten_tree[ph_pos]
             )
-            self.nodemap_subg2jvp[self.current_node] = jvp_primal
+            self._nodemap_subg2jvp[self.current_node] = jvp_primal
         else:
-            ph_pos = self.placeholder_i - self.n_flattened_primal_inputs
+            ph_pos = self._placeholder_i - self.n_flattened_primal_inputs
 
             jvp_tangent = _from_flatten(
                 self.jvp_input_tangents, self.input_flatten_tree[ph_pos]
             )
-            self.nodemap_subg2jvp[self.current_node] = jvp_tangent
+            self._nodemap_subg2jvp[self.current_node] = jvp_tangent
 
-        self.placeholder_i += 1
+        self._placeholder_i += 1
     
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
         assert submod_path == ''
+        # attr_name looks like _tensor_constants0
 
-        self.nodemap_subg2jvp[self.current_node] = \
-            self.nondiff_jvp_submod_attrnames[attr_name]
+        self._nodemap_subg2jvp[self.current_node] = \
+            self.jvp_input_nondiff_attr2node[attr_name]
     
     def if_call_function(self, function):
         jvp_node = self.jvp_graph.node_copy(
-            self.current_node, self.nodemap_subg2jvp.__getitem__
+            self.current_node, self._nodemap_subg2jvp.__getitem__
         )
 
-        self.nodemap_subg2jvp[self.current_node] = jvp_node
+        self._nodemap_subg2jvp[self.current_node] = jvp_node
     
     def if_output(self):
         """
@@ -1090,7 +1109,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
             " We expect torch.func.jvp() sub-Graph flatten and concat all" \
             " primal and tangent result items"
 
-        convert = self.nodemap_subg2jvp.__getitem__
+        convert = self._nodemap_subg2jvp.__getitem__
 
         if self.n_flattened_primal_outputs == 1:
             self.output_primal = tree_map(jvp_subgraph_out[0], convert)
@@ -1277,8 +1296,12 @@ def jvp(
                 p.zero_()
 
             # The JvpTransformer-generated Graph will be inlined here.
+            # 
+            # And the attrpath won't contain 'graph_module', as all
+            # parameters/submods in `.graph_module` are also in _Jvp itself,
+            # FX tracer will pick the attrpath in the shallower Module level.
             self.graph_module()
-            
+
 
     jvpm = _Jvp(inputs, outputs, vectors)
     jvp_transformer = JvpTransformer(module, jvpm).run()
