@@ -41,7 +41,7 @@ class _TorchFuncGraphSimplifer(EasierInterpreter):
             self.current_graph.erase_node(self.current_node)
 
 
-def simplify_torchfunc_fx_graph(raw_g: Graph) -> Graph:
+def simplify_torchfunc_fx_graph(jvp_gm: 'GraphModule') -> Graph:
     """
     The Graph (both FX or TorchScript) from torch.func.jvp() will have many
     internal, annotation-only Nodes from torch.func, for EASIER AD usage
@@ -78,10 +78,10 @@ def simplify_torchfunc_fx_graph(raw_g: Graph) -> Graph:
     ```
     """
     simp_g = Graph()
-    out_v = simp_g.graph_copy(raw_g, {})
+    out_v = simp_g.graph_copy(jvp_gm.graph, {})
     simp_g.output(out_v)
 
-    _TorchFuncGraphSimplifer([None], [simp_g]).run()  # type: ignore
+    _TorchFuncGraphSimplifer([jvp_gm], [simp_g]).run()  # type: ignore
 
     return simp_g
 

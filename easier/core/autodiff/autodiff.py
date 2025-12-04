@@ -599,7 +599,7 @@ class JvpTransformer(EasierInterpreter):
 
                 # copy the whole torch.func.jvp sub-Graph, it includes both
                 # the primal part and the tangent part
-                subg = simplify_torchfunc_fx_graph(gm.graph)
+                subg = simplify_torchfunc_fx_graph(gm)
                 copier = _TorchJvpSubGraphCopier(
                     gm, subg, self.jvp_graph,
                     flatten_tree, input_primal_nodes, input_tangent_nodes,
