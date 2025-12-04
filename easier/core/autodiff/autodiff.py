@@ -241,7 +241,6 @@ class JvpTransformer(EasierInterpreter):
         assert isinstance(target, Node)
         self._try_init_tangent_for_inplace_target(target)
 
-
     def _is_tangent_involved(
         self,
         raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]
@@ -264,6 +263,8 @@ class JvpTransformer(EasierInterpreter):
         Remarks:
 
         -   Tangent on non-diffable param is not counted.
+
+        -   Not necessarily every diffable param has tangent.
         """
         involved = False
         for raw_node_diff_arg in raw_node_diff_args.values():
@@ -338,6 +339,37 @@ class JvpTransformer(EasierInterpreter):
                 ))
 
         return input_primal_nodes, input_tangent_nodes
+    
+    def _prepare_constant_tensor_for_operator(self):
+        enforced_dtype = None
+
+        for arg in self.current_node.args:
+            if arg in self.nodemap_raw2tangent:
+                # Given this is an syntactic operator, if any operand
+                # has tangent, other constants must be of floating-point dtype
+                # to be handled by torch.func.jvp().
+                enforced_dtype = torch.float32
+
+        for arg_i, const in enumerate(list(self.current_node.args)):
+            if isinstance(const, (int, float)):
+                with self.current_graph.inserting_before(self.current_node):
+                    raw_const_node = self.current_graph.call_function(
+                        torch.full, ((), const), {'dtype': enforced_dtype}
+                    )
+                    self.current_node.update_arg(arg_i, raw_const_node)
+                    set_node_meta(
+                        raw_const_node,
+                        RuntimeTensorMeta(
+                            Role.REPLICATED,
+                            (),
+                            torch.full((), const, dtype=enforced_dtype).dtype
+                        )
+                    )
+                
+                self.nodemap_raw2primal[raw_const_node] = \
+                    self.jvp_graph.call_function(
+                        torch.full, ((), const), {'dtype': enforced_dtype}
+                    )
         
     def _handle_operation(self, function: Callable):
         """
@@ -464,10 +496,13 @@ class JvpTransformer(EasierInterpreter):
         
             # operator.xxx only appears in non-inplace CALL_FUNCTION Nodes.
             # simply convert it to torch.xxx op.
-            if function is operator.truediv:
-                function = torch.div
-            elif getattr(operator, function.__name__, None) is function:
-                function = getattr(torch, function.__name__)
+            if getattr(operator, function.__name__, None) is function:
+                if function is operator.truediv:
+                    function = torch.div  # torch does not have truediv
+                else:
+                    function = getattr(torch, function.__name__)
+
+                self._prepare_constant_tensor_for_operator()
 
             #
             # Handle using torch.func.jvp and tracing.
@@ -512,16 +547,23 @@ class JvpTransformer(EasierInterpreter):
 
             tangent_involved = self._is_tangent_involved(raw_node_diff_args)
 
-            # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
-            # NOTE this op may be a undifferentiable op, but we still need its
-            # primal part
-            gm, out_meta, flatten_tree = \
-                self._generate_jvp_subgraph_using_torchfunc(
-                    function, dfb, raw_node_normalized_kwargs
-                )
-            set_node_meta(self.current_node, out_meta)
 
             if not tangent_involved:
+                kwvals = {
+                    k: tree_map(
+                        v, self._create_zero_val
+                    ) if isinstance(v, Node) else v
+                    for k, v in raw_node_normalized_kwargs.items()
+                }
+                fake_res = function(**kwvals)
+                
+                from easier.core.runtime.jit_engine.jit_engine import \
+                    get_value_runtime_info
+                out_meta = get_value_runtime_info(
+                    self.current_node, fake_res, self._fake_eval_meta_ctor
+                )
+                set_node_meta(self.current_node, out_meta)
+
                 # maybe:
                 # - the op is not differentiable at all;
                 # - no input differentiable arguments are with tangents
@@ -532,6 +574,15 @@ class JvpTransformer(EasierInterpreter):
                 self.nodemap_raw2primal[self.current_node] = output_primal
             
             else:
+                # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
+                # NOTE this op may be a undifferentiable op, but we still need its
+                # primal part
+                gm, out_meta, flatten_tree = \
+                    self._generate_jvp_subgraph_using_torchfunc(
+                        function, dfb, raw_node_normalized_kwargs
+                    )
+                set_node_meta(self.current_node, out_meta)
+
                 self._try_init_tangent_for_inplace_op(function)
 
                 # Unflattened structure
@@ -868,6 +919,22 @@ class JvpTransformer(EasierInterpreter):
                 _primal_func, flattened_primals, flattened_tangents
             )
         
+        # NOTE depending on whether we are passing primals by a tuple like
+        # `flattened_primals` or by individual parameter for each primal,
+        # the output Node of `gm` from ** fx.experimental.make_fx **
+        # will have nested structure or will not:
+        #
+        # If by individual parameter
+        # `def _jvp(to_sort: Tensor, arg_tangent: Tensor)` then:
+        # `return ((sorted, index), (gathered_tangent, zero))`
+        #
+        # If by a tuple like below
+        # `def _jvp(flattened_primals: Tuple[torch.Tensor, ...],)` then:
+        # return ([sorted, index, gathered_tangent, zero],)
+        #
+        # But when evaluate `y, jvp_res = gm(vals, tangents)` the results
+        # will have proper structure.
+        
         # FX Graph, including make_fx, does not respect nested inputs,
         # so we need to manually flatten any nested args and maintain the
         # mapping between before/after flattening.
@@ -990,7 +1057,10 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         When copying the sub-Graph into jvp Graph, we need to handle this.
         """
         jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
-        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs
+        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs, \
+            "With currently organization of _primal_func and _jvp above," \
+            " We expect torch.func.jvp() sub-Graph flatten and concat all" \
+            " primal and tangent result items"
 
         convert = self.nodemap_subg2jvp.__getitem__
 

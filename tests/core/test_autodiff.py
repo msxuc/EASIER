@@ -201,24 +201,7 @@ class TestJvp:
 
     def test_smoke__assemble_poisson(self):
         init = PoissonInitializer(POISSON, MESH)
-        
-        from easier.core.passes import collectively_initialize_and_validate
-        from easier.core.passes.utils import fx_normalize_function_variant_into_kwargs
-        _, [g] = collectively_initialize_and_validate([init])
-        op_ids = set()
-        for n in g.nodes:
-            try:
-                if n.op == 'call_function':
-                    f = n.target
-                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-                    op_ids.add(f.__name__ + str(list(d.keys())))
-                elif n.op == 'call_method':
-                    f = getattr(torch, n.target)
-                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-                    op_ids.add(n.target + str(list(d.keys())))
-            except:
-                op_ids.add(str(n.target))
-        print(list(op_ids))
+        # _check_op_usage(init)
                 
         tpoints = esr.Tensor(torch.rand_like(init.points), mode='partition')
         jvp = esr.jvp(init, [init.points], [init.b, init.Ac, init.Af], vectors=[tpoints])
@@ -235,32 +218,105 @@ class TestJvp:
         esr_tAf = jvp.products[2].collect()
 
     def test_smoke__swe_main(self):
+        #
+        # EASIER approach
+        #
+
+        input_attrnames = [
+            'x', 'sy', 'bsx', 'bsy', 'alpha',
+            # Since esr.jvp currently does not allow overlapping between I/O,
+            # the last 3 inputs are effectively outputs too.
+            'h', 'uh', 'vh'
+        ]
+
         eqn = ShallowWaterEquation(MESH, SW)
-        
-        from easier.core.passes import collectively_initialize_and_validate
-        from easier.core.passes.utils import fx_normalize_function_variant_into_kwargs
-        _, [g] = collectively_initialize_and_validate([eqn])
-        op_ids = set()
-        for n in g.nodes:
-            try:
-                if n.op == 'call_function':
-                    f = n.target
-                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-                    op_ids.add(f.__name__ + str(list(d.keys())))
-                elif n.op == 'call_method':
-                    f = getattr(torch.ops.aten, n.target)
-                    d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-                    op_ids.add(n.target + str(list(d.keys())))
-            except:
-                op_ids.add(str(n.target))
-        print(list(op_ids))
-                
-        tx = esr.Tensor(torch.rand_like(eqn.x), mode='partition')
-        jvp = esr.jvp(eqn, [eqn.x], [eqn.h], vectors=[tx])
+        # _check_op_usage(eqn)
+
+        inputs = [getattr(eqn, n) for n in input_attrnames]
+
+        INIT_VECTOR_VALS = [torch.rand_like(input) for input in inputs]
+
+        vectors = [esr.Tensor(vv, mode='partition') for vv in INIT_VECTOR_VALS]
+
+        jvp = esr.jvp(eqn, inputs, [], vectors=vectors)
         [jvp] = esr.compile([jvp], backend='torch') # type: ignore
         jvp: Jvp
 
         jvp()
+
+        esr_primals = [t.collect() for t in inputs]
+        esr_tangents = [vectors[i].collect() for i, t in enumerate(inputs)]
+
+        #
+        # torch.jvp approach
+        #
+        eqn = ShallowWaterEquation(MESH, SW)
+        [eqn] = esr.compile([eqn], backend='none') # type: ignore
+
+        # We need such a dict-like container, supporting __getattr__, and
+        # don't enforce nn.Parameter field like esr.Module(nn.Module).
+        class _MutableRoot:
+            def face_reconstruct(self, phi):
+                return ShallowWaterEquation.face_reconstruct(self, phi)
+            def delta(self, h, uh, vh):
+                return ShallowWaterEquation.delta(self, h, uh, vh)
+
+        # All methods, attributes, submods are dispatched to `eqn`
+        _eqn = _MutableRoot()
+        for k, v in eqn.__dict__.items():
+            setattr(_eqn, k, v)
+        for k, v in eqn.named_parameters():
+            setattr(_eqn, k, v)
+        for k, v in eqn.named_modules():
+            setattr(_eqn, k, v)
+        
+        # esr.Tensors for the new eqn instance.
+        inputs = [getattr(eqn, n) for n in input_attrnames]
+
+        # torch.jvp() needs explicit return values.
+        output_attrnames = ['h', 'uh', 'vh']
+
+        def _func(*input_proxies):
+            # Although proxies are wrapped on inputs, they are different
+            # instances from the `inputs` above, rebind them within the
+            # callstack of torch.jvp()
+            for n, p in zip(input_attrnames, input_proxies):
+                setattr(_eqn, n, p)
+            
+            ShallowWaterEquation.forward(_eqn)
+
+            return tuple(getattr(_eqn, n) for n in output_attrnames)
+            
+        torch_outs, torch_tangents = torch.func.jvp(  # type: ignore
+            _func, tuple(inputs), tuple(INIT_VECTOR_VALS)
+        )
+
+        for ep, tp in zip(esr_primals[-3:], torch_outs):
+            assert torch.allclose(ep, tp)
+        for et, tt in zip(esr_tangents[-3:], torch_tangents):
+            assert torch.allclose(et, tt, rtol=1e-04, atol=1e-06)
+
+
+
+
+def _check_op_usage(topmod):
+    from easier.core.passes import \
+        collectively_initialize_and_validate
+    from easier.core.passes.utils import \
+        fx_normalize_function_variant_into_kwargs
+    _, [g] = collectively_initialize_and_validate([topmod])
+    op_ids = set()
+    for n in g.nodes:
+        if n.op == 'call_function':
+            f = n.target
+            d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+            op_ids.add(f.__name__ + str(list(d.keys())))
+        elif n.op == 'call_method':
+            f = getattr(torch.ops.aten, n.target)
+            d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
+            op_ids.add(n.target + str(list(d.keys())))
+    
+    print(list(op_ids))
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',

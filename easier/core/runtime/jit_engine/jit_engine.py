@@ -1180,7 +1180,7 @@ class JitEngine:
         # as it generates info of nested esr.Module calls for outer JIT runs.
         ms, gs = passes.analyze_data_dependency(ms, gs)
 
-        ms, gs = passes.fuse_dataflow(ms, gs)
+        # ms, gs = passes.fuse_dataflow(ms, gs)
         ms, gs = passes.analyze_life_range(ms, gs)
 
         # ms, gs = passes.codegen(ms, gs)
