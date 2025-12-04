@@ -9,7 +9,7 @@ from torch.fx import Graph, Node
 from torch.fx.node import BaseArgumentTypes as _FxConstBase
 from torch.nn.modules import Module
 
-from easier.core.passes.utils import EasierInterpreter
+from easier.core.passes.utils import FX, EasierInterpreter
 
 
 # e.g. int, float, dtype, device, slice, range, etc.

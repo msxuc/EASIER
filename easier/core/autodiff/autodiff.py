@@ -577,7 +577,7 @@ class JvpTransformer(EasierInterpreter):
                 # Unconditionally invoke torch.jvp to generate primal+jvp subgraph
                 # NOTE this op may be a undifferentiable op, but we still need its
                 # primal part
-                gm, out_meta, flatten_tree = \
+                gm, out_meta, flatten_tree, nondiff_inputs = \
                     self._generate_jvp_subgraph_using_torchfunc(
                         function, dfb, raw_node_normalized_kwargs
                     )
@@ -603,7 +603,8 @@ class JvpTransformer(EasierInterpreter):
                 copier = _TorchJvpSubGraphCopier(
                     gm, subg, self.jvp_graph,
                     flatten_tree, input_primal_nodes, input_tangent_nodes,
-                    n_flattened_primal_outputs
+                    n_flattened_primal_outputs,
+                    nondiff_inputs
                 ).run()
 
                 # torch.jvp sub-Graph is likely to result in explicit unpacking
@@ -738,7 +739,11 @@ class JvpTransformer(EasierInterpreter):
         function: Callable,
         dfb: Differentiability,
         raw_normalized_kwargs: Dict[str, FxArg],
-    ) -> Tuple[GraphModule, StructuredTensorMeta, List[List[int]]]:
+    ) -> Tuple[
+        GraphModule,
+        StructuredTensorMeta,
+        List[List[int]]
+    ]:
         """
         We need to note that torch.func.jvp API only leverage the order of
         parameters -- via `diff_arg_names: List[str]`,
@@ -790,21 +795,28 @@ class JvpTransformer(EasierInterpreter):
         # Non-differentiable parts of raw inputs, primal inputs
         #
         
-        # TODO if a non-diffable raw-input Node is captured via closure to jvp,
+        # If a non-diffable raw-input Node is captured via closure to jvp,
         # it's represented by a sub-Graph Node e.g. GET_ATTR[tensor_constant0]
         # We need to map it back to primal Nodes.
-        # TODO jvp_nondiff_env_nodes = {}
+        #
+        # The order should be strictly maintained by jvp-resultant
+        # GraphModule's _tensor_constantsN fields.
+        nondiff_val2node: Dict[torch.Tensor, Node] = {}
 
         jvp_nondiff_env_vals: Dict[str, Union[torch.Tensor, FxConst]] = {}
-        for nondiff_param, default_arg in dfb.other_params:
-            raw_node_nondiff_arg = raw_normalized_kwargs[nondiff_param]
+        for nondiff_param_name, default_arg in dfb.other_params:
+            raw_node_nondiff_arg = raw_normalized_kwargs[nondiff_param_name]
 
             if isinstance(raw_node_nondiff_arg, Sequence):
                 raise NotImplementedError("Nested non-differentiable arg")
                 # PyTorch unlikely has this.
             
             if isinstance(raw_node_nondiff_arg, Node):
-                raise NotImplementedError("Captured non-differentiable arg")
+                # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph.
+                jvp_nondiff_val = self._create_zero_val(raw_node_nondiff_arg)
+                assert isinstance(jvp_nondiff_val, torch.Tensor)
+
+                nondiff_val2node[jvp_nondiff_val] = raw_node_nondiff_arg
 
             else:
                 assert raw_node_nondiff_arg is None \
@@ -817,18 +829,23 @@ class JvpTransformer(EasierInterpreter):
             # (especially when the argument is omitted at callsite)
             # that is not None.
             if jvp_nondiff_val is None:
-                if nondiff_param in self.current_node.kwargs:
+                # Sometimes FX normalization will add omitted optional argument
+                # which is inferred from op definition, effectively same as
+                # `default_arg`. But if that arg appears in node.kwargs, it
+                # means user has explicitly specified it.
+                if nondiff_param_name in self.current_node.kwargs:
                     raise NotImplementedError(
-                        "User explicitly specifies None arg, may indicate that"
-                        " an internal assumption is broken"
+                        "User explicitly specifies None arg in"
+                        f" {self.current_node}"
+                        ", may indicate that an internal assumption is broken"
                     )
                 assert not isinstance(default_arg, RequiredParam)
                 jvp_nondiff_val = default_arg
             
             jvp_nondiff_env_vals[
-                nondiff_param
+                nondiff_param_name
             ] = jvp_nondiff_val  # type: ignore
-
+        
         
         # Differentiable Tensor-type parameters, must be passed via jvp()
         # API param list.
@@ -959,8 +976,13 @@ class JvpTransformer(EasierInterpreter):
         )
         assert y_meta == jvp_meta
 
+        # Connect jvp() assigned _tensor_constantsN fields with nondiff Nodes
+        nondiff_jvp_submod_attrnames = {}
+        for const_name, nondiff_val in gm.named_buffers():
+            nondiff_jvp_submod_attrnames[const_name] = nondiff_val2node[nondiff_val]
+
         # TODO return bijective position mapping
-        return gm, y_meta, flattened_primal_tree
+        return gm, y_meta, flattened_primal_tree, nondiff_jvp_submod_attrnames
 
 class _TorchJvpSubGraphCopier(EasierInterpreter):
     def __init__(
@@ -968,7 +990,8 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         input_flatten_tree: List[List[int]],
         jvp_input_primals: List[Union[FxConst, Node, Sequence[Node]]],
         jvp_input_tangents: List[Union[FxConst, Node, Sequence[Node]]],
-        n_flattened_primal_outputs: int
+        n_flattened_primal_outputs: int,
+        nondiff_jvp_submod_attrnames: Dict[str, Node]
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
@@ -983,7 +1006,11 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
 
         self.n_flattened_primal_outputs =  n_flattened_primal_outputs
 
+        self.nondiff_jvp_submod_attrnames = nondiff_jvp_submod_attrnames
+
         self.placeholder_i = 0  # totally 2*len(diff_arg_names)
+
+        # self.nondiff_getattr_i = 0  # totally len(nondiff_inputs)
 
         # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
         # allow constants, but the subgraph assumes all inputs are Nodes,
@@ -1035,9 +1062,10 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         self.placeholder_i += 1
     
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        raise NotImplementedError(
-            "Captured values, likely non-differentiable primal inputs"
-        )
+        assert submod_path == ''
+
+        self.nodemap_subg2jvp[self.current_node] = \
+            self.nondiff_jvp_submod_attrnames[attr_name]
     
     def if_call_function(self, function):
         jvp_node = self.jvp_graph.node_copy(

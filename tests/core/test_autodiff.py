@@ -110,12 +110,16 @@ class TestJvpTransformation:
 
                 sort, idxes = torch.sort(vc, dim=1)
 
+                b = v0 < v1
+                torch.where(b, v0, v1)
+
         m = M()
         jvpm = esr.jvp(m, [m.v], [])
         jvpm: Jvp
 
         v, tv, v0, tv0, v1, tv1, cat, tcat, \
             sort, sort0, sort1, tcat_idx, zero, \
+            lt, where, twhere \
             = jvpm.graph_module.graph.nodes
         
         assert tv0.target == operator.getitem and tv0.args[0] == tv
