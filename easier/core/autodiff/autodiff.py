@@ -29,6 +29,7 @@ from easier.core.autodiff.autodiff_rule import \
     Differentiability, RequiredParam, \
     tangent_rule_registry, differentiabilities
 from easier.core.autodiff.utils import simplify_torchfunc_fx_graph, FxConst
+from easier.core.utils import EasierJitException
 
 
 
@@ -288,10 +289,22 @@ class JvpTransformer(EasierInterpreter):
     def _prepare_diffable_primals_and_tangents(
         self,
         raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]
-    ):
+    ) -> Tuple[
+        List[Union[Node, Sequence[Node]]],
+        List[Union[Node, Sequence[Node]]]
+    ]:
+        """
+        Given the order of raw diff-able args in `raw_node_diff_args`,
+        return a list of _prepared_ primals and _prepared_ tangents to
+        achieve the JVP calculation of this raw Node.
+
+        Being _prepared_ means scalar diff-able args will converted to
+        ()-shape Tensors/Nodes in the JVP Graph.
+        This can also be seen from the absence of FxConst in the result type.
+        """
         # Must be in the same (whatever) order as `raw_node_diff_args`
-        input_primal_nodes: List[Union[FxConst, Node, Sequence[Node]]] = []
-        input_tangent_nodes: List[Union[FxConst, Node, Sequence[Node]]] = []
+        input_primal_nodes: List[Union[Node, Sequence[Node]]] = []
+        input_tangent_nodes: List[Union[Node, Sequence[Node]]] = []
 
         for raw_node_diff_arg in raw_node_diff_args.values():
 
@@ -301,23 +314,26 @@ class JvpTransformer(EasierInterpreter):
                     "If a differentiable parameter is not a fx.Node" \
                     " or Node list, it must be a scalar"
 
-                # For scalar primal input to jvp, we **keep** the arg scalar.
-                input_primal_nodes.append(raw_node_diff_arg)
-                input_tangent_nodes.append(0.)
-                # TODO if any JVP rule exploits arg being tensors this won't
-                # work.
-
-                # # Zero tangent for scalar
-                # #
-                # # NOTE it's safer to create replicated zero tensors, because
-                # # to generate JVP sub-Graph we use zero tensors (diff_argval)
-                # # so the sub-Graph may exploit the assumption that all input
-                # # tangents are tensors. And it eases our copying since all
-                # # elements are Nodes -- no need to inline scalars.
-                # # Although literal `1.0` may also work, computationally.
-                # input_tangent_nodes.append(self.jvp_graph.call_function(
-                #     torch.zeros, ([],), { 'dtype': torch.float32 }
-                # ))
+                # Zero tangent for scalar
+                #
+                # Because when invoking torch.jvp(), we convert scalar-type
+                # diffable arguments to ()-shape tensors.
+                # Because of this assumption, torch.jvp() will geneerate calls
+                # to operator overloading that requires args to be tensors.
+                # If we keep the raw scalar arguments, TypeError will occur.
+                #
+                # Therefore, before we do sub-Graph inlining, we need to
+                # convert raw scalar args to tensors/Nodes in the JVP graph.
+                input_primal_nodes.append(self.jvp_graph.call_function(
+                    torch.full,
+                    ((), raw_node_diff_arg),
+                    { 'dtype': torch.float32 }
+                ))
+                input_tangent_nodes.append(self.jvp_graph.call_function(
+                    torch.zeros,
+                    ([],),
+                    { 'dtype': torch.float32 }
+                ))
             
             else:  # Node or Node list
                 input_primal_nodes.append(tree_map(
@@ -340,7 +356,21 @@ class JvpTransformer(EasierInterpreter):
 
         return input_primal_nodes, input_tangent_nodes
     
-    def _prepare_constant_tensor_for_operator(self):
+    def _prepare_constant_tensor_operands_for_operator(self):
+        """
+        The _operator_ here means Python syntactic operator like operator.add,
+        operator.truediv etc.
+
+        We need to dispatch the normalization and JVP subgraph generation to
+        their corresponding torch ops like torch.add, torch.div etc.
+
+        Then we follow the same rule as handling other ops, the scalar operands
+        are converted-to and treated-as ()-shape tensors.
+        """
+        assert callable(self.current_node.target)
+        assert getattr(operator, self.current_node.target.__name__) \
+            is self.current_node.target
+
         enforced_dtype = None
 
         for arg in self.current_node.args:
@@ -396,8 +426,8 @@ class JvpTransformer(EasierInterpreter):
             #
             # primal
             #
-            output_primal = self.jvp_graph.node_copy(
-                self.current_node, self.nodemap_raw2primal.__getitem__
+            output_primal = self._strict_map_raw_to_jvp(
+                self.current_node, self.nodemap_raw2primal
             )
 
             out_meta = rule.invoke_output_meta()
@@ -418,8 +448,8 @@ class JvpTransformer(EasierInterpreter):
                     assert isinstance(item_i, int)
                     assert item_i == user_i
 
-                    primal_getitem = self.jvp_graph.node_copy(
-                        raw_getitem, self.nodemap_raw2primal.__getitem__
+                    primal_getitem = self._strict_map_raw_to_jvp(
+                        raw_getitem, self.nodemap_raw2primal
                     )
 
                     item_meta = out_meta[item_i]
@@ -502,7 +532,7 @@ class JvpTransformer(EasierInterpreter):
                 else:
                     function = getattr(torch, function.__name__)
 
-                self._prepare_constant_tensor_for_operator()
+                self._prepare_constant_tensor_operands_for_operator()
 
             #
             # Handle using torch.func.jvp and tracing.
@@ -568,8 +598,8 @@ class JvpTransformer(EasierInterpreter):
                 # - the op is not differentiable at all;
                 # - no input differentiable arguments are with tangents
                 # then copy the primal Node only.
-                output_primal = self.jvp_graph.node_copy(
-                    self.current_node, self.nodemap_raw2primal.__getitem__
+                output_primal = self._strict_map_raw_to_jvp(
+                    self.current_node, self.nodemap_raw2primal
                 )
                 self.nodemap_raw2primal[self.current_node] = output_primal
             
@@ -652,8 +682,27 @@ class JvpTransformer(EasierInterpreter):
         
         # endif op category
     
-    def _strict_copy_raw_to_jvp(self, raw: Node):
-        pass
+    def _strict_map_raw_to_jvp(self, raw: Node, nodemap: Dict[Node, Node]):
+        """
+        fx.Graph.node_copy tends to silently hide raw-not-existing error in
+        nodemap.__getitem__ arg transformation (in torch C++ level),
+        silently returning a None constant in the JVP Graph.
+
+        This aux method validates the consistency of both nodemaps
+        in this class.
+        """
+        assert nodemap is self.nodemap_raw2primal \
+            or nodemap is self.nodemap_raw2tangent
+
+        for raw_input in raw.all_input_nodes:
+            assert raw_input in self.nodemap_raw2primal, \
+                "Raw Node's Node input must be in raw-primal Node map"
+        
+        jvp_node = self.jvp_graph.node_copy(
+            raw, arg_transform=nodemap.__getitem__
+        )
+
+        return jvp_node
 
     
     def if_call_method(self, method_name: str):
@@ -682,8 +731,8 @@ class JvpTransformer(EasierInterpreter):
             assert isinstance(input, Node)
 
             # Copy primal
-            primal_node = self.jvp_graph.node_copy(
-                self.current_node, self.nodemap_raw2primal.__getitem__
+            primal_node = self._strict_map_raw_to_jvp(
+                self.current_node, self.nodemap_raw2primal
             )
             primal_node.target = jvpmod_submod_attrname
 
@@ -694,8 +743,8 @@ class JvpTransformer(EasierInterpreter):
 
             # Inject JVP if tangent appears
             if input in self.nodemap_raw2tangent:
-                tangent_node = self.jvp_graph.node_copy(
-                    self.current_node, self.nodemap_raw2tangent.__getitem__
+                tangent_node = self._strict_map_raw_to_jvp(
+                    self.current_node, self.nodemap_raw2tangent
                 )
                 tangent_node.target = jvpmod_submod_attrname
 
@@ -712,8 +761,8 @@ class JvpTransformer(EasierInterpreter):
             assert out is None or isinstance(out, Node)
 
             # Copy primal
-            primal_node = self.jvp_graph.node_copy(
-                self.current_node, self.nodemap_raw2primal.__getitem__
+            primal_node = self._strict_map_raw_to_jvp(
+                self.current_node, self.nodemap_raw2primal
             )
             primal_node.target = jvpmod_submod_attrname
 
@@ -729,8 +778,8 @@ class JvpTransformer(EasierInterpreter):
                 if out is not None:
                     self._try_init_tangent_for_inplace_target(out)
 
-                tangent_node = self.jvp_graph.node_copy(
-                    self.current_node, self.nodemap_raw2tangent.__getitem__
+                tangent_node = self._strict_map_raw_to_jvp(
+                    self.current_node, self.nodemap_raw2tangent
                 )
                 tangent_node.target = jvpmod_submod_attrname
 
@@ -821,7 +870,10 @@ class JvpTransformer(EasierInterpreter):
                 # PyTorch unlikely has this.
             
             if isinstance(raw_node_nondiff_arg, Node):
-                # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph.
+                # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph,
+                # we can rely on the identity of this nondiff_val and the
+                # attrname like "_tensor_constants0" to connect JVP-graph
+                # nondiff-arg Nodes and the GET_ATTR Nodes in the subgraph.
                 jvp_nondiff_val = self._create_zero_val(raw_node_nondiff_arg)
                 assert isinstance(jvp_nondiff_val, torch.Tensor)
 
@@ -969,12 +1021,6 @@ class JvpTransformer(EasierInterpreter):
         )
         y, jvp_res = gm(flattened_primal_vals, flattened_tangent_vals)
 
-        ng = get_node_tensor_group(self.current_node)
-        if ng is None:
-            role = Role.REPLICATED
-        else:
-            role = Role.DISTRIBUTED
-
         from easier.core.runtime.jit_engine.jit_engine import \
             get_value_runtime_info
         y_meta = get_value_runtime_info(
@@ -1001,8 +1047,8 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         # Structural info about diff-able inputs
         #
         input_flatten_tree: List[List[int]],
-        jvp_input_primals: List[Union[FxConst, Node, Sequence[Node]]],
-        jvp_input_tangents: List[Union[FxConst, Node, Sequence[Node]]],
+        jvp_input_primals: List[Union[Node, Sequence[Node]]],
+        jvp_input_tangents: List[Union[Node, Sequence[Node]]],
         #
         # Structural info about outputs
         #
@@ -1052,7 +1098,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         is_primal = self._placeholder_i < self.n_flattened_primal_inputs
 
         def _from_flatten(
-            jvp_inputs: List[Union[FxConst, Node, Sequence[Node]]],
+            jvp_inputs: List[Union[Node, Sequence[Node]]],
             tree: List[int]
         ) -> Union[Node, FxConst]:
             if len(tree) == 1:
@@ -1086,9 +1132,20 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
         self._nodemap_subg2jvp[self.current_node] = \
             self.jvp_input_nondiff_attr2node[attr_name]
     
-    def if_call_function(self, function):
+    def _strict_map_subg_to_jvp(self, subg_node: Node):
+        for subg_input in subg_node.all_input_nodes:
+            assert subg_input in self._nodemap_subg2jvp, \
+                "Sub-Graph Node's Node input must be in subg2jvp Node map"
+        
         jvp_node = self.jvp_graph.node_copy(
-            self.current_node, self._nodemap_subg2jvp.__getitem__
+            subg_node, arg_transform=self._nodemap_subg2jvp.__getitem__
+        )
+
+        return jvp_node
+    
+    def if_call_function(self, function):
+        jvp_node = self._strict_map_subg_to_jvp(
+            self.current_node
         )
 
         self._nodemap_subg2jvp[self.current_node] = jvp_node

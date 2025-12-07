@@ -63,13 +63,6 @@ differentiabilities[torch.neg] = differentiabilities[torch.ops.aten.neg] = [
     ),
 ]
 
-differentiabilities[torch.pow] = differentiabilities[torch.ops.aten.pow] = [
-    Differentiability(
-        ['input', 'exponent', ],
-        [],
-    ),
-]
-
 differentiabilities[torch.sign] = differentiabilities[torch.ops.aten.sign] = [
     Differentiability(
         ['input', ],

@@ -123,7 +123,28 @@ class DiffRuleBase:
         Returns:
         -   RuntimeTensorMeta or a nested one
         """
-        raise NotImplementedError("Derived class should implement this")
+        roles = []
+        def _make(x):
+            if isinstance(x, Node):
+                meta = get_node_meta(x)
+                assert isinstance(meta, RuntimeTensorMeta), \
+                    "Value of arg Node cannot be nested structure"
+
+                roles.append(meta.role)
+
+                return torch.zeros(meta.shape, dtype=meta.dtype)
+            else:
+                return x
+
+        vals = tree_map(args, _make)
+        kwvals = { k: tree_map(v,  _make) for k, v in kwargs.items() }
+        res = self.op(*vals, **kwvals)
+        assert isinstance(res, torch.Tensor), \
+            'Default impl supports single-res op only'
+
+        role = \
+            Role.DISTRIBUTED if Role.DISTRIBUTED in roles else Role.REPLICATED
+        return RuntimeTensorMeta(role, tuple(res.shape), res.dtype)
 
     
     def jvp(self, *args, **kwargs):
@@ -136,11 +157,11 @@ class DiffRuleBase:
             not a single Node such that indexing it will result in extra
             getitem Nodes.
 
-        -   EasierProxy for input Nodes
+        -   EasierProxy for primal input Nodes
         -   Constants remain constants
 
         Returns:
-        -   Tensor/Proxy: A single result item with tangent
+        -   Tensor/Proxy: A single result item for tangent
 
         -   List[None | Tensor/Proxy]:
             Resultant tangent items for a multiple-result operator.
@@ -163,7 +184,7 @@ class DiffRuleBase:
     def invoke_output_meta(self):
         if self.fx_normalize_to_kwargs_only:
             ometa = self.output_meta(
-                *self.raw_normalized_kwargs
+                **self.raw_normalized_kwargs
             )
 
         else:
@@ -180,16 +201,19 @@ class DiffRuleBase:
         primal_result: Union[Node, Sequence[Node]],
         diff_input_names: List[str],
         raw2primal: Dict[Node, Node],
-        tangents: List[Union['FxConst', Node, Sequence[Node]]]
+        # tangents are currently Tensors/Nodes, and might be ()-shape.
+        tangents: List[Union[Node, Sequence[Node]]]
     ) -> Union[Node, Sequence[Node]]:
         assert self.raw_node.op == FX.CALL_FUNCTION
 
         from easier.core.jit import EasierProxy, EasierTracer
         from easier.core.autodiff.autodiff import FxConst
 
-        jvp_graph: Graph = collect_meta(
+        jvp_graphs: List[Graph] = collect_meta(
             primal_result, lambda n: n.graph, leaf_type=Node
-        )[0]
+        )
+        assert len(set(jvp_graphs)) == 1
+        jvp_graph = jvp_graphs[0]
 
         tracer = EasierTracer()
         tracer.graph = jvp_graph
@@ -200,24 +224,27 @@ class DiffRuleBase:
             primal_result_proxies = [primal_proxy]
         
 
-        def _arg_proxy(arg):
-            if isinstance(arg, FxConst.__args__):
-                return arg
+        def _raw_arg_proxy(raw_arg):
+            if isinstance(raw_arg, FxConst.__args__):
+                return raw_arg
             else:
+                assert raw_arg.graph is not jvp_graph
+
+                primal_arg = raw2primal[raw_arg]
                 # Including Node and nested structure -- will result in
                 # explicit getitem Nodes
-                return tracer.proxy(arg)
+                return tracer.proxy(primal_arg)
 
 
         # Tangent parameters are suffixed by _t .e.g input_t, other_t
         kw_tangents_proxies = dict(zip(
             (n + '_t' for n in diff_input_names),
-            map(_arg_proxy, tangents)
+            tree_map(tangents, tracer.proxy)
         ))
 
         if self.fx_normalize_to_kwargs_only:
             norm_kw_proxies = {
-                k: tree_map(raw, _arg_proxy)
+                k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_normalized_kwargs.items()
             }
             res_tangent = self.jvp(
@@ -226,9 +253,9 @@ class DiffRuleBase:
             )
 
         else:
-            args_proxies = tree_map(self.raw_node.args, _arg_proxy)
+            args_proxies = tree_map(self.raw_node.args, _raw_arg_proxy)
             kwargs_proxies = {
-                k: tree_map(raw, _arg_proxy)
+                k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_node.kwargs.items()
             }
             res_tangent = self.jvp(
@@ -318,34 +345,54 @@ class EsrSumRule(DiffRuleBase):
 tangent_rule_registry[esr.sum] = EsrSumRule
 
 
+class PowRule(DiffRuleBase):
+    fx_normalize_to_kwargs_only = True
+    
+    def __init__(self, node: Node, op: Callable, raw_meta_ctor: Callable):
+        super().__init__(
+            node,
+            torch.pow,  # unify operator.pow
+            raw_meta_ctor
+        )
+
+    def input_differentiability(
+        self, input, exponent
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
+        d = {}
+        if isinstance(input, Node):
+            d['input'] = input
+        if isinstance(exponent, Node):
+            d['exponent'] = exponent
+
+        self.diffable_choice = d
+        if list(d.keys()) != ['input']:
+            raise NotImplementedError(
+                "torch.pow with two Tensors has special semantics"
+            )
+
+        return d
+
+    def jvp(self, input, exponent, input_t):
+        # TODO Current exponent is constant Scalar
+        # TODO For optional tangents, take kwargs like **tangents and check
+        # 'input_t, expoenent_t' and their primal types.
+        if exponent == 0:
+            return torch.zeros_like(input)
+        else:
+            return input_t * (exponent * torch.pow(input, exponent - 1))
+
+
+tangent_rule_registry[operator.pow] \
+    = tangent_rule_registry[torch.pow] \
+    = PowRule
+
+
 class _NonDiffable(DiffRuleBase):
     # no matter normalizable or not, we don't need to do normalization
     fx_normalize_to_kwargs_only = False  
 
     def input_differentiability(self, *args, **kwargs):
         return {}
-    def output_meta(self, *args, **kwargs):
-        roles = []
-        def _make(x):
-            if isinstance(x, Node):
-                meta = get_node_meta(x)
-                assert isinstance(meta, RuntimeTensorMeta), \
-                    "Value of arg Node cannot be nested structure"
-
-                roles.append(meta.role)
-
-                return torch.zeros(meta.shape, dtype=meta.dtype)
-            else:
-                return x
-
-        vals = tree_map(args, _make)
-        kwvals = { k: tree_map(v,  _make) for k, v in kwargs.items() }
-        res = self.op(*vals, **kwvals)
-        assert isinstance(res, torch.Tensor)
-
-        role = \
-            Role.DISTRIBUTED if Role.DISTRIBUTED in roles else Role.REPLICATED
-        return RuntimeTensorMeta(role, tuple(res.shape), res.dtype)
 
     def jvp(self, *args, **kwargs):
         raise EasierJitException("unreachable")

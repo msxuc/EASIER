@@ -678,7 +678,11 @@ def analyze_data_dependency(modules: List[esr.Module], graphs: List[Graph]):
         "One module/graph at a time, avoid adding dep edges cross graphs"
     m = modules[0]
 
-    TensorViewUsageChecker(modules, graphs).run()
+    # TODO In EASIER AutoDiff, currently we rely on torch.func.jvp() to
+    # generate JVP computational graph for common torch operators, and that
+    # torch API doesn't have such an assumption of extra clones.
+    #
+    # TensorViewUsageChecker(modules, graphs).run()
 
     dda = DataDependencyAnalyzer(modules, graphs).run()
 

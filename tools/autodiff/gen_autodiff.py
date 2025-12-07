@@ -392,7 +392,7 @@ op_names = [
     'lt',
     'mul',
     'neg',
-    'pow',
+    # 'pow',
     'sign',
     'sub',
     'sub_',

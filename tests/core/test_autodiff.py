@@ -56,7 +56,7 @@ class TestJvpTransformation:
             
             def jvp(self, result, input, dim, descending, input_t):
                 (_sort, idxes) = result
-                return (torch.neg(input_t[idxes]), None)
+                return (torch.neg(input[idxes] + input_t[idxes]), None)
         reg[torch.sort] = _Sort
 
         class M(esr.Module):
@@ -78,7 +78,7 @@ class TestJvpTransformation:
             jvpm: Jvp
 
             v, tv, v0, tv0, v1, tv1, cat, tcat, \
-                sort, sort0, sort1, tcat_idx, neg, \
+                sort, sort0, sort1, cat_idx, tcat_idx, add, neg, \
                 = jvpm.graph_module.graph.nodes
             
             assert tv0.target == operator.getitem and tv0.args[0] == tv
@@ -88,11 +88,15 @@ class TestJvpTransformation:
             assert sort0.target == operator.getitem and sort0.args == (sort, 0)
             assert sort1.target == operator.getitem and sort1.args == (sort, 1)
 
+            assert cat_idx.target == operator.getitem \
+                and cat_idx.args == (cat, sort1)
             assert tcat_idx.target == operator.getitem \
                 and tcat_idx.args == (tcat, sort1)
+            assert add.target == operator.add \
+                and add.args == (cat_idx, tcat_idx)
             
             # Fake node for indication only
-            assert neg.target == torch.neg and neg.args == (tcat_idx,)
+            assert neg.target == torch.neg and neg.args == (add,)
 
             # the 2nd res item for sort has no tangent
 
@@ -204,11 +208,21 @@ class TestJvp:
 
 
     def test_smoke__assemble_poisson(self):
+        #
+        # EASIER approach
+        #
+    
         init = PoissonInitializer(POISSON, MESH)
         # _check_op_usage(init)
                 
-        tpoints = esr.Tensor(torch.rand_like(init.points), mode='partition')
-        jvp = esr.jvp(init, [init.points], [init.b, init.Ac, init.Af], vectors=[tpoints])
+        INIT_VECTOR = torch.rand_like(init.points)
+
+        tpoints = esr.Tensor(INIT_VECTOR, mode='partition')
+        jvp = esr.jvp(
+            init,
+            [init.points], [init.b, init.Ac, init.Af],
+            vectors=[tpoints]
+        )
         [jvp] = esr.compile([jvp], backend='torch') # type: ignore
         jvp: Jvp
 
@@ -220,6 +234,53 @@ class TestJvp:
         esr_tb = jvp.products[0].collect()
         esr_tAc = jvp.products[1].collect()
         esr_tAf = jvp.products[2].collect()
+
+        #
+        # torch.jvp approach
+        #
+
+        init = PoissonInitializer(POISSON, MESH)
+        [init] = esr.compile([init], backend='none')
+
+        class _MutableRoot:
+            def get_face_norm(self, p0, p1, p2):
+                return PoissonInitializer.get_face_norm(self, p0, p1, p2)
+
+        _init = _MutableRoot()
+        for k, v in init.__dict__.items():
+            setattr(_init, k, v)
+        for k, v in init.named_parameters():
+            setattr(_init, k, v)
+        for k, v in init.named_modules():
+            setattr(_init, k, v)
+
+        # All inplace written esr.Tensors must be _inputs_ to torch.jvp().
+        input_attrnames = ['points', 'centroid', 'rho', 'b', 'Ac', 'Af']
+        output_attrnames = ['b', 'Ac', 'Af']
+
+        def _func(*input_proxies):
+            # Although proxies are wrapped on inputs, they are different
+            # instances from the `inputs` above, rebind them within the
+            # callstack of torch.jvp()
+            for n, p in zip(input_attrnames, input_proxies):
+                setattr(_init, n, p)
+            
+            PoissonInitializer.forward(_init)
+
+            return tuple(getattr(_init, n) for n in output_attrnames)
+            
+        inputs = [getattr(init, n) for n in input_attrnames]
+        tangents = [torch.zeros_like(i) for i in inputs]
+        tangents[0] = INIT_VECTOR
+
+        torch_outs, torch_tangents = torch.func.jvp(  # type: ignore
+            _func, tuple(inputs), tuple(tangents)
+        )
+
+        for ep, tp in zip([esr_b, esr_Ac, esr_Af], torch_outs):
+            torch.testing.assert_close(ep, tp)
+        for et, tt in zip([esr_tb, esr_tAc, esr_tAf], torch_tangents):
+            torch.testing.assert_close(et, tt, rtol=1e-6, atol=1e-6)
 
     def test_smoke__swe_main(self):
         #
@@ -243,7 +304,7 @@ class TestJvp:
         vectors = [esr.Tensor(vv, mode='partition') for vv in INIT_VECTOR_VALS]
 
         jvp = esr.jvp(eqn, inputs, [], vectors=vectors)
-        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
+        [jvp] = esr.compile([jvp], backend='none') # type: ignore
         jvp: Jvp
 
         jvp()
@@ -296,11 +357,9 @@ class TestJvp:
         )
 
         for ep, tp in zip(esr_primals[-3:], torch_outs):
-            assert torch.allclose(ep, tp)
+            torch.testing.assert_close(ep, tp)
         for et, tt in zip(esr_tangents[-3:], torch_tangents):
-            assert torch.allclose(et, tt, rtol=1e-04, atol=1e-06)
-
-
+            torch.testing.assert_close(et, tt, rtol=1e-6, atol=1e-6)
 
 
 def _check_op_usage(topmod):
@@ -321,6 +380,7 @@ def _check_op_usage(topmod):
             op_ids.add(n.target + str(list(d.keys())))
     
     print(list(op_ids))
+
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',
