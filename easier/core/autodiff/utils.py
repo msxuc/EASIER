@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 
+from types import EllipsisType
 from typing import Callable, Dict, TypeAlias, Union, cast
 
 import torch
@@ -13,7 +14,7 @@ from easier.core.passes.utils import FX, EasierInterpreter, tree_map
 
 
 # e.g. int, float, dtype, device, slice, range, etc.
-FxConst: TypeAlias = Union[_FxConstBase, slice, range]
+FxConst: TypeAlias = Union[_FxConstBase, slice, range, EllipsisType, None]
 
 
 def strict_node_copy(src_node: Node, dst_graph: Graph, src2dst: Dict[Node, Node]):

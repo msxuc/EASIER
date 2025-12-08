@@ -739,7 +739,14 @@ def fx_graph_to_serializable_ir(fx_graph: Graph) -> List[IRNode]:
         (n, i) for i, n in enumerate(fx_graph.nodes))
 
     def _node_ref_or_plain(x):
-        return IRNodeRef(nodes_idxes[x], x.name) if isinstance(x, Node) else x
+        if isinstance(x, Node):
+            return IRNodeRef(nodes_idxes[x], x.name)
+        elif isinstance(x, (slice, range)):
+            return type(x)(
+                *[_node_ref_or_plain(arg) for arg in [x.start, x.stop, x.step]]
+            )
+        else:
+            return x
 
     ir = []
     for fx_node in nodes_idxes:

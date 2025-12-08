@@ -138,6 +138,13 @@ class DiffRuleBase:
 
         vals = tree_map(args, _make)
         kwvals = { k: tree_map(v,  _make) for k, v in kwargs.items() }
+
+        is_aten_api = 'aten' in self.op.__module__
+        if is_aten_api:
+            if 'input' in kwvals:
+                kwval_input = kwvals.pop('input')
+                kwvals['self'] = kwval_input
+
         res = self.op(*vals, **kwvals)
         assert isinstance(res, torch.Tensor), \
             'Default impl supports single-res op only'
@@ -204,7 +211,6 @@ class DiffRuleBase:
         # tangents are currently Tensors/Nodes, and might be ()-shape.
         tangents: List[Union[Node, Sequence[Node]]]
     ) -> Union[Node, Sequence[Node]]:
-        assert self.raw_node.op == FX.CALL_FUNCTION
 
         from easier.core.jit import EasierProxy, EasierTracer
         from easier.core.autodiff.autodiff import FxConst
@@ -225,6 +231,12 @@ class DiffRuleBase:
         
 
         def _raw_arg_proxy(raw_arg):
+            if isinstance(raw_arg, (slice, range)):
+                return type(raw_arg)(*[
+                    _raw_arg_proxy(arg)
+                    for arg in [raw_arg.start, raw_arg.stop, raw_arg.step]
+                ])
+
             if isinstance(raw_arg, FxConst.__args__):
                 return raw_arg
             else:
@@ -316,7 +328,34 @@ class GetitemRule(DiffRuleBase):
         imeta = get_node_meta(input)
         assert isinstance(imeta, RuntimeTensorMeta), \
             "Tuple unpacking is handled elsewhere"
-        out_shp = tuple(torch.zeros(imeta.shape)[*index].shape)
+        
+        # there may be nested Proxies in `index` e.g.
+        # `X[:, self.i:self.j]` where i j are ()-shape int tensors.
+        if not isinstance(index, tuple):
+            index = (index,)
+        
+        def _maybe_zero_index_tensor(pos):
+            if isinstance(pos, Node):
+                pos_meta = get_node_meta(pos)
+                assert isinstance(pos_meta, RuntimeTensorMeta)
+                index_val = torch.zeros(pos_meta.shape, dtype=torch.int64)
+                return index_val
+            else:
+                return pos
+        
+        index_vals = []
+        for pos in index:
+            if isinstance(pos, (slice, range)):
+                index_val = type(pos)(*[
+                    _maybe_zero_index_tensor(item)
+                    for item in [pos.start, pos.stop, pos.step]
+                ])
+            else:
+                index_val = _maybe_zero_index_tensor(pos)
+
+            index_vals.append(index_val)
+
+        out_shp = tuple(torch.zeros(imeta.shape)[*index_vals].shape)
         return RuntimeTensorMeta(imeta.role, out_shp, imeta.dtype)
 
     def jvp(self, input, index, input_t):
@@ -333,17 +372,60 @@ class EsrSumRule(DiffRuleBase):
     ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'input': input}
 
-    def output_meta(self, input):
-        imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
-        return RuntimeTensorMeta(
-            Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
-        )
+    # def output_meta(self, input):
+    #     imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
+    #     return RuntimeTensorMeta(
+    #         Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
+    #     )
 
     def jvp(self, input, input_t):
         return esr.sum(input_t)
 
 tangent_rule_registry[esr.sum] = EsrSumRule
 
+
+class EsrNormRule(DiffRuleBase):
+    fx_normalize_to_kwargs_only = False
+    needs_result = True
+
+    def input_differentiability(
+        self, input, p=2
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
+        return {'input': input}
+
+    def jvp(self, norm_result, input, input_t, p=2):
+        if p != 2:
+            raise NotImplementedError(f"esr.norm p = {p} and != 2")
+        
+        d = esr.sum(input_t * input) / norm_result
+        return torch.where(norm_result == 0, 0, d)
+
+tangent_rule_registry[esr.norm] = EsrNormRule
+
+
+class TorchNormRule(DiffRuleBase):
+    """
+    PyTorch derivatives.yaml and FunctionsManuals.cpp has bugs that overloading
+    of torch.norm without dim/keepdim parameters are dispatched to the
+    fully fledged version with keepdim=True, causing wrong shapes and this
+    would make torch.jvp reject calls like `x.norm()`.
+    """
+    fx_normalize_to_kwargs_only = True
+    diffable_params = ['input']
+
+    needs_result = True
+
+    def jvp(self, norm_result, input, input_t, p=2):
+        if p != 2:
+            raise NotImplementedError(f"torch.norm p = {p} and != 2")
+        
+        d = torch.sum(input_t * input) / norm_result
+        return torch.where(norm_result == 0, 0, d)
+
+
+tangent_rule_registry[torch.norm] = \
+    tangent_rule_registry[torch.ops.aten.norm] = \
+    TorchNormRule
 
 class PowRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = True
@@ -468,4 +550,39 @@ differentiabilities[torch.sort] = [
     #     [('stable', None), ('dim', -1), ('descending', False)]
     #     output_differentiability=[True, False]
     # )
+]
+
+
+
+##
+
+
+differentiabilities[torch.clamp] = [
+    Differentiability(
+        ['input', 'min'],
+        [('max', None)]
+    )
+]
+differentiabilities[torch.diag_embed] = [
+    Differentiability(
+        ['input',],
+        [('offset', 0), ('dim1', -2), ('dim2', -1)]
+    )
+]
+differentiabilities[torch.transpose] = [
+    Differentiability(
+        ['input',],
+        [('dim0', required), ('dim1', required)]
+    )
+]
+differentiabilities[torch.linalg.svd] = [
+    Differentiability(
+        ['A',],
+        [('full_matrices', True), ('driver', None)]
+    )
+]
+differentiabilities[torch.matmul] = [
+    Differentiability(
+        ['input', 'other'],
+    )
 ]

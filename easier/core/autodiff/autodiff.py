@@ -110,21 +110,31 @@ class JvpTransformer(EasierInterpreter):
         # Attr name for Selector/Reducer to setattr on jvp
         self.primitive_name_allocator = SubmodNameAllocator('esrprim')
 
+        # Attr name for ()-shape constant Tensors created for literal Scalar
+        # arguments, those constants are made attributes to make them aware
+        # of AOT target device like CUDA.
+        self.const_name_allocator = SubmodNameAllocator('const')
+
 
     def _ensure_jvp_attr_obj(
-        self, raw_obj: Union[esr.Tensor, esr.Selector, esr.Reducer],
+        self, raw_obj: Union[torch.Tensor, esr.Selector, esr.Reducer],
         name_allocator: SubmodNameAllocator,
         attrname_hint: str
     ) -> str:
+        # esr.Tensors only: if they are inputs/outputs/vectors
         if raw_obj in self.tensors_attrpaths:
             return self.tensors_attrpaths[raw_obj]  # type: ignore
 
         # Lazily bound non-IO primal tensors, or S/R.
         # These attributes will be directly in the Jvp Module's fields.
         for primal_attrname, primal_obj in self.jvp_module.__dict__.items():
+            # First try detecting if S/R, the same sub-Module instance will
+            # be reused.
             if primal_obj is raw_obj:
                 break
         else:
+            # Otherwise, it's a plain torch.Tensor
+            # or a not specified esr.Tensor, just move it here.
             primal_attrname = name_allocator.alloc_name(
                 self.jvp_module, attrname_hint
             )
@@ -154,6 +164,8 @@ class JvpTransformer(EasierInterpreter):
         e.g. torch.cat Node may have `args[0] == [x1, x2, x3]`.
         
         The result may also be a nested structure of many zero tensors.
+
+        Always on CPU.
         """
         def _make(x):
             assert isinstance(x, Node), \
@@ -288,6 +300,7 @@ class JvpTransformer(EasierInterpreter):
     
     def _prepare_diffable_primals_and_tangents(
         self,
+        function: Callable,
         raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]
     ) -> Tuple[
         List[Union[Node, Sequence[Node]]],
@@ -306,14 +319,14 @@ class JvpTransformer(EasierInterpreter):
         input_primal_nodes: List[Union[Node, Sequence[Node]]] = []
         input_tangent_nodes: List[Union[Node, Sequence[Node]]] = []
 
-        for raw_node_diff_arg in raw_node_diff_args.values():
+        for argname, raw_node_diff_arg in raw_node_diff_args.items():
 
             if not isinstance(raw_node_diff_arg, (Node, Sequence)):
                 # const scalars
                 assert isinstance(raw_node_diff_arg, (int, float, str)), \
                     "If a differentiable parameter is not a fx.Node" \
                     " or Node list, it must be a scalar"
-
+                
                 # Zero tangent for scalar
                 #
                 # Because when invoking torch.jvp(), we convert scalar-type
@@ -324,16 +337,24 @@ class JvpTransformer(EasierInterpreter):
                 #
                 # Therefore, before we do sub-Graph inlining, we need to
                 # convert raw scalar args to tensors/Nodes in the JVP graph.
-                input_primal_nodes.append(self.jvp_graph.call_function(
-                    torch.full,
-                    ((), raw_node_diff_arg),
-                    { 'dtype': torch.float32 }
-                ))
-                input_tangent_nodes.append(self.jvp_graph.call_function(
-                    torch.zeros,
-                    ([],),
-                    { 'dtype': torch.float32 }
-                ))
+                #
+                primal_const_tensor_attrname = self._ensure_jvp_attr_obj(
+                    torch.full((), raw_node_diff_arg, dtype=torch.float32),
+                    self.const_name_allocator,
+                    f"{function.__name__}_{argname}"
+                )
+                input_primal_nodes.append(
+                    self.jvp_graph.get_attr(primal_const_tensor_attrname)
+                )
+
+                tangent_const_tensor_attrname = self._ensure_jvp_attr_obj(
+                    torch.zeros((), dtype=torch.float32),
+                    self.const_name_allocator,
+                    f"{function.__name__}_{argname}_t"
+                )
+                input_tangent_nodes.append(
+                    self.jvp_graph.get_attr(tangent_const_tensor_attrname)
+                )
             
             else:  # Node or Node list
                 input_primal_nodes.append(tree_map(
@@ -383,23 +404,35 @@ class JvpTransformer(EasierInterpreter):
         for arg_i, const in enumerate(list(self.current_node.args)):
             if isinstance(const, (int, float)):
                 with self.current_graph.inserting_before(self.current_node):
-                    raw_const_node = self.current_graph.call_function(
-                        torch.full, ((), const), {'dtype': enforced_dtype}
+
+                    # NOTE this raw const node doesn't have propert device
+                    # option, therefore it's a BAD Node. But we are not going
+                    # to evaluate the raw Node, only to fulfill the assumption
+                    # that raw Node holds the metadata.
+                    raw_operand_node = self.current_graph.call_function(
+                        print, ("should never be evaluated",) 
                     )
-                    self.current_node.update_arg(arg_i, raw_const_node)
+                    const_tensor_val = torch.full(
+                        (), const, dtype=enforced_dtype
+                    )
+
+                    self.current_node.update_arg(arg_i, raw_operand_node)
                     set_node_meta(
-                        raw_const_node,
+                        raw_operand_node,
                         RuntimeTensorMeta(
-                            Role.REPLICATED,
-                            (),
-                            torch.full((), const, dtype=enforced_dtype).dtype
+                            Role.REPLICATED, (), const_tensor_val.dtype
                         )
                     )
                 
-                self.nodemap_raw2primal[raw_const_node] = \
-                    self.jvp_graph.call_function(
-                        torch.full, ((), const), {'dtype': enforced_dtype}
-                    )
+                const_tensor_attrname = self._ensure_jvp_attr_obj(
+                    const_tensor_val,
+                    self.const_name_allocator,
+                    f"operator_{self.current_node.target.__name__}_arg{arg_i}"
+
+                )
+                
+                self.nodemap_raw2primal[raw_operand_node] = \
+                    self.jvp_graph.get_attr(const_tensor_attrname)
         
     def _handle_operation(self, function: Callable):
         """
@@ -482,7 +515,7 @@ class JvpTransformer(EasierInterpreter):
                     
                 _, input_tangent_nodes = \
                     self._prepare_diffable_primals_and_tangents(
-                        raw_node_diff_args
+                        function, raw_node_diff_args
                     )
 
                 # Rule is only charge of generating tangent calculations
@@ -618,7 +651,7 @@ class JvpTransformer(EasierInterpreter):
                 # Unflattened structure
                 input_primal_nodes, input_tangent_nodes = \
                     self._prepare_diffable_primals_and_tangents(
-                        raw_node_diff_args
+                        function, raw_node_diff_args
                     )
 
                 out_diff = dfb.output_differentiability

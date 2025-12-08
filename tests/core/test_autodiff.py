@@ -4,7 +4,7 @@
 import operator
 import os
 import tempfile
-from typing import Callable, Dict, List, Sequence, Type, Union
+from typing import Callable, Dict, List, Optional, Sequence, Type, Union
 from unittest.mock import patch
 import pytest
 import torch
@@ -16,6 +16,7 @@ from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, tangent_rule_registry, differentiabilities
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta
 from easier.core.utils import get_random_str
+from easier.numeric.solver.gmres import GMRES
 
 from ..utils import \
     torchrun_singlenode, assert_tensor_list_equal, \
@@ -213,7 +214,7 @@ class TestJvp:
         #
     
         init = PoissonInitializer(POISSON, MESH)
-        # _check_op_usage(init)
+        # _check_op_usage([init])
                 
         INIT_VECTOR = torch.rand_like(init.points)
 
@@ -295,7 +296,7 @@ class TestJvp:
         ]
 
         eqn = ShallowWaterEquation(MESH, SW)
-        # _check_op_usage(eqn)
+        # _check_op_usage([eqn])
 
         inputs = [getattr(eqn, n) for n in input_attrnames]
 
@@ -362,25 +363,233 @@ class TestJvp:
             torch.testing.assert_close(et, tt, rtol=1e-6, atol=1e-6)
 
 
-def _check_op_usage(topmod):
+def _check_op_usage(topmods):
     from easier.core.passes import \
         collectively_initialize_and_validate
     from easier.core.passes.utils import \
         fx_normalize_function_variant_into_kwargs
-    _, [g] = collectively_initialize_and_validate([topmod])
+    _, graphs = collectively_initialize_and_validate(topmods)
     op_ids = set()
-    for n in g.nodes:
-        if n.op == 'call_function':
-            f = n.target
-            d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-            op_ids.add(f.__name__ + str(list(d.keys())))
-        elif n.op == 'call_method':
-            f = getattr(torch.ops.aten, n.target)
-            d = fx_normalize_function_variant_into_kwargs(f, n.args, n.kwargs)
-            op_ids.add(n.target + str(list(d.keys())))
+    bad_targets = set()
+    for g in graphs:
+        for n in g.nodes:
+            try:
+                if n.op == 'call_function':
+                    f = n.target
+                    d = fx_normalize_function_variant_into_kwargs(
+                        f, n.args, n.kwargs
+                    )
+                    op_ids.add(
+                        f.__module__ + '.' + f.__name__ + str(list(d.keys()))
+                    )
+                elif n.op == 'call_method':
+                    f = getattr(torch.ops.aten, n.target)
+                    d = fx_normalize_function_variant_into_kwargs(
+                        f, n.args, n.kwargs
+                    )
+                    op_ids.add(n.target + str(list(d.keys())))
+            except:
+                bad_targets.add(n.target)
     
     print(list(op_ids))
+    print(list(bad_targets))
 
+
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_GMRES():
+    poisson = Poisson(MESH, POISSON)
+
+    # Poisson.A is LinSys which is not an esr.Module and will be inlined
+    gmres = GMRES(poisson.A, poisson.b, poisson.x)
+    
+    input_attrnames: List[str] = []
+    inputs: List[esr.Tensor] = []
+    vectors: List[esr.Tensor] = []
+    for n, p in gmres.named_parameters(recurse=False):
+        if isinstance(p, esr.Tensor):
+            t_p = esr.Tensor(
+                esr.zeros_like(p),
+                mode='partition' if p.is_partition else 'replicate'
+            )
+            input_attrnames.append(n)
+            inputs.append(p)
+            vectors.append(t_p)
+    
+    def _jvp_submod(submod: esr.Module):
+        jvpm = esr.jvp(submod, inputs, [], vectors=vectors)
+        return jvpm
+    
+    class UpdateB(esr.Module):
+        def __init__(self, B, rnorm):
+            super().__init__()
+
+            self.B = B
+            self.rnorm = rnorm
+        
+        def forward(self):
+            self.B[0, 0] = self.rnorm
+    
+    class UpdateH(esr.Module):
+        def __init__(self, H, h):
+            super().__init__()
+
+            self.H = H
+            self.h = h
+            self.i = esr.Tensor(
+                torch.tensor([0], dtype=torch.int32, device=H.device),
+                mode='replicate'
+            )
+            self.j = esr.Tensor(
+                torch.tensor([0], dtype=torch.int32, device=H.device),
+                mode='replicate'
+            )
+        
+        def forward(self):
+            self.H[self.i, self.j] = self.h
+
+
+    class UpdateY(esr.Module):
+        def __init__(self, H, B, y):
+            super().__init__()
+
+            self.H = H
+            self.B = B
+            self.y = y
+            self.j = esr.Tensor(
+                torch.tensor([0], dtype=torch.int32, device=H.device),
+                mode='replicate'
+            )
+
+        def forward(self):
+            u, s, vt = torch.linalg.svd(self.H[:self.j + 2], full_matrices=False)
+            self.y[:] = vt.transpose(0, 1) @ \
+                torch.diag_embed(1 / torch.clamp(s, min=1e-8)) @ \
+                u.transpose(0, 1) @ self.B[:self.j + 2]
+
+    update_B = UpdateB(gmres.B, gmres.rnorm)
+    update_H = UpdateH(gmres.H, gmres.h)
+    update_y = UpdateY(gmres.H, gmres.B, gmres.y)
+
+    # _check_op_usage([sol, update_B, update_H, update_y])
+    
+    class JvpGMRES(esr.Module):
+        def __init__(self):
+            super().__init__()
+            
+            self.jvp_update_rnorm = _jvp_submod(gmres.update_rnorm)
+            self.jvp_init = _jvp_submod(gmres.init)
+
+            self.jvp_init_V = _jvp_submod(gmres.init_V)
+            self.jvp_init_w = _jvp_submod(gmres.init_w)
+            self.jvp_sum_w = _jvp_submod(gmres.sum_w)
+            self.jvp_update_w = _jvp_submod(gmres.update_w)
+            self.jvp_norm_w = _jvp_submod(gmres.norm_w)
+            self.jvp_update_V = _jvp_submod(gmres.update_V)
+
+            self.jvp_update_x = torch.nn.ModuleList(
+                _jvp_submod(x) for x in gmres.update_x  # type: ignore
+            )
+
+            # Extra esr.Modules
+            self.jvp_update_B = _jvp_submod(update_B)
+            self.jvp_update_H = _jvp_submod(update_H)
+            self.jvp_update_y = _jvp_submod(update_y)
+
+            for n, p in zip(input_attrnames, inputs):
+                setattr(self, n, p)
+
+        def _init_w(self, j: int):
+            # All these `.i, .j` esr.Tensors have ndim==0,
+            # we need to use `fill_()` to set the single element of them.
+            self.jvp_init_w.j.fill_(j)
+            self.jvp_init_w()
+
+        def _sum_w(self, i: int):
+            self.jvp_sum_w.i.fill_(i)
+            self.jvp_sum_w()
+
+        def _update_w(self, i: int):
+            self.jvp_update_w.i.fill_(i)
+            self.jvp_update_w()
+
+        def _update_V(self, i: int):
+            self.jvp_update_V.i.fill_(i)
+            self.jvp_update_V()
+
+        def _update_y(self, j: int):
+            self.jvp_update_y.j.fill_(j)
+            self.jvp_update_y()
+
+        def jvp_solve(
+            self,
+            rtol=1e-5,
+            atol: Optional[float] = None,
+            maxiter: Optional[int] = None,
+            debug_iter: Optional[int] = None
+        ):
+            name = "JvpGMRES"
+            self.jvp_init()
+            rtol *= self.bnorm
+
+            tol = max(rtol, atol) if atol else rtol
+
+            iters = 0
+            while True:
+                self.jvp_update_rnorm()
+
+                if debug_iter is not None and iters % debug_iter == 0:
+                    esr.logger.info(
+                        f"{name} residual {float(self.rnorm)}"
+                        f" at the {iters}-th iteration")
+
+                if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
+                (maxiter is not None and iters >= maxiter):
+                    break
+                iters += 1
+
+                # self.B[0, 0] = self.rnorm
+                self.jvp_update_B()
+
+                self.jvp_init_V()
+
+                for j in range(self.restart):
+                    self._init_w(j)
+                    for i in range(j + 1):
+                        self._sum_w(i)
+
+                        # self.H[i, j] = self.h
+                        self.jvp_update_H.i.fill_(i)
+                        self.jvp_update_H.j.fill_(j)
+                        self.jvp_update_H()
+
+                        self._update_w(i)
+
+                    self.jvp_norm_w()
+
+                    # self.H[j + 1, j] = self.h
+                    self.jvp_update_H.i.fill_(j + 1)
+                    self.jvp_update_H.j.fill_(j)
+                    self.jvp_update_H()
+
+                    if self.h < 1e-15:
+                        break
+                    elif j < self.restart - 1:
+                        self._update_V(j + 1)
+
+                # u, s, vt = torch.linalg.svd(self.H[:j + 2], full_matrices=False)
+                # self.y[:] = vt.transpose(0, 1) @ \
+                #     torch.diag_embed(1 / torch.clamp(s, min=1e-8)) @ \
+                #     u.transpose(0, 1) @ self.B[:j + 2]
+                self.jvp_update_y.j.fill_(j)
+                self.jvp_update_y()
+
+                self.jvp_update_x[j]()
+
+    jvp_gmres = JvpGMRES()
+    [jvp_gmres] = esr.compile([jvp_gmres], backend='none')  # type: ignore
+    jvp_gmres: JvpGMRES
+
+    jvp_gmres.jvp_solve()
 
 @pytest.mark.parametrize('dev_type', [
     'cpu',
