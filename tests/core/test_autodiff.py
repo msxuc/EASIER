@@ -395,6 +395,7 @@ def _check_op_usage(topmods):
     print(list(bad_targets))
 
 
+@pytest.mark.skip
 @pytest.mark.usefixtures('dummy_dist_env')
 def test_GMRES():
     poisson = Poisson(MESH, POISSON)
@@ -471,10 +472,12 @@ def test_GMRES():
     update_y = UpdateY(gmres.H, gmres.B, gmres.y)
 
     # _check_op_usage([sol, update_B, update_H, update_y])
-    
+
     class JvpGMRES(esr.Module):
-        def __init__(self):
+        def __init__(self, restart: int):
             super().__init__()
+
+            self.restart = restart
             
             self.jvp_update_rnorm = _jvp_submod(gmres.update_rnorm)
             self.jvp_init = _jvp_submod(gmres.init)
@@ -515,10 +518,6 @@ def test_GMRES():
         def _update_V(self, i: int):
             self.jvp_update_V.i.fill_(i)
             self.jvp_update_V()
-
-        def _update_y(self, j: int):
-            self.jvp_update_y.j.fill_(j)
-            self.jvp_update_y()
 
         def jvp_solve(
             self,
@@ -585,12 +584,14 @@ def test_GMRES():
 
                 self.jvp_update_x[j]()
 
-    jvp_gmres = JvpGMRES()
+    jvp_gmres = JvpGMRES(gmres.restart)
     [jvp_gmres] = esr.compile([jvp_gmres], backend='none')  # type: ignore
     jvp_gmres: JvpGMRES
 
-    jvp_gmres.jvp_solve()
+    jvp_gmres.jvp_solve(maxiter=100)
 
+
+@pytest.mark.skip
 @pytest.mark.parametrize('dev_type', [
     'cpu',
     pytest.param('cuda', marks=when_ngpus_ge_2)

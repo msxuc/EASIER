@@ -67,6 +67,7 @@ class JvpTransformer(EasierInterpreter):
 
         super().__init__([module], [graph])
 
+        self.raw_module = module
         self.jvp_module = jvp_module
 
         self.jvp_graph = Graph()
@@ -83,15 +84,15 @@ class JvpTransformer(EasierInterpreter):
         # tangent, we only 1) ensure its GET_ATTR Node is unique; 2) inject a
         # zero_like Node for GET_ATTR Node.
         # I.e. we don't allocate an esr.Tensor for such immediate tangents.
-        self.tensors_attrpaths: Dict[esr.Tensor, str] = {}
+        self.jvp_tensors_attrpaths: Dict[esr.Tensor, str] = {}
 
         for i, (input, vector) in enumerate(zip(
             jvp_module.inputs, jvp_module.vectors
         )):
             self.tensormap_primal2tangent[input] = vector
 
-            self.tensors_attrpaths[input] = f'inputs.{i}'
-            self.tensors_attrpaths[vector] = f'vectors.{i}'
+            self.jvp_tensors_attrpaths[input] = f'inputs.{i}'
+            self.jvp_tensors_attrpaths[vector] = f'vectors.{i}'
 
 
         for i, (output, product) in enumerate(zip(
@@ -99,46 +100,49 @@ class JvpTransformer(EasierInterpreter):
         )):
             self.tensormap_primal2tangent[output] = product
 
-            self.tensors_attrpaths[output] = f'outputs.{i}'
-            self.tensors_attrpaths[product] = f'products.{i}'
+            self.jvp_tensors_attrpaths[output] = f'outputs.{i}'
+            self.jvp_tensors_attrpaths[product] = f'products.{i}'
+        
 
-
-        # There are still esr.Tensors not in jvp.inputs/outputs, but also
-        # primal, we allocate names and bind them lazily.
-        self.primal_name_allocator = SubmodNameAllocator('primal')
-
-        # Attr name for Selector/Reducer to setattr on jvp
-        self.primitive_name_allocator = SubmodNameAllocator('esrprim')
+        self._setup_jvp_module_attrs()
 
         # Attr name for ()-shape constant Tensors created for literal Scalar
         # arguments, those constants are made attributes to make them aware
         # of AOT target device like CUDA.
         self.const_name_allocator = SubmodNameAllocator('const')
 
+    def _setup_jvp_module_attrs(self):
+        """
+        Copy other submod (no matterr esr.Module or common torch.nn.Module)
+        and other parameters to Jvp module,
+        this allows accesses to attrbutes like `jvpm.submod1.submod2.x`.
+        """
+        for path, obj in list(
+            self.raw_module.named_modules()
+        ) + list(
+            self.raw_module.named_parameters(recurse=False)
+        ):
+            if '.' in path or path == '':
+                # - submod children: inherited, since we re-assign the submod;
+                # - ''-path: the root module itself
+                continue
 
-    def _ensure_jvp_attr_obj(
-        self, raw_obj: Union[torch.Tensor, esr.Selector, esr.Reducer],
-        name_allocator: SubmodNameAllocator,
-        attrname_hint: str
+            if path in ['inputs', 'outputs', 'vectors', 'products']:
+                raise EasierJitException(
+                    f"{self.raw_module.__class__.__name__}.{path}"
+                    " attribute name conflicts with easier.jvp()"
+                )
+            
+            setattr(self.jvp_module, path, obj)
+            
+
+    def _ensure_jvp_const_attr(
+        self, const: torch.Tensor, attrname_hint: str = ''
     ) -> str:
-        # esr.Tensors only: if they are inputs/outputs/vectors
-        if raw_obj in self.tensors_attrpaths:
-            return self.tensors_attrpaths[raw_obj]  # type: ignore
-
-        # Lazily bound non-IO primal tensors, or S/R.
-        # These attributes will be directly in the Jvp Module's fields.
-        for primal_attrname, primal_obj in self.jvp_module.__dict__.items():
-            # First try detecting if S/R, the same sub-Module instance will
-            # be reused.
-            if primal_obj is raw_obj:
-                break
-        else:
-            # Otherwise, it's a plain torch.Tensor
-            # or a not specified esr.Tensor, just move it here.
-            primal_attrname = name_allocator.alloc_name(
-                self.jvp_module, attrname_hint
-            )
-            setattr(self.jvp_module, primal_attrname, raw_obj)
+        primal_attrname = self.const_name_allocator.alloc_name(
+            self.jvp_module, attrname_hint
+        )
+        setattr(self.jvp_module, primal_attrname, const)
 
         return primal_attrname
 
@@ -190,10 +194,9 @@ class JvpTransformer(EasierInterpreter):
         )
         set_node_meta(self.current_node, runtime_meta)
 
-        primal_attrname = self._ensure_jvp_attr_obj(
-            attr_val, self.primal_name_allocator, attr_name
+        primal_node = self.jvp_graph.get_attr(
+            cast(str, self.current_node.target)
         )
-        primal_node = self.jvp_graph.get_attr(primal_attrname)
 
         self.nodemap_raw2primal[self.current_node] = primal_node
 
@@ -204,7 +207,7 @@ class JvpTransformer(EasierInterpreter):
             tangent_tensor = self.tensormap_primal2tangent[attr_val]
 
             # Inject tangent node
-            tangent_attrname = self.tensors_attrpaths[tangent_tensor]
+            tangent_attrname = self.jvp_tensors_attrpaths[tangent_tensor]
             tangent_node = self.jvp_graph.get_attr(tangent_attrname)
 
             # Bind primal-tangent
@@ -338,18 +341,16 @@ class JvpTransformer(EasierInterpreter):
                 # Therefore, before we do sub-Graph inlining, we need to
                 # convert raw scalar args to tensors/Nodes in the JVP graph.
                 #
-                primal_const_tensor_attrname = self._ensure_jvp_attr_obj(
+                primal_const_tensor_attrname = self._ensure_jvp_const_attr(
                     torch.full((), raw_node_diff_arg, dtype=torch.float32),
-                    self.const_name_allocator,
                     f"{function.__name__}_{argname}"
                 )
                 input_primal_nodes.append(
                     self.jvp_graph.get_attr(primal_const_tensor_attrname)
                 )
 
-                tangent_const_tensor_attrname = self._ensure_jvp_attr_obj(
+                tangent_const_tensor_attrname = self._ensure_jvp_const_attr(
                     torch.zeros((), dtype=torch.float32),
-                    self.const_name_allocator,
                     f"{function.__name__}_{argname}_t"
                 )
                 input_tangent_nodes.append(
@@ -424,9 +425,8 @@ class JvpTransformer(EasierInterpreter):
                         )
                     )
                 
-                const_tensor_attrname = self._ensure_jvp_attr_obj(
+                const_tensor_attrname = self._ensure_jvp_const_attr(
                     const_tensor_val,
-                    self.const_name_allocator,
                     f"operator_{self.current_node.target.__name__}_arg{arg_i}"
 
                 )
@@ -712,8 +712,21 @@ class JvpTransformer(EasierInterpreter):
                                 copier.output_tangent[item_i]
                 # endif out_diff
             # endif tangent_involved
+
+            if isinstance(out_meta, Sequence):
+                # no matter if tangent is involved in torch.jvp-handled
+                # multi-res op call, we need to set_node_meta on following
+                # unpacking getitem Nodes
+                for raw_getitem in self.current_node.users:
+                    assert raw_getitem.target is operator.getitem
+                    _, item_i = raw_getitem.args
+                    assert isinstance(item_i, int)
+                    
+                    item_meta = out_meta[item_i]
+                    set_node_meta(raw_getitem, item_meta)
         
         # endif op category
+    
     
     def _strict_map_raw_to_jvp(self, raw: Node, nodemap: Dict[Node, Node]):
         """
@@ -743,13 +756,6 @@ class JvpTransformer(EasierInterpreter):
         self._handle_operation(function)
 
     def if_call_module(self, submod: Module):
-
-        jvpmod_submod_attrname = self._ensure_jvp_attr_obj(
-            submod,  # type: ignore
-            self.primitive_name_allocator,
-            cast(str, self.current_node.target)
-        )
-
         if isinstance(submod, esr.Module):
             raise NotImplementedError()
             # Nested easier.Module, must be JVP-ed.
@@ -767,8 +773,6 @@ class JvpTransformer(EasierInterpreter):
             primal_node = self._strict_map_raw_to_jvp(
                 self.current_node, self.nodemap_raw2primal
             )
-            primal_node.target = jvpmod_submod_attrname
-
             self.nodemap_raw2primal[self.current_node] = primal_node
             
             # NOTE the fake batch size is not affected by S.idx.shape[0]
@@ -779,8 +783,6 @@ class JvpTransformer(EasierInterpreter):
                 tangent_node = self._strict_map_raw_to_jvp(
                     self.current_node, self.nodemap_raw2tangent
                 )
-                tangent_node.target = jvpmod_submod_attrname
-
                 self.nodemap_raw2tangent[self.current_node] = tangent_node
 
         elif isinstance(submod, esr.Reducer):
@@ -797,8 +799,6 @@ class JvpTransformer(EasierInterpreter):
             primal_node = self._strict_map_raw_to_jvp(
                 self.current_node, self.nodemap_raw2primal
             )
-            primal_node.target = jvpmod_submod_attrname
-
             self.nodemap_raw2primal[self.current_node] = primal_node
 
             # NOTE the fake batch size is not affected by S.idx.shape[0]
@@ -814,8 +814,6 @@ class JvpTransformer(EasierInterpreter):
                 tangent_node = self._strict_map_raw_to_jvp(
                     self.current_node, self.nodemap_raw2tangent
                 )
-                tangent_node.target = jvpmod_submod_attrname
-
                 self.nodemap_raw2tangent[self.current_node] = tangent_node
 
 
@@ -1286,8 +1284,8 @@ class Jvp(esr.Module):
 
         # Type hint for local _Jvp class created by esr.jvp()
         self.graph_module: GraphModule
-
     
+
     def _check_args_nondup_and_dtype(
         self, args: Sequence[esr.Tensor], param_name: str
     ):
@@ -1378,6 +1376,8 @@ def jvp(
     # method on the CLASS instead of an Jvp Module instance, we need to
     # create a local class for each jvp call to provide class-level `forward`.
     class _Jvp(Jvp):
+        _raw_module_class = module.__class__.__qualname__
+
         def forward(self):
             # Products are not overlapping with other esr.Tensors,
             # zero-initialize them every time, since uninvolved tensors will

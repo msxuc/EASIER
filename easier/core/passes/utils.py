@@ -741,10 +741,6 @@ def fx_graph_to_serializable_ir(fx_graph: Graph) -> List[IRNode]:
     def _node_ref_or_plain(x):
         if isinstance(x, Node):
             return IRNodeRef(nodes_idxes[x], x.name)
-        elif isinstance(x, (slice, range)):
-            return type(x)(
-                *[_node_ref_or_plain(arg) for arg in [x.start, x.stop, x.step]]
-            )
         else:
             return x
 
@@ -818,9 +814,12 @@ def unpickle_ir(u8_array: numpy.ndarray) -> List[IRNode]:
     return ir
 
 
-def tree_map(x, func):
+def tree_map(x, func) -> Any:
     if isinstance(x, (list, tuple)):  # cover subtypes of list etc. too
         return type(x)(tree_map(a, func) for a in x)
+    elif isinstance(x, (slice, range)):
+        args = x.start, x.stop, x.step
+        return type(x)(*(tree_map(a, func) for a in args))
     else:
         return func(x)
 

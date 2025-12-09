@@ -153,8 +153,11 @@ class DerivEntry:
 
 def parse_derivatives_yaml(
     args: 'CliArgs', # opdefs: List[OpDef], removed_incremental_inplace_ops: Set[OpDef]
-    op_names: List[str]
+    op_ns_names: List[str]
 ) -> List[DerivEntry]:
+
+    op_names = [ op_ns_name.replace('.', '_') for op_ns_name in op_ns_names ]
+
     print("""
 ##############################
 #   Parse derivatives.yaml   #
@@ -232,6 +235,9 @@ def parse_derivatives_yaml(
             param_name_comb = '@'.join(arg.name for arg in overloading_schema.arguments)
             by_param_names.setdefault(param_name_comb, []).append(kv)
         
+        entries_candidates: List[DerivEntry] = []
+        some_overloading_fails = False
+        
         def _schema_lt(
             s1: torch._C.FunctionSchema, s2: torch._C.FunctionSchema
         ):
@@ -245,9 +251,10 @@ def parse_derivatives_yaml(
                     elif t1 == 'Tensor' and t2 == 'number':
                         all_lt.append(False)
                     else:
-                        assert False, \
-                            'Not mergeable arguments are not equal in' \
-                            f' {s1} and {s2}'
+                        raise TypeError(
+                            f'Not mergeable arguments "{a1.name}" in {s1}' \
+                            f' and "{a2.name}" in {s2} are not equal'
+                        )
 
             assert len(all_lt) > 0, f'{s1} and {s2}'
             assert len(set(all_lt)) == 1, f'{s1} and {s2}'
@@ -263,9 +270,17 @@ def parse_derivatives_yaml(
 
             if len(mergeable_schemas_and_yamldefs) > 1:
                 # effectively form a lattice
-                for candidate in mergeable_schemas_and_yamldefs[1:]:
-                    if _schema_lt(upperbound[0], candidate[0]):
-                        upperbound = candidate
+                try:
+                    for candidate in mergeable_schemas_and_yamldefs[1:]:
+                        if _schema_lt(upperbound[0], candidate[0]):
+                            upperbound = candidate
+                except Exception as ex:
+                    print(
+                        f'{upperbound[0].name} are not mergeable:'
+                        f'\n  {ex}'
+                    )
+                    some_overloading_fails = True
+                    break
                 
             upper_schema, yaml_derivdef = upperbound
             
@@ -281,16 +296,22 @@ def parse_derivatives_yaml(
                 # Otherwise, it is multi-res or has no tangent rule (composed),
                 # we'd better skip it and add diff rule for it manually in EASIER.
 
-                print(f'{upper_schema} does not have "result" field')
-                continue
+                print(
+                    f'{upper_schema.name} does not have "result" field:'
+                    f'\n  {upper_schema}'
+                )
+                some_overloading_fails = True
+                break
 
             else:
                 tangent_expr: str = yaml_derivdef['result']
                 tangent_expr = tangent_expr.strip()
                 if tangent_expr == 'auto_linear':
                     assert upper_schema.arguments[0].name == 'self'
-                    differentiability = _parse_differentiability(upper_schema, 'self_t', False)
-                    result_entries.append(DerivEntry(
+                    differentiability = _parse_differentiability(
+                        upper_schema, 'self_t', False
+                    )
+                    entries_candidates.append(DerivEntry(
                         upper_schema, differentiability
                     ))
                 
@@ -301,23 +322,48 @@ def parse_derivatives_yaml(
 
                     if is_auto_element_wise:
                         assert 'self' in yaml_derivdef, \
-                            f'{deriv_op_sig}\n\tis auto but does not have "self"' \
-                            f' tangent defined' \
-                            f'\n\t{yaml_derivdef}\n' \
+                            f'{deriv_op_sig}\n    is auto but does not have' \
+                            f' "self" tangent defined' \
+                            f'\n  {yaml_derivdef}\n' \
                         
                         tangent_expr = yaml_derivdef['self']
 
                     tangent_expr = tangent_expr.strip()
-                    differentiability = _parse_differentiability(upper_schema, tangent_expr, is_auto_element_wise)
+                    differentiability = _parse_differentiability(
+                        upper_schema, tangent_expr, is_auto_element_wise
+                    )
 
-                    result_entries.append(DerivEntry(
+                    entries_candidates.append(DerivEntry(
                         upper_schema, differentiability
                     ))
+                # endif 'auto_linear'
+
+            # endif has explicit 'result' tangent rule
+
+        # endfor each grouped/mergeable overloading by param names
+
+        if not some_overloading_fails:
+            result_entries.extend(entries_candidates)
+
+        else:
+            print(f'@@Overloading schemas:')
+            for fs, yamldict in schemas_and_yamldefs:
+                print(f'  {fs}')
+            print()
+
+    # endfor each overloadings of one op name
 
     return result_entries
 
 
-def dump_torch_jvp_differentiabilities_file(all_entries: List[DerivEntry]):
+def dump_torch_jvp_differentiabilities_file(
+    op_ns_names: List[str], all_entries: List[DerivEntry]
+):
+    name2nsname = {
+        op_ns_name.replace('.', '_'): op_ns_name
+        for op_ns_name in op_ns_names
+    }
+
     by_names: Dict[str,  List[DerivEntry]] = {}
     for entry in all_entries:
         entries = by_names.setdefault(entry.schema.name[6:], [])
@@ -345,7 +391,8 @@ from .autodiff_rule import Differentiability, required, differentiabilities
         for op_name, entries in sorted(by_names.items(), key=lambda kv: kv[0]):
             fs.write(f"""
 
-differentiabilities[torch.{op_name}] = differentiabilities[torch.ops.aten.{op_name}] = ["""
+differentiabilities[torch.{name2nsname[op_name]}] = \\
+differentiabilities[torch.ops.aten.{op_name}] = ["""
             )
 
             for entry in entries:
@@ -381,26 +428,41 @@ differentiabilities[torch.{op_name}] = differentiabilities[torch.ops.aten.{op_na
 
 
 
-op_names = [
+op_ns_names = [
     'abs',
     'add',
     'add_',
+
+    # Dynamically depends one presence of min/max params
+    # 'clamp',
+
     'clone',
     'concat',
+    'diag_embed',
     'div',
+    'einsum',
     'exp',
+    'linalg.svd',
     'lt',
+    'matmul',
     'mul',
     'neg',
+
+    # Has bug.
+    # 'norm',
+
+    # Overloading semantics do not overlap
     # 'pow',
+
     'sign',
     'sub',
     'sub_',
     'sum',
     'sort',
+    'squeeze',
+    'transpose',
     'where',
 ]
-
 
 @dataclasses.dataclass
 class CliArgs:
@@ -414,5 +476,5 @@ if __name__ == '__main__':
 
     cliargs = CliArgs(**vars(parser.parse_args()))
 
-    result_entries = parse_derivatives_yaml(cliargs, op_names)
-    dump_torch_jvp_differentiabilities_file(result_entries)
+    result_entries = parse_derivatives_yaml(cliargs, op_ns_names)
+    dump_torch_jvp_differentiabilities_file(op_ns_names, result_entries)

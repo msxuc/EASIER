@@ -39,16 +39,15 @@ class ConstantTensorMover(EasierInterpreter):
 
         elif isinstance(attr_val, torch.Tensor):  # constants
             # FX will treat tensors created ad hoc in `forward()` as
-            # constant tensors and `setattr()` them into the root module
+            # constant tensors and `setattr()` them into the root/sub module
             # with attribute names like `_tensor_constant0`,
             # and such attributes are neither Module parameters or buffers.
             # We need to move those constant tensors to proper device, too.
-            path: str = self.current_node.target  # type: ignore
-            assert '.' not in path, \
-                "constant tensors must be attrs of the root module"
+            
+            submod = self.current_module.get_submodule(submod_path)
 
             setattr(
-                self.current_module, path,
+                submod, attr_name,
                 # Ensure constants are contiguous so that these tensors
                 # have initial strides.
                 # And it's ok to call `.to(device)` multi times.

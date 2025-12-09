@@ -754,9 +754,6 @@ class ConstantsCollector(EasierInterpreter):
             # and such attributes are neither Module parameters or buffers.
             # We need to move those constant tensors to proper device, too.
             path: str = self.current_node.target  # type: ignore
-            assert '.' not in path, \
-                "constant tensors must be attrs of the root module"
-
             self.constant_values[path] = attr_val.cpu()
 
 

@@ -5,6 +5,7 @@ import dataclasses
 import operator
 from typing import Callable, Dict, List, Literal, Optional, Sequence, \
     Set, Tuple, Type, Union, TYPE_CHECKING
+import typing
 
 import torch
 from torch.fx import Node, Graph
@@ -231,12 +232,6 @@ class DiffRuleBase:
         
 
         def _raw_arg_proxy(raw_arg):
-            if isinstance(raw_arg, (slice, range)):
-                return type(raw_arg)(*[
-                    _raw_arg_proxy(arg)
-                    for arg in [raw_arg.start, raw_arg.stop, raw_arg.step]
-                ])
-
             if isinstance(raw_arg, FxConst.__args__):
                 return raw_arg
             else:
@@ -259,7 +254,7 @@ class DiffRuleBase:
                 k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_normalized_kwargs.items()
             }
-            res_tangent = self.jvp(
+            res_tangent_proxy = self.jvp(
                 *primal_result_proxies,
                 **norm_kw_proxies, **kw_tangents_proxies
             )
@@ -270,7 +265,7 @@ class DiffRuleBase:
                 k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_node.kwargs.items()
             }
-            res_tangent = self.jvp(
+            res_tangent_proxy = self.jvp(
                 *primal_result_proxies, *args_proxies,
                 **kwargs_proxies, **kw_tangents_proxies
             )
@@ -278,9 +273,9 @@ class DiffRuleBase:
         assert get_node_meta(self.raw_node), \
             f"Rule {self} should set metadata on the raw Node"
         
-        res_tangent: Union[EasierProxy, Sequence[Union[None, EasierProxy]]]
+        res_tangent_proxy: Union[EasierProxy, Sequence[Union[None, EasierProxy]]]
         return tree_map(
-            res_tangent,
+            res_tangent_proxy,
             lambda p: None if p is None else p.node
         )  # type: ignore
 
@@ -308,9 +303,11 @@ class SetitemRule(DiffRuleBase):
         target, index, input,
         target_t: 'EasierProxy', input_t: 'EasierProxy'
     ):
-        target_t.node.graph.call_function(
-            operator.setitem, (target_t.node, index, input_t.node)
-        )
+        # By simply invoking a setitem operation on tangent Tensors/Proxies
+        # we can inject Nodes to jvp Graph, all nested proxies will be
+        # converted to Nodes, e.g. in `X[:, self.i:self.j]`
+        target_t[index] = input_t
+
         return target_t
 
 tangent_rule_registry[operator.setitem] = SetitemRule
@@ -393,6 +390,8 @@ class EsrNormRule(DiffRuleBase):
     ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'input': input}
 
+    # NOTE because all arguments are actually passed in as keywords, so we
+    # can put primal parameter p=2 to the last if it has default value.
     def jvp(self, norm_result, input, input_t, p=2):
         if p != 2:
             raise NotImplementedError(f"esr.norm p = {p} and != 2")
@@ -424,8 +423,61 @@ class TorchNormRule(DiffRuleBase):
 
 
 tangent_rule_registry[torch.norm] = \
-    tangent_rule_registry[torch.ops.aten.norm] = \
+tangent_rule_registry[torch.ops.aten.norm] = \
     TorchNormRule
+
+
+class ClampRule(DiffRuleBase):
+    fx_normalize_to_kwargs_only = True
+
+    def input_differentiability(
+        self, input, min=None, max=None
+    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
+        d = {'input': input}
+
+        # but may be Scalar, will result in ()-shape zero tangent tensor
+        if min is not None:  
+            d['min'] = min
+        if max is not None:
+            d['max'] = max
+        
+        self.input_diff = d
+
+        return d
+
+    @typing.no_type_check
+    def jvp(
+        self,
+        input,
+        min: Union['EasierProxy', None]=None, max=None,
+        input_t='MUST_EXIST_MAYBE_ZEROS',
+        min_t: Union['EasierProxy', None]=None, max_t=None
+    ):
+        if min is not None and max is not None:
+            return torch.where(
+                min > max,
+                max_t,
+                torch.where(
+                    input < min,
+                    min_t,
+                    torch.where(
+                        input > max,
+                        max_t,
+                        input_t
+                    )
+                )
+            )
+        elif min is not None:
+            return torch.where(input > min, input_t, min_t)
+        elif max is not None:
+            return torch.where(input < max, input_t, max_t)
+        else:
+            return input_t
+
+tangent_rule_registry[torch.clamp] = \
+tangent_rule_registry[torch.ops.aten.clamp] = \
+    ClampRule
+
 
 class PowRule(DiffRuleBase):
     fx_normalize_to_kwargs_only = True
@@ -464,22 +516,10 @@ class PowRule(DiffRuleBase):
             return input_t * (exponent * torch.pow(input, exponent - 1))
 
 
-tangent_rule_registry[operator.pow] \
-    = tangent_rule_registry[torch.pow] \
-    = PowRule
+tangent_rule_registry[operator.pow] = \
+tangent_rule_registry[torch.pow] = \
+    PowRule
 
-
-class _NonDiffable(DiffRuleBase):
-    # no matter normalizable or not, we don't need to do normalization
-    fx_normalize_to_kwargs_only = False  
-
-    def input_differentiability(self, *args, **kwargs):
-        return {}
-
-    def jvp(self, *args, **kwargs):
-        raise EasierJitException("unreachable")
-
-tangent_rule_registry[operator.lt] = _NonDiffable
 
 #
 # Custom torch op Differentiability for torch.func.jvp()
@@ -496,6 +536,11 @@ tangent_rule_registry[operator.lt] = _NonDiffable
 #
 # - torch.aten ops in derivatives.yaml but requiring special parsing.
 #   It's easier to manual define Differentiability for them.
+#
+
+
+#
+# Ops not in derivatives.yaml
 #
 
 differentiabilities[torch.ops.aten.add_] = [
@@ -516,7 +561,6 @@ def _normalize_einsum_kwargs(op, args, kwargs):
     def _match(equation, tensors):
         return { 'equation': equation, 'tensors': tensors }
     return _match(*args, **kwargs)
-
 differentiabilities[torch.einsum] = [
     Differentiability(
         ['tensors'],
@@ -525,10 +569,11 @@ differentiabilities[torch.einsum] = [
     )
 ]
 
-differentiabilities[torch.lt] = [
+differentiabilities[torch.linalg.svd] = [
     Differentiability(
-        [],
-        [('input', required), ('other', required)]
+        ['A',],
+        [('full_matrices', True), ('driver', None)],
+        output_differentiability=[True, True, True]
     )
 ]
 
@@ -539,6 +584,17 @@ differentiabilities[torch.ops.aten.sub_] = [
     )
 ]
 
+#
+# Ops to manually handle, but via Differentiability mechanism
+#
+
+differentiabilities[torch.matmul] = [
+    Differentiability(
+        ['input', 'other'],
+    )
+]
+
+# TODO let gen_autodiff handles out_differentiability
 differentiabilities[torch.sort] = [
     Differentiability(
         ['input'],
@@ -552,37 +608,20 @@ differentiabilities[torch.sort] = [
     # )
 ]
 
-
-
-##
-
-
-differentiabilities[torch.clamp] = [
+differentiabilities[torch.squeeze] = \
+differentiabilities[torch.ops.aten.squeeze] = [
     Differentiability(
-        ['input', 'min'],
-        [('max', None)]
+        ['input'],
+    ),
+    Differentiability(
+        ['input'],
+        [('dim', required)]  # int or int[]
     )
 ]
-differentiabilities[torch.diag_embed] = [
+
+differentiabilities[torch.lt] = [
     Differentiability(
-        ['input',],
-        [('offset', 0), ('dim1', -2), ('dim2', -1)]
-    )
-]
-differentiabilities[torch.transpose] = [
-    Differentiability(
-        ['input',],
-        [('dim0', required), ('dim1', required)]
-    )
-]
-differentiabilities[torch.linalg.svd] = [
-    Differentiability(
-        ['A',],
-        [('full_matrices', True), ('driver', None)]
-    )
-]
-differentiabilities[torch.matmul] = [
-    Differentiability(
-        ['input', 'other'],
+        [],
+        [('input', required), ('other', required)]
     )
 ]

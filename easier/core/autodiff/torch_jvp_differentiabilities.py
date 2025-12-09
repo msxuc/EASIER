@@ -10,28 +10,40 @@ import torch
 from .autodiff_rule import Differentiability, required, differentiabilities
 
 
-differentiabilities[torch.abs] = differentiabilities[torch.ops.aten.abs] = [
+differentiabilities[torch.abs] = \
+differentiabilities[torch.ops.aten.abs] = [
     Differentiability(
         ['input', ],
         [],
     ),
 ]
 
-differentiabilities[torch.add] = differentiabilities[torch.ops.aten.add] = [
+differentiabilities[torch.add] = \
+differentiabilities[torch.ops.aten.add] = [
     Differentiability(
         ['input', 'other', ],
         [('alpha', 1), ],
     ),
 ]
 
-differentiabilities[torch.clone] = differentiabilities[torch.ops.aten.clone] = [
+differentiabilities[torch.clone] = \
+differentiabilities[torch.ops.aten.clone] = [
     Differentiability(
         ['input', ],
         [('memory_format', None), ],
     ),
 ]
 
-differentiabilities[torch.div] = differentiabilities[torch.ops.aten.div] = [
+differentiabilities[torch.diag_embed] = \
+differentiabilities[torch.ops.aten.diag_embed] = [
+    Differentiability(
+        ['input', ],
+        [('offset', 0), ('dim1', -2), ('dim2', -1), ],
+    ),
+]
+
+differentiabilities[torch.div] = \
+differentiabilities[torch.ops.aten.div] = [
     Differentiability(
         ['input', 'other', ],
         [],
@@ -42,42 +54,48 @@ differentiabilities[torch.div] = differentiabilities[torch.ops.aten.div] = [
     ),
 ]
 
-differentiabilities[torch.exp] = differentiabilities[torch.ops.aten.exp] = [
+differentiabilities[torch.exp] = \
+differentiabilities[torch.ops.aten.exp] = [
     Differentiability(
         ['input', ],
         [],
     ),
 ]
 
-differentiabilities[torch.mul] = differentiabilities[torch.ops.aten.mul] = [
+differentiabilities[torch.mul] = \
+differentiabilities[torch.ops.aten.mul] = [
     Differentiability(
         ['input', 'other', ],
         [],
     ),
 ]
 
-differentiabilities[torch.neg] = differentiabilities[torch.ops.aten.neg] = [
+differentiabilities[torch.neg] = \
+differentiabilities[torch.ops.aten.neg] = [
     Differentiability(
         ['input', ],
         [],
     ),
 ]
 
-differentiabilities[torch.sign] = differentiabilities[torch.ops.aten.sign] = [
+differentiabilities[torch.sign] = \
+differentiabilities[torch.ops.aten.sign] = [
     Differentiability(
         ['input', ],
         [],
     ),
 ]
 
-differentiabilities[torch.sub] = differentiabilities[torch.ops.aten.sub] = [
+differentiabilities[torch.sub] = \
+differentiabilities[torch.ops.aten.sub] = [
     Differentiability(
         ['input', 'other', ],
         [('alpha', 1), ],
     ),
 ]
 
-differentiabilities[torch.sum] = differentiabilities[torch.ops.aten.sum] = [
+differentiabilities[torch.sum] = \
+differentiabilities[torch.ops.aten.sum] = [
     Differentiability(
         ['input', ],
         [('dtype', None), ],
@@ -88,7 +106,16 @@ differentiabilities[torch.sum] = differentiabilities[torch.ops.aten.sum] = [
     ),
 ]
 
-differentiabilities[torch.where] = differentiabilities[torch.ops.aten.where] = [
+differentiabilities[torch.transpose] = \
+differentiabilities[torch.ops.aten.transpose] = [
+    Differentiability(
+        ['input', ],
+        [('dim0', required), ('dim1', required), ],
+    ),
+]
+
+differentiabilities[torch.where] = \
+differentiabilities[torch.ops.aten.where] = [
     Differentiability(
         ['input', 'other', ],
         [('condition', required), ],

@@ -17,11 +17,6 @@ from easier.core.passes.utils import FX, EasierInterpreter, tree_map
 FxConst: TypeAlias = Union[_FxConstBase, slice, range, EllipsisType, None]
 
 
-def strict_node_copy(src_node: Node, dst_graph: Graph, src2dst: Dict[Node, Node]):
-    # TODO
-    pass
-
-
 class _TorchFuncGraphSimplifer(EasierInterpreter):
     def if_call_method(self, method_name: str):
         assert False, "torch.func.jvp() should decomposite all Tensor methods"
