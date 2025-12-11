@@ -369,14 +369,13 @@ class EsrSumRule(DiffRuleBase):
     ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
         return {'input': input}
 
-    # def output_meta(self, input):
-    #     imeta: RuntimeTensorMeta = get_node_meta(input)  # type: ignore
-    #     return RuntimeTensorMeta(
-    #         Role.REPLICATED, (1,) + imeta.shape[1:], imeta.dtype
-    #     )
-
-    def jvp(self, input, input_t):
-        return esr.sum(input_t)
+    def jvp(self, input, input_t: 'EasierProxy'):
+        # NOTE without fully fleged fx.symbolic_trace(), custom wrapped
+        # functions like esr.aggregators are not handled but inlined to the
+        # underlying torch.sum, which will lead to error when validating
+        # Roles.
+        esr_sum = input_t.node.graph.call_function(esr.sum, (input_t.node,))
+        return input_t.tracer.proxy(esr_sum)
 
 tangent_rule_registry[esr.sum] = EsrSumRule
 
@@ -396,7 +395,17 @@ class EsrNormRule(DiffRuleBase):
         if p != 2:
             raise NotImplementedError(f"esr.norm p = {p} and != 2")
         
-        d = esr.sum(input_t * input) / norm_result
+        mul = input_t * input
+
+        # NOTE without fully fleged fx.symbolic_trace(), custom wrapped
+        # functions like esr.aggregators are not handled but inlined to the
+        # underlying torch.sum, which will lead to error when validating
+        # Roles.
+        mul: 'EasierProxy'
+        esr_sum = mul.node.graph.call_function(esr.sum, (mul.node,))
+        sum = mul.tracer.proxy(esr_sum)
+
+        d = sum / norm_result
         return torch.where(norm_result == 0, 0, d)
 
 tangent_rule_registry[esr.norm] = EsrNormRule

@@ -4,7 +4,7 @@
 import operator
 import os
 import tempfile
-from typing import Callable, Dict, List, Optional, Sequence, Type, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 from unittest.mock import patch
 import pytest
 import torch
@@ -209,158 +209,162 @@ class TestJvp:
 
 
     def test_smoke__assemble_poisson(self):
-        #
-        # EASIER approach
-        #
-    
-        init = PoissonInitializer(POISSON, MESH)
-        # _check_op_usage([init])
-                
-        INIT_VECTOR = torch.rand_like(init.points)
-
-        tpoints = esr.Tensor(INIT_VECTOR, mode='partition')
-        jvp = esr.jvp(
-            init,
-            [init.points], [init.b, init.Ac, init.Af],
-            vectors=[tpoints]
+        _test_jvp(
+            lambda: PoissonInitializer(POISSON, MESH),
+            ['get_face_norm'],
+            ['points'],
+            ['b', 'Ac', 'Af'],
         )
-        [jvp] = esr.compile([jvp], backend='torch') # type: ignore
-        jvp: Jvp
-
-        jvp()
-
-        esr_b = jvp.outputs[0].collect()
-        esr_Ac = jvp.outputs[1].collect()
-        esr_Af = jvp.outputs[2].collect()
-        esr_tb = jvp.products[0].collect()
-        esr_tAc = jvp.products[1].collect()
-        esr_tAf = jvp.products[2].collect()
-
-        #
-        # torch.jvp approach
-        #
-
-        init = PoissonInitializer(POISSON, MESH)
-        [init] = esr.compile([init], backend='none')
-
-        class _MutableRoot:
-            def get_face_norm(self, p0, p1, p2):
-                return PoissonInitializer.get_face_norm(self, p0, p1, p2)
-
-        _init = _MutableRoot()
-        for k, v in init.__dict__.items():
-            setattr(_init, k, v)
-        for k, v in init.named_parameters():
-            setattr(_init, k, v)
-        for k, v in init.named_modules():
-            setattr(_init, k, v)
-
-        # All inplace written esr.Tensors must be _inputs_ to torch.jvp().
-        input_attrnames = ['points', 'centroid', 'rho', 'b', 'Ac', 'Af']
-        output_attrnames = ['b', 'Ac', 'Af']
-
-        def _func(*input_proxies):
-            # Although proxies are wrapped on inputs, they are different
-            # instances from the `inputs` above, rebind them within the
-            # callstack of torch.jvp()
-            for n, p in zip(input_attrnames, input_proxies):
-                setattr(_init, n, p)
-            
-            PoissonInitializer.forward(_init)
-
-            return tuple(getattr(_init, n) for n in output_attrnames)
-            
-        inputs = [getattr(init, n) for n in input_attrnames]
-        tangents = [torch.zeros_like(i) for i in inputs]
-        tangents[0] = INIT_VECTOR
-
-        torch_outs, torch_tangents = torch.func.jvp(  # type: ignore
-            _func, tuple(inputs), tuple(tangents)
-        )
-
-        for ep, tp in zip([esr_b, esr_Ac, esr_Af], torch_outs):
-            torch.testing.assert_close(ep, tp)
-        for et, tt in zip([esr_tb, esr_tAc, esr_tAf], torch_tangents):
-            torch.testing.assert_close(et, tt, rtol=1e-6, atol=1e-6)
 
     def test_smoke__swe_main(self):
-        #
-        # EASIER approach
-        #
-
-        input_attrnames = [
-            'x', 'sy', 'bsx', 'bsy', 'alpha',
-            # Since esr.jvp currently does not allow overlapping between I/O,
-            # the last 3 inputs are effectively outputs too.
-            'h', 'uh', 'vh'
-        ]
-
-        eqn = ShallowWaterEquation(MESH, SW)
-        # _check_op_usage([eqn])
-
-        inputs = [getattr(eqn, n) for n in input_attrnames]
-
-        INIT_VECTOR_VALS = [torch.rand_like(input) for input in inputs]
-
-        vectors = [esr.Tensor(vv, mode='partition') for vv in INIT_VECTOR_VALS]
-
-        jvp = esr.jvp(eqn, inputs, [], vectors=vectors)
-        [jvp] = esr.compile([jvp], backend='none') # type: ignore
-        jvp: Jvp
-
-        jvp()
-
-        esr_primals = [t.collect() for t in inputs]
-        esr_tangents = [vectors[i].collect() for i, t in enumerate(inputs)]
-
-        #
-        # torch.jvp approach
-        #
-        eqn = ShallowWaterEquation(MESH, SW)
-        [eqn] = esr.compile([eqn], backend='none') # type: ignore
-
-        # We need such a dict-like container, supporting __getattr__, and
-        # don't enforce nn.Parameter field like esr.Module(nn.Module).
-        class _MutableRoot:
-            def face_reconstruct(self, phi):
-                return ShallowWaterEquation.face_reconstruct(self, phi)
-            def delta(self, h, uh, vh):
-                return ShallowWaterEquation.delta(self, h, uh, vh)
-
-        # All methods, attributes, submods are dispatched to `eqn`
-        _eqn = _MutableRoot()
-        for k, v in eqn.__dict__.items():
-            setattr(_eqn, k, v)
-        for k, v in eqn.named_parameters():
-            setattr(_eqn, k, v)
-        for k, v in eqn.named_modules():
-            setattr(_eqn, k, v)
-        
-        # esr.Tensors for the new eqn instance.
-        inputs = [getattr(eqn, n) for n in input_attrnames]
-
-        # torch.jvp() needs explicit return values.
-        output_attrnames = ['h', 'uh', 'vh']
-
-        def _func(*input_proxies):
-            # Although proxies are wrapped on inputs, they are different
-            # instances from the `inputs` above, rebind them within the
-            # callstack of torch.jvp()
-            for n, p in zip(input_attrnames, input_proxies):
-                setattr(_eqn, n, p)
-            
-            ShallowWaterEquation.forward(_eqn)
-
-            return tuple(getattr(_eqn, n) for n in output_attrnames)
-            
-        torch_outs, torch_tangents = torch.func.jvp(  # type: ignore
-            _func, tuple(inputs), tuple(INIT_VECTOR_VALS)
+        _test_jvp(
+            lambda: ShallowWaterEquation(MESH, SW),
+            ['face_reconstruct', 'delta'],
+            [
+                'x',
+                'sy',
+                'bsx', 'bsy',
+                'alpha',
+            ],
+            ['h', 'uh', 'vh'],
+            rtol=1e-5, atol=1e-6
         )
 
-        for ep, tp in zip(esr_primals[-3:], torch_outs):
-            torch.testing.assert_close(ep, tp)
-        for et, tt in zip(esr_tangents[-3:], torch_tangents):
-            torch.testing.assert_close(et, tt, rtol=1e-6, atol=1e-6)
+
+def _test_jvp(
+    ctor: Callable[[], esr.Module],
+    redirected_methods: List[str] = [],
+    input_attrnames: List[str] | None = None,
+    output_attrnames: List[str] = [],  # not overlapping
+    optional_vectors: Dict[str, torch.Tensor] = {},
+    rtol=None, atol=None
+):
+    module = ctor()
+    # _check_op_usage([module])
+
+    if not input_attrnames:
+        input_attrnames = []
+        for n, _ in module.named_parameters():
+            if '.' not in n:
+                input_attrnames.append(n)
+
+
+    #
+    # Prepare constant torch.Tensor initial tangents for inputs
+    #
+    _merged_inputs = [
+        getattr(module, n) for n in input_attrnames + output_attrnames
+    ]
+    INIT_VECTORS = list(map(torch.rand_like, _merged_inputs))
+
+    for i, n in enumerate(input_attrnames):
+        if n in optional_vectors:
+            INIT_VECTORS[i] = optional_vectors[n]
+
+    #
+    # EASIER approach
+    #
+    esr_inputs = [
+        getattr(module, n) for n in input_attrnames + output_attrnames
+    ]
+    esr_vectors: List[esr.Tensor] = []
+    for i, v in zip(esr_inputs, INIT_VECTORS):
+        esr_vectors.append(esr.Tensor(
+            v, mode='partition' if i.is_partition else 'replicate'
+        ))
+    
+    jvp = esr.jvp(module, esr_inputs, [], esr_vectors)
+    [jvp] = esr.compile([jvp], backend='torch')  # type: ignore
+    jvp: Jvp
+
+    jvp()
+
+    esr_primals = [t.collect() for t in jvp.inputs]
+    esr_tangents = [t.collect() for t in jvp.vectors]
+
+    #
+    # torch.jvp approach
+    #
+    module = ctor()
+
+    vectors = dict(zip(input_attrnames + output_attrnames, INIT_VECTORS))
+
+    torch_outs, torch_tangents = _run_torch_jvp(
+        module, redirected_methods, vectors,
+        input_attrnames + output_attrnames
+    )
+
+    for ep, tp in zip(esr_primals, torch_outs):
+        torch.testing.assert_close(ep, tp)
+    for et, tt in zip(esr_tangents, torch_tangents):
+        torch.testing.assert_close(et, tt, rtol=rtol, atol=atol)
+
+    
+
+
+
+def _run_torch_jvp(
+    module: esr.Module, redirected_methods: List[str],
+    vectors: Dict[str, torch.Tensor],
+    output_attrnames: List[str]
+) -> Tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]:
+
+    [module] = esr.compile([module], backend='none')
+
+    # We need such a dict-like container, supporting __getattr__, and
+    # don't enforce nn.Parameter field like esr.Module(nn.Module).
+    class _MutableRoot:
+        pass
+
+    raw_cls = module.__class__
+
+    for method in redirected_methods:
+
+        # Introduce an explicit var binding to capture loop var 'method'
+        def _set_method(method: str):
+            def _dispatch(*args, **kwargs):
+                return getattr(raw_cls, method)(*args, **kwargs)
+            setattr(_MutableRoot, method, _dispatch)
+
+        _set_method(method)
+    
+    all_params: Dict[str, torch.Tensor] = {}
+
+    # All methods, attributes, submods are dispatched to `eqn`
+    root = _MutableRoot()
+    for k, v in module.__dict__.items():
+        setattr(root, k, v)
+    for k, v in module.named_parameters():
+        setattr(root, k, v)
+
+        if '.' not in k:
+            all_params[k] = v
+
+    for k, v in module.named_modules():
+        setattr(root, k, v)
+
+    def _func(*param_proxies):
+        # Although proxies are wrapped on inputs, they are different
+        # instances from the `inputs` above, rebind them within the
+        # callstack of torch.jvp()
+        for n, p in zip(all_params.keys(), param_proxies):
+            setattr(root, n, p)
+        
+        raw_cls.forward(root)  # type: ignore
+
+        return tuple(getattr(root, n) for n in output_attrnames)
+    
+    init_tangents = {
+        k: vectors.get(k, torch.zeros_like(v))
+        for k, v in all_params.items()
+    }
+        
+    torch_outs, torch_tangents = torch.func.jvp(  # type: ignore
+        _func, tuple(all_params.values()), tuple(init_tangents.values())
+    )
+
+    return torch_outs, torch_tangents
+
 
 
 def _check_op_usage(topmods):
@@ -395,7 +399,6 @@ def _check_op_usage(topmods):
     print(list(bad_targets))
 
 
-@pytest.mark.skip
 @pytest.mark.usefixtures('dummy_dist_env')
 def test_GMRES():
     poisson = Poisson(MESH, POISSON)
@@ -472,6 +475,33 @@ def test_GMRES():
     update_y = UpdateY(gmres.H, gmres.B, gmres.y)
 
     # _check_op_usage([sol, update_B, update_H, update_y])
+
+    class _GmresCtor:
+        def __getattribute__(self, name: str):
+            def _make():
+                poisson = Poisson(MESH, POISSON)
+                gmres = GMRES(poisson.A, poisson.b, poisson.x)
+                return getattr(gmres, name)
+            return _make
+    _gmres = _GmresCtor()
+
+    _test_jvp(_gmres.update_rnorm)
+    _test_jvp(_gmres.init)
+
+    _test_jvp(_gmres.init_V)
+    _test_jvp(_gmres.init_w)
+    _test_jvp(_gmres.sum_w)
+    _test_jvp(_gmres.update_w)
+    _test_jvp(_gmres.norm_w)
+    _test_jvp(_gmres.update_V)
+
+
+    _test_jvp(lambda: _gmres.update_x()[0])
+
+    # Extra esr.Modules
+    _test_jvp(lambda: UpdateB(_gmres.B(), _gmres.rnorm()))
+    _test_jvp(lambda: UpdateH(_gmres.H(), _gmres.h()))
+    _test_jvp(lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()))
 
     class JvpGMRES(esr.Module):
         def __init__(self, restart: int):
