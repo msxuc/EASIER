@@ -416,7 +416,8 @@ def _check_op_usage(topmods):
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
-def test_GMRES():
+@pytest.mark.parametrize('test_component', [True, False]) 
+def test_GMRES(test_component: bool):
     poisson = Poisson(MESH, POISSON)
 
     # Poisson.A is LinSys which is not an esr.Module and will be inlined
@@ -488,36 +489,44 @@ def test_GMRES():
 
 
     #
-    # test Jvp of individual esr.Module compoenent work well
+    # test if Jvp of individual esr.Module compoenent works well
     #
-    class _GmresCompCtor:
-        def __getattribute__(self, name: str):
-            def _make():
-                poisson = Poisson(MESH, POISSON)
-                gmres = GMRES(poisson.A, poisson.b, poisson.x)
-                return getattr(gmres, name)
-            return _make
-    _gmres = _GmresCompCtor()
+    if test_component:
+        class _GmresCompCtor:
+            def __getattribute__(self, name: str):
+                def _make():
+                    poisson = Poisson(MESH, POISSON)
+                    gmres = GMRES(poisson.A, poisson.b, poisson.x)
+                    return getattr(gmres, name)
+                return _make
+        _gmres = _GmresCompCtor()
 
-    _test_jvp(_gmres.update_rnorm)
-    _test_jvp(_gmres.init)
+        _test_jvp(_gmres.update_rnorm, randomize_initial_value=True)
+        _test_jvp(_gmres.init, randomize_initial_value=True)
 
-    _test_jvp(_gmres.init_V, randomize_initial_value=True)
-    _test_jvp(_gmres.init_w)
-    _test_jvp(_gmres.sum_w)
-    _test_jvp(_gmres.update_w)
-    _test_jvp(_gmres.norm_w)
-    _test_jvp(_gmres.update_V, randomize_initial_value=True)
+        _test_jvp(_gmres.init_V, randomize_initial_value=True)
+        _test_jvp(_gmres.init_w, randomize_initial_value=True)
+        _test_jvp(_gmres.sum_w, randomize_initial_value=True)
+        _test_jvp(_gmres.update_w, randomize_initial_value=True)
+        _test_jvp(_gmres.norm_w, randomize_initial_value=True)
+        _test_jvp(_gmres.update_V, randomize_initial_value=True)
 
-    _test_jvp(lambda: _gmres.update_x()[0])
-    _test_jvp(lambda: _gmres.update_x()[10])
+        _test_jvp(lambda: _gmres.update_x()[0], randomize_initial_value=True)
+        _test_jvp(lambda: _gmres.update_x()[10], randomize_initial_value=True)
 
-    _test_jvp(lambda: UpdateB(_gmres.B(), _gmres.rnorm()))
-    _test_jvp(lambda: UpdateH(_gmres.H(), _gmres.h()))
-    _test_jvp(
-        lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()),
-        randomize_initial_value=True
-    )
+        _test_jvp(
+            lambda: UpdateB(_gmres.B(), _gmres.rnorm()),
+            randomize_initial_value=True
+        )
+        _test_jvp(
+            lambda: UpdateH(_gmres.H(), _gmres.h()),
+            randomize_initial_value=True
+        )
+        _test_jvp(
+            lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()),
+            randomize_initial_value=True
+        )
+        return
     
 
     update_B = UpdateB(gmres.B, gmres.rnorm)
@@ -642,7 +651,8 @@ def test_GMRES():
     [jvp_gmres] = esr.compile([jvp_gmres], backend='none')  # type: ignore
     jvp_gmres: JvpGMRES
 
-    jvp_gmres.jvp_solve(maxiter=100)
+    tol=1e-5
+    jvp_gmres.jvp_solve(atol=tol, maxiter=1000, debug_iter=10)
 
 
 @pytest.mark.skip
