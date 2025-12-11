@@ -11,6 +11,7 @@ import torch
 from torch.fx import Node
 
 import easier as esr
+from easier.core.runtime.data_loader import InMemoryTensorLoader
 from easier.core.autodiff.autodiff import FxConst, Jvp, JvpTransformer
 from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, tangent_rule_registry, differentiabilities
@@ -237,15 +238,16 @@ def _test_jvp(
     input_attrnames: List[str] | None = None,
     output_attrnames: List[str] = [],  # not overlapping
     optional_vectors: Dict[str, torch.Tensor] = {},
-    rtol=None, atol=None
+    rtol=None, atol=None,
+    randomize_initial_value=False
 ):
     module = ctor()
     # _check_op_usage([module])
 
     if not input_attrnames:
         input_attrnames = []
-        for n, _ in module.named_parameters():
-            if '.' not in n:
+        for n, p in module.named_parameters():
+            if '.' not in n and p.dtype.is_floating_point:
                 input_attrnames.append(n)
 
 
@@ -255,6 +257,7 @@ def _test_jvp(
     _merged_inputs = [
         getattr(module, n) for n in input_attrnames + output_attrnames
     ]
+    INIT_RANDOM_INPUT = list(map(torch.rand_like, _merged_inputs))
     INIT_VECTORS = list(map(torch.rand_like, _merged_inputs))
 
     for i, n in enumerate(input_attrnames):
@@ -267,6 +270,11 @@ def _test_jvp(
     esr_inputs = [
         getattr(module, n) for n in input_attrnames + output_attrnames
     ]
+    if randomize_initial_value:
+        for esr_i, r_i in zip(esr_inputs, INIT_RANDOM_INPUT):
+            esr_i: esr.Tensor
+            esr_i.easier_data_loader = InMemoryTensorLoader(r_i)
+
     esr_vectors: List[esr.Tensor] = []
     for i, v in zip(esr_inputs, INIT_VECTORS):
         esr_vectors.append(esr.Tensor(
@@ -286,6 +294,14 @@ def _test_jvp(
     # torch.jvp approach
     #
     module = ctor()
+
+    esr_inputs = [
+        getattr(module, n) for n in input_attrnames + output_attrnames
+    ]
+    if randomize_initial_value:
+        for esr_i, r_i in zip(esr_inputs, INIT_RANDOM_INPUT):
+            esr_i: esr.Tensor
+            esr_i.easier_data_loader = InMemoryTensorLoader(r_i)
 
     vectors = dict(zip(input_attrnames + output_attrnames, INIT_VECTORS))
 
@@ -337,7 +353,7 @@ def _run_torch_jvp(
     for k, v in module.named_parameters():
         setattr(root, k, v)
 
-        if '.' not in k:
+        if '.' not in k and v.dtype.is_floating_point:
             all_params[k] = v
 
     for k, v in module.named_modules():
@@ -470,38 +486,46 @@ def test_GMRES():
                 torch.diag_embed(1 / torch.clamp(s, min=1e-8)) @ \
                 u.transpose(0, 1) @ self.B[:self.j + 2]
 
-    update_B = UpdateB(gmres.B, gmres.rnorm)
-    update_H = UpdateH(gmres.H, gmres.h)
-    update_y = UpdateY(gmres.H, gmres.B, gmres.y)
 
-    # _check_op_usage([sol, update_B, update_H, update_y])
-
-    class _GmresCtor:
+    #
+    # test Jvp of individual esr.Module compoenent work well
+    #
+    class _GmresCompCtor:
         def __getattribute__(self, name: str):
             def _make():
                 poisson = Poisson(MESH, POISSON)
                 gmres = GMRES(poisson.A, poisson.b, poisson.x)
                 return getattr(gmres, name)
             return _make
-    _gmres = _GmresCtor()
+    _gmres = _GmresCompCtor()
 
     _test_jvp(_gmres.update_rnorm)
     _test_jvp(_gmres.init)
 
-    _test_jvp(_gmres.init_V)
+    _test_jvp(_gmres.init_V, randomize_initial_value=True)
     _test_jvp(_gmres.init_w)
     _test_jvp(_gmres.sum_w)
     _test_jvp(_gmres.update_w)
     _test_jvp(_gmres.norm_w)
-    _test_jvp(_gmres.update_V)
-
+    _test_jvp(_gmres.update_V, randomize_initial_value=True)
 
     _test_jvp(lambda: _gmres.update_x()[0])
+    _test_jvp(lambda: _gmres.update_x()[10])
 
-    # Extra esr.Modules
     _test_jvp(lambda: UpdateB(_gmres.B(), _gmres.rnorm()))
     _test_jvp(lambda: UpdateH(_gmres.H(), _gmres.h()))
-    _test_jvp(lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()))
+    _test_jvp(
+        lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()),
+        randomize_initial_value=True
+    )
+    
+
+    update_B = UpdateB(gmres.B, gmres.rnorm)
+    update_H = UpdateH(gmres.H, gmres.h)
+    update_y = UpdateY(gmres.H, gmres.B, gmres.y)
+
+    # _check_op_usage([sol, update_B, update_H, update_y])
+
 
     class JvpGMRES(esr.Module):
         def __init__(self, restart: int):
