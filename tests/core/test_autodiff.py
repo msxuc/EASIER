@@ -3,8 +3,9 @@
 
 import operator
 import os
+import sys
 import tempfile
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 from unittest.mock import patch
 import pytest
 import torch
@@ -12,20 +13,25 @@ from torch.fx import Node
 
 import easier as esr
 from easier.core.runtime.data_loader import InMemoryTensorLoader
-from easier.core.autodiff.autodiff import FxConst, Jvp, JvpTransformer
+from easier.core.autodiff.autodiff import Jvp, JvpTransformer
 from easier.core.autodiff.autodiff_rule import \
-    DiffRuleBase, Differentiability, tangent_rule_registry, differentiabilities
+    DiffRuleBase, Differentiability, \
+    tangent_rule_registry, differentiabilities
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta
 from easier.core.utils import get_random_str
-from easier.numeric.solver.gmres import GMRES
+from easier.core.passes.utils import SubmodNameAllocator, get_easier_objects
+from easier.numeric.solver import CG, GMRES
 
 from ..utils import \
     torchrun_singlenode, assert_tensor_list_equal, \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
-    import_poisson, import_shallow_water_equation, MESH, POISSON, SW
+    import_poisson, import_shallow_water_equation, \
+    MESH_100, POISSON_100, SW_100, \
+    MESH_30, POISSON_30, \
+    linsys_to_mat
 
 
-Poisson = import_poisson()
+import_poisson()  # activate Python search paths only
 from assemble_poisson import PoissonInitializer  # type: ignore
 
 ShallowWaterEquation = import_shallow_water_equation()
@@ -41,7 +47,9 @@ class TestJvpTransformation:
             diffable_params = ['tensors']
             
             def output_meta(self, tensors, dim):
-                return RuntimeTensorMeta(Role.DISTRIBUTED, (10, 2), torch.float32)
+                return RuntimeTensorMeta(
+                    Role.DISTRIBUTED, (10, 2), torch.float32
+                )
             
             def jvp(self, tensors, dim, tensors_t):
                 return torch.concat(tensors_t, dim)
@@ -64,7 +72,9 @@ class TestJvpTransformation:
         class M(esr.Module):
             def __init__(self):
                 super().__init__()
-                self.v = esr.Tensor(esr.zeros([10, 3], dtype=torch.float32), mode='partition')
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
 
             def forward(self):
                 v0 = self.v[:, 0:1]
@@ -107,7 +117,9 @@ class TestJvpTransformation:
         class M(esr.Module):
             def __init__(self):
                 super().__init__()
-                self.v = esr.Tensor(esr.zeros([10, 3], dtype=torch.float32), mode='partition')
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
     
             def forward(self):
                 v0 = self.v[:, 0:1]
@@ -211,7 +223,7 @@ class TestJvp:
 
     def test_smoke__assemble_poisson(self):
         _test_jvp(
-            lambda: PoissonInitializer(POISSON, MESH),
+            lambda: PoissonInitializer(POISSON_100, MESH_100),
             ['get_face_norm'],
             ['points'],
             ['b', 'Ac', 'Af'],
@@ -219,7 +231,7 @@ class TestJvp:
 
     def test_smoke__swe_main(self):
         _test_jvp(
-            lambda: ShallowWaterEquation(MESH, SW),
+            lambda: ShallowWaterEquation(MESH_100, SW_100),
             ['face_reconstruct', 'delta'],
             [
                 'x',
@@ -237,9 +249,10 @@ def _test_jvp(
     redirected_methods: List[str] = [],
     input_attrnames: List[str] | None = None,
     output_attrnames: List[str] = [],  # not overlapping
+    # Otherwise random vectors/tangents are used.
     optional_vectors: Dict[str, torch.Tensor] = {},
     rtol=None, atol=None,
-    randomize_initial_value=False
+    randomize_initial_inputs=False
 ):
     module = ctor()
     # _check_op_usage([module])
@@ -270,7 +283,7 @@ def _test_jvp(
     esr_inputs = [
         getattr(module, n) for n in input_attrnames + output_attrnames
     ]
-    if randomize_initial_value:
+    if randomize_initial_inputs:
         for esr_i, r_i in zip(esr_inputs, INIT_RANDOM_INPUT):
             esr_i: esr.Tensor
             esr_i.easier_data_loader = InMemoryTensorLoader(r_i)
@@ -298,7 +311,7 @@ def _test_jvp(
     esr_inputs = [
         getattr(module, n) for n in input_attrnames + output_attrnames
     ]
-    if randomize_initial_value:
+    if randomize_initial_inputs:
         for esr_i, r_i in zip(esr_inputs, INIT_RANDOM_INPUT):
             esr_i: esr.Tensor
             esr_i.easier_data_loader = InMemoryTensorLoader(r_i)
@@ -415,31 +428,226 @@ def _check_op_usage(topmods):
     print(list(bad_targets))
 
 
-@pytest.mark.usefixtures('dummy_dist_env')
-@pytest.mark.parametrize('test_component', [True, False]) 
-def test_GMRES(test_component: bool):
-    poisson = Poisson(MESH, POISSON)
+def _dump_jvp_graph_module(topmods):
+    """
+    Usage:
+    -   compile with 'none' backend
+    -   call this after compile
+    -   set breakpoint in the local function _jvp_fw below.
+    """
+    dump_dir = os.path.join(tempfile.gettempdir(), "easier", "jvp")
+    dump_dir = os.path.expanduser(dump_dir)
+    os.makedirs(dump_dir, exist_ok=True)
 
-    # Poisson.A is LinSys which is not an esr.Module and will be inlined
-    gmres = GMRES(poisson.A, poisson.b, poisson.x)
-    
+    if dump_dir not in sys.path:
+        sys.path.append(dump_dir)
+
+    for jvpm, hint_name in get_easier_objects(topmods).items():
+        if not isinstance(jvpm, Jvp):
+            continue
+
+        # code looks like:
+        # ```
+        # torch.fx._symbolic_trace.wrap("easier_core_module_sum")
+        # torch.fx._symbolic_trace.wrap("easier_core_module_norm")
+        #
+        # def forward(self):
+        #    p = self.p
+        #    vectors_4 = getattr(self.vectors, "4")
+        #    ...
+        #    a_reducer = self.A.reducer(mul);  mul = other = None
+        #    ...
+        # ```
+
+        code = jvpm.graph_module.graph.python_code('self').src
+        fw_start_pos = code.index('def forward(')
+
+        fw_lines = []
+        for src_fw_line in code[fw_start_pos:].splitlines():
+            # If no GC parts, the pos is -1
+            gc_start_pos = src_fw_line.find(';')
+            if gc_start_pos > 0:
+                src_fw_line = src_fw_line[:gc_start_pos]
+
+            fw_lines.append('    ' + src_fw_line + '\n')
+
+        # fx.Codegen offers little fine-granularity utils to control codegen
+        # so we cannot add hint for primal-tangent-raw mapping.
+        # TODO custom codegen by ourselves
+        fname = SubmodNameAllocator('').purify_attr_name(hint_name[0])
+        fpath = os.path.join(dump_dir, f'{fname}.py')
+        with open(fpath, 'w') as fs:
+            fs.write(f"""
+import torch
+import easier
+
+easier_core_module_sum = easier.core.module.sum
+easier_core_module_norm = easier.core.module.norm
+
+class {fname}:
+""")
+            fs.writelines(fw_lines)
+
+
+        import importlib
+        fmod = importlib.import_module(fname)
+        cls = getattr(fmod, fname)
+
+        def _set_fw(jvpm: Jvp, cls):
+
+            def _jvp_fw(self: Jvp):
+                for p in self.products:
+                    p.zero_()
+                
+                #
+                # Debugger insert breakpoint at the line below, then step-into.
+                #
+
+                cls.forward(self.graph_module)
+
+            jvpm.forward = _jvp_fw.__get__(jvpm)
+        
+        _set_fw(jvpm, cls)  # capture iter vars `jvpm, cls`
+        
+
+@pytest.mark.usefixtures('dummy_dist_env')
+def test_CG():
+    Poisson30 = import_poisson(30)
+
+    # CG.A is LinSys which is not an esr.Module and will be inlined
+    def _make_cg():
+        poisson = Poisson30(MESH_30, POISSON_30)
+        cg = CG(poisson.A, poisson.b, poisson.x)
+        return cg
+
+
+    tol=1e-9  # preciser for small mesh size 30 
+
+    #
+    # Invoke CG
+    #
+    cg = _make_cg()
+    [cg] = esr.compile([cg], backend='none')  # type: ignore
+    cg: CG
+
+    b = cg.b.collect()
+    NV = cg.x.shape[0]
+
+    from easier.numeric.linsys import Linsys
+    A: Linsys = cg.A  # type: ignore
+    M = linsys_to_mat(NV, NV, A.selector.idx, A.reducer.idx, A.Ae, A.Av)
+    M_inv =  torch.inverse(M)
+    real_x = M_inv @ cg.b
+
+    cg.solve(atol=tol, maxiter=1000, debug_iter=10)
+
+    solved_x = cg.x.collect()
+    torch.testing.assert_close(solved_x, real_x)
+
+
+    #
+    # Invoke JVP CG
+    #
+    cg = _make_cg()
+
     input_attrnames: List[str] = []
     inputs: List[esr.Tensor] = []
-    vectors: List[esr.Tensor] = []
-    for n, p in gmres.named_parameters(recurse=False):
+    vectors: Dict[str, esr.Tensor] = {}
+    for n, p in cg.named_parameters(recurse=False):
         if isinstance(p, esr.Tensor):
+            input_attrnames.append(n)
+            inputs.append(p)
+
             t_p = esr.Tensor(
                 esr.zeros_like(p),
                 mode='partition' if p.is_partition else 'replicate'
             )
-            input_attrnames.append(n)
-            inputs.append(p)
-            vectors.append(t_p)
-    
+            vectors[n] = t_p
+
+
+    INIT_T_B = torch.rand_like(vectors['b'])
+    INIT_T_B = torch.nn.functional.normalize(INIT_T_B, dim=0)
+    vectors['b'] = esr.Tensor(INIT_T_B, mode='partition')
+
     def _jvp_submod(submod: esr.Module):
-        jvpm = esr.jvp(submod, inputs, [], vectors=vectors)
+        jvpm = esr.jvp(submod, inputs, [], vectors=list(vectors.values()))
         return jvpm
-    
+
+    class JvpCG(esr.Module):
+        def __init__(self):
+            super().__init__()
+
+            self.jvp_init = _jvp_submod(cg.init)
+            self.jvp_step = _jvp_submod(cg.step)
+            self.jvp_update = _jvp_submod(cg.update)
+
+            for n, p in zip(input_attrnames, inputs):
+                setattr(self, n, p)
+        
+        def jvp_solve(
+            self,
+            rtol: float = 1e-5,
+            atol: Optional[float] = None,
+            maxiter: Optional[int] = None,
+            debug_iter: Optional[int] = None
+        ) -> Dict[str, Any]:
+            name = self.__class__.__name__
+            self.jvp_init()
+            rtol *= self.bnorm
+            tol = max(rtol, atol) if atol else rtol
+
+            iters = 0
+            while True:
+                self.jvp_step()
+
+                if debug_iter is not None and iters % debug_iter == 0:
+                    esr.logger.info(
+                        f"{name} residual {float(self.rnorm)}"
+                        f" at the {iters}-th iteration")
+
+                if (not torch.isnan(self.rnorm) and self.rnorm <= tol) or \
+                (maxiter is not None and iters >= maxiter):
+                    break
+                iters += 1
+
+                self.jvp_update()
+
+            esr.logger.info(
+                f"{name} solver completed with residual {float(self.rnorm)}" +
+                f" at the {iters}-th iteration")
+
+            return {'residual': float(self.rnorm), 'iters': iters}
+
+    jvp_cg = JvpCG()
+    [jvp_cg] = esr.compile([jvp_cg], backend='none')  # type: ignore
+    jvp_cg: JvpCG
+
+    _dump_jvp_graph_module([jvp_cg])
+
+    jvp_cg.jvp_solve(atol=tol, maxiter=1000, debug_iter=10)
+
+    esr_x = jvp_cg.x.collect()  # type: ignore
+    torch.testing.assert_close(esr_x, real_x)
+
+    esr_tx = vectors['x'].collect()
+
+    torch_tx = M_inv @ INIT_T_B
+    torch.testing.assert_close(esr_tx, torch_tx)
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
+@pytest.mark.parametrize(
+    'test_component', [True, False], ids=['component', 'solver']
+) 
+def test_GMRES(test_component: bool):
+    Poisson30 = import_poisson(30)
+
+    # Poisson.A is LinSys which is not an esr.Module and will be inlined
+    def _make_gmres():
+        poisson = Poisson30(MESH_30, POISSON_30)
+        gmres = GMRES(poisson.A, poisson.b, poisson.x)
+        return gmres
+
     class UpdateB(esr.Module):
         def __init__(self, B, rnorm):
             super().__init__()
@@ -487,7 +695,6 @@ def test_GMRES(test_component: bool):
                 torch.diag_embed(1 / torch.clamp(s, min=1e-8)) @ \
                 u.transpose(0, 1) @ self.B[:self.j + 2]
 
-
     #
     # test if Jvp of individual esr.Module compoenent works well
     #
@@ -495,47 +702,101 @@ def test_GMRES(test_component: bool):
         class _GmresCompCtor:
             def __getattribute__(self, name: str):
                 def _make():
-                    poisson = Poisson(MESH, POISSON)
-                    gmres = GMRES(poisson.A, poisson.b, poisson.x)
+                    gmres = _make_gmres()
                     return getattr(gmres, name)
                 return _make
         _gmres = _GmresCompCtor()
+        # We need somehow to create new component esr.Module instance because
+        # each Module/Tensor can be compiled only once.
 
-        _test_jvp(_gmres.update_rnorm, randomize_initial_value=True)
-        _test_jvp(_gmres.init, randomize_initial_value=True)
+        _test_jvp(_gmres.update_rnorm, randomize_initial_inputs=True)
+        _test_jvp(_gmres.init, randomize_initial_inputs=True)
 
-        _test_jvp(_gmres.init_V, randomize_initial_value=True)
-        _test_jvp(_gmres.init_w, randomize_initial_value=True)
-        _test_jvp(_gmres.sum_w, randomize_initial_value=True)
-        _test_jvp(_gmres.update_w, randomize_initial_value=True)
-        _test_jvp(_gmres.norm_w, randomize_initial_value=True)
-        _test_jvp(_gmres.update_V, randomize_initial_value=True)
+        _test_jvp(_gmres.init_V, randomize_initial_inputs=True)
+        _test_jvp(_gmres.init_w, randomize_initial_inputs=True)
+        _test_jvp(_gmres.sum_w, randomize_initial_inputs=True)
+        _test_jvp(_gmres.update_w, randomize_initial_inputs=True)
+        _test_jvp(_gmres.norm_w, randomize_initial_inputs=True)
+        _test_jvp(_gmres.update_V, randomize_initial_inputs=True)
 
-        _test_jvp(lambda: _gmres.update_x()[0], randomize_initial_value=True)
-        _test_jvp(lambda: _gmres.update_x()[10], randomize_initial_value=True)
+        for i in range(20):
+            _test_jvp(lambda: _gmres.update_x()[i], randomize_initial_inputs=True)
 
         _test_jvp(
             lambda: UpdateB(_gmres.B(), _gmres.rnorm()),
-            randomize_initial_value=True
+            randomize_initial_inputs=True
         )
         _test_jvp(
             lambda: UpdateH(_gmres.H(), _gmres.h()),
-            randomize_initial_value=True
+            randomize_initial_inputs=True
         )
         _test_jvp(
             lambda: UpdateY(_gmres.H(), _gmres.B(), _gmres.y()),
-            randomize_initial_value=True
+            randomize_initial_inputs=True
         )
         return
+    
+
+    tol=1e-9  # preciser for small mesh size 30 
+    
+    #
+    # Invoke raw GMRES
+    #
+    gmres = _make_gmres()
+    [gmres] = esr.compile([gmres], backend='none')  # type: ignore
+    gmres: GMRES
+
+    b = gmres.b.collect()
+    NV = gmres.x.shape[0]
+
+    from easier.numeric.linsys import Linsys
+    A: Linsys = gmres.A  # type: ignore
+    M = linsys_to_mat(NV, NV, A.selector.idx, A.reducer.idx, A.Ae, A.Av)
+    M_inv =  torch.inverse(M)
+    real_x = M_inv @ gmres.b
+
+    gmres.solve(atol=tol, maxiter=1000, debug_iter=10)
+
+    solved_x = gmres.x.collect()
+    torch.testing.assert_close(solved_x, real_x)
+    
+
+    #
+    # Invoke JVP GMRES
+    #
+    gmres = _make_gmres()
+
+    input_attrnames: List[str] = []
+    inputs: List[esr.Tensor] = []
+    vectors: Dict[str, esr.Tensor] = {}
+    for n, p in gmres.named_parameters(recurse=False):
+        if isinstance(p, esr.Tensor):
+            input_attrnames.append(n)
+            inputs.append(p)
+
+            t_p = esr.Tensor(
+                esr.zeros_like(p),
+                mode='partition' if p.is_partition else 'replicate'
+            )
+            vectors[n] = t_p
+
+
+    INIT_T_B = torch.rand_like(vectors['b'])
+    INIT_T_B = torch.nn.functional.normalize(INIT_T_B, dim=0)
+    vectors['b'] = esr.Tensor(INIT_T_B, mode='partition')
+
+    def _jvp_submod(submod: esr.Module):
+        jvpm = esr.jvp(submod, inputs, [], vectors=list(vectors.values()))
+        return jvpm
     
 
     update_B = UpdateB(gmres.B, gmres.rnorm)
     update_H = UpdateH(gmres.H, gmres.h)
     update_y = UpdateY(gmres.H, gmres.B, gmres.y)
 
-    # _check_op_usage([sol, update_B, update_H, update_y])
+    # _check_op_usage([gmres, update_B, update_H, update_y])
 
-
+    
     class JvpGMRES(esr.Module):
         def __init__(self, restart: int):
             super().__init__()
@@ -553,7 +814,7 @@ def test_GMRES(test_component: bool):
             self.jvp_update_V = _jvp_submod(gmres.update_V)
 
             self.jvp_update_x = torch.nn.ModuleList(
-                _jvp_submod(x) for x in gmres.update_x  # type: ignore
+                _jvp_submod(up) for up in gmres.update_x  # type: ignore
             )
 
             # Extra esr.Modules
@@ -646,13 +907,20 @@ def test_GMRES(test_component: bool):
                 self.jvp_update_y()
 
                 self.jvp_update_x[j]()
-
+    
     jvp_gmres = JvpGMRES(gmres.restart)
     [jvp_gmres] = esr.compile([jvp_gmres], backend='none')  # type: ignore
     jvp_gmres: JvpGMRES
 
-    tol=1e-5
     jvp_gmres.jvp_solve(atol=tol, maxiter=1000, debug_iter=10)
+
+    esr_x = jvp_gmres.x.collect()  # type: ignore
+    torch.testing.assert_close(esr_x, real_x)
+
+    esr_tx = vectors['x'].collect()
+
+    torch_x, torch_tx = torch.func.jvp(torch.mv, (M_inv, b), (torch.zeros_like(M_inv), INIT_T_B))
+    torch.testing.assert_close(esr_tx, torch_tx)
 
 
 @pytest.mark.skip

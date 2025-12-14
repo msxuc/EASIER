@@ -8,7 +8,7 @@ from easier.numeric import solver
 
 from tests.utils import \
     have_cuda, when_ngpus_ge_2, torchrun_singlenode, \
-    import_poisson, MESH, POISSON
+    import_poisson, MESH_100, POISSON_100
 
 
 def worker__test_cg(local_rank: int, world_size: int, backend: str):
@@ -17,7 +17,7 @@ def worker__test_cg(local_rank: int, world_size: int, backend: str):
     # for prec_type in ['symmetric', None]:
     for prec_type in [None]:
 
-        eqn = Poisson(MESH, POISSON)
+        eqn = Poisson(MESH_100, POISSON_100)
         sol = solver.CG(eqn.A, eqn.b, eqn.x)
         [sol] = esr.compile([sol], backend=backend)  # type: ignore
         sol: solver.CG
@@ -32,7 +32,7 @@ def worker__test_gmres(local_rank: int, world_size: int, backend: str):
     # for prec_type in ['forward', 'backward', 'symmetric', None]:
     for prec_type in [None]:
 
-        eqn = Poisson(MESH, POISSON)
+        eqn = Poisson(MESH_100, POISSON_100)
         sol = solver.GMRES(eqn.A, eqn.b, eqn.x)
         [sol] = esr.compile([sol], backend=backend)  # type: ignore
         sol: solver.GMRES

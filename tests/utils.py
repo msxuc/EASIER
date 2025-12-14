@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import List, Literal, Tuple
+import dataclasses
+from typing import List, Literal, Optional, Tuple, Union
 import os
 import sys
 import pytest
@@ -13,17 +14,21 @@ from torch.multiprocessing.spawn import spawn
 import easier
 import easier.core.runtime.dist_env as _DM
 
+MESH_30 = os.path.expanduser('~/.easier/triangular_30.hdf5')
+POISSON_30 = os.path.expanduser('~/.easier/Poisson_30.hdf5')
 
-MESH = os.path.expanduser('~/.easier/triangular_100.hdf5')
-POISSON = os.path.expanduser('~/.easier/Poisson_100.hdf5')
-SW = os.path.expanduser('~/.easier/SW_100.hdf5')
+MESH_100 = os.path.expanduser('~/.easier/triangular_100.hdf5')
+POISSON_100 = os.path.expanduser('~/.easier/Poisson_100.hdf5')
+SW_100 = os.path.expanduser('~/.easier/SW_100.hdf5')
 
 
-def import_poisson():
-    assert os.path.exists(MESH), \
-        "Run `python tutorial/create_triangular_mesh.py 100`"
-    assert os.path.exists(POISSON), \
-        "Run `torchrun tutorial/poisson/assemble_poisson.py MESH POISSON`"
+def import_poisson(mesh_size=100):
+    mesh = os.path.expanduser(f'~/.easier/triangular_{mesh_size}.hdf5')
+    poisson = os.path.expanduser(f'~/.easier/Poisson_{mesh_size}.hdf5')
+    assert os.path.exists(mesh), \
+        f"Run `python tutorial/create_triangular_mesh.py {mesh_size} DIR`"
+    assert os.path.exists(poisson), \
+        f"Run `torchrun tutorial/poisson/assemble_poisson.py MESH POISSON`"
 
     esr_dir = os.path.dirname(easier.__file__)
     path = os.path.join(esr_dir, '..', 'tutorial', 'poisson')
@@ -35,9 +40,9 @@ def import_poisson():
     return Poisson
 
 def import_shallow_water_equation():
-    assert os.path.exists(MESH), \
+    assert os.path.exists(MESH_100), \
         "Run `python tutorial/create_triangular_mesh.py 100`"
-    assert os.path.exists(SW), \
+    assert os.path.exists(SW_100), \
         "Run " \
         "`torchrun tutorial/shallow_water_equation/assemble_shallow_water.py" \
         " MESH SW`"
@@ -242,3 +247,25 @@ def assert_tensor_list_equal(la: List[torch.Tensor],
     assert len(la) == len(lb)
     for a, b in zip(la, lb):
         assert torch.equal(a, b)
+
+
+def linsys_to_mat(
+    nx: int,
+    ny: int,
+    s_idx: torch.Tensor,
+    r_idx: torch.Tensor,
+    Ae: torch.Tensor,
+    Av: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # NOTE if nx ny is too big e.g. > 10000, this will consume too many mem
+    # gets OOM and killed.
+    A = torch.zeros([ny, nx], dtype=Ae.dtype)
+
+    nnz = r_idx * nx + s_idx
+    A.flatten()[nnz] = Ae
+
+    if Av is not None:
+        assert nx == ny, 'Av available only for square matrix'
+        A = A + torch.diag(Av)
+    
+    return A

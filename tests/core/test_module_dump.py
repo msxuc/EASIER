@@ -13,7 +13,7 @@ from easier.core.utils import get_random_str
 from ..utils import \
     torchrun_singlenode, assert_tensor_list_equal, \
     when_ngpus_ge_2, mpi_e2e, mpirun_singlenode, \
-    import_poisson, MESH, POISSON
+    import_poisson, MESH_100, POISSON_100
 from tests.core.utils import multi_stage_zero_length_partition
 
 Poisson = import_poisson()
@@ -22,7 +22,7 @@ Poisson = import_poisson()
 class Model(esr.Module):
     def __init__(self, nf, device='cpu') -> None:
         super().__init__()
-        eqn = Poisson(MESH, POISSON, device)
+        eqn = Poisson(MESH_100, POISSON_100, device)
         nv = self.nv = eqn.x.shape[0]
         ne = self.ne = eqn.src.shape[0]
 
