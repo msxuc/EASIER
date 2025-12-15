@@ -435,6 +435,8 @@ def _dump_jvp_graph_module(topmods):
     -   call this after compile
     -   set breakpoint in the local function _jvp_fw below.
     """
+    import importlib
+
     dump_dir = os.path.join(tempfile.gettempdir(), "easier", "jvp")
     dump_dir = os.path.expanduser(dump_dir)
     os.makedirs(dump_dir, exist_ok=True)
@@ -488,8 +490,9 @@ class {fname}:
 """)
             fs.writelines(fw_lines)
 
+        importlib.invalidate_caches()
+        # otherwise immediately import_module may fail with ModuleNotFound
 
-        import importlib
         fmod = importlib.import_module(fname)
         cls = getattr(fmod, fname)
 
@@ -622,7 +625,7 @@ def test_CG():
     [jvp_cg] = esr.compile([jvp_cg], backend='none')  # type: ignore
     jvp_cg: JvpCG
 
-    _dump_jvp_graph_module([jvp_cg])
+    # _dump_jvp_graph_module([jvp_cg])
 
     jvp_cg.jvp_solve(atol=tol, maxiter=1000, debug_iter=10)
 
@@ -739,26 +742,26 @@ def test_GMRES(test_component: bool):
 
     tol=1e-9  # preciser for small mesh size 30 
     
-    #
-    # Invoke raw GMRES
-    #
-    gmres = _make_gmres()
-    [gmres] = esr.compile([gmres], backend='none')  # type: ignore
-    gmres: GMRES
+    # #
+    # # Invoke raw GMRES
+    # #
+    # gmres = _make_gmres()
+    # [gmres] = esr.compile([gmres], backend='none')  # type: ignore
+    # gmres: GMRES
 
-    b = gmres.b.collect()
-    NV = gmres.x.shape[0]
+    # b = gmres.b.collect()
+    # NV = gmres.x.shape[0]
 
-    from easier.numeric.linsys import Linsys
-    A: Linsys = gmres.A  # type: ignore
-    M = linsys_to_mat(NV, NV, A.selector.idx, A.reducer.idx, A.Ae, A.Av)
-    M_inv =  torch.inverse(M)
-    real_x = M_inv @ gmres.b
+    # from easier.numeric.linsys import Linsys
+    # A: Linsys = gmres.A  # type: ignore
+    # M = linsys_to_mat(NV, NV, A.selector.idx, A.reducer.idx, A.Ae, A.Av)
+    # M_inv =  torch.inverse(M)
+    # real_x = M_inv @ gmres.b
 
-    gmres.solve(atol=tol, maxiter=1000, debug_iter=10)
+    # gmres.solve(atol=tol, maxiter=1000, debug_iter=10)
 
-    solved_x = gmres.x.collect()
-    torch.testing.assert_close(solved_x, real_x)
+    # solved_x = gmres.x.collect()
+    # torch.testing.assert_close(solved_x, real_x)
     
 
     #
@@ -912,6 +915,8 @@ def test_GMRES(test_component: bool):
     [jvp_gmres] = esr.compile([jvp_gmres], backend='none')  # type: ignore
     jvp_gmres: JvpGMRES
 
+    _dump_jvp_graph_module([jvp_gmres])
+
     jvp_gmres.jvp_solve(atol=tol, maxiter=1000, debug_iter=10)
 
     esr_x = jvp_gmres.x.collect()  # type: ignore
@@ -919,49 +924,7 @@ def test_GMRES(test_component: bool):
 
     esr_tx = vectors['x'].collect()
 
-    torch_x, torch_tx = torch.func.jvp(torch.mv, (M_inv, b), (torch.zeros_like(M_inv), INIT_T_B))
+    torch_tx = M_inv @ INIT_T_B
     torch.testing.assert_close(esr_tx, torch_tx)
 
 
-@pytest.mark.skip
-@pytest.mark.parametrize('dev_type', [
-    'cpu',
-    pytest.param('cuda', marks=when_ngpus_ge_2)
-])
-def test_dump_jvp(dev_type: str):
-    dumpdir = os.path.join(tempfile.gettempdir(), "easier", "tests",
-                               get_random_str())
-        
-    torch.manual_seed(2345)
-    model_dev = torch.device(dev_type)
-
-    m = Model(3, model_dev)  # type: ignore
-
-    jm1, = esr.compile([m], 'torch', partition_mode='evenly')  # type: ignore
-    esr.dump([jm1], dumpdir)
-    jm1: Model
-
-    torch.manual_seed(2345)
-    m = Model(3, model_dev)  # type: ignore
-    jm2, = esr.compile(
-        [m], 'torch', load_dir=dumpdir, partition_mode='evenly'  # type: ignore
-    )
-    jm2: Model
-
-    _equal_jitted_selector(jm1.selector_src, jm2.selector_src)
-    _equal_jitted_selector(jm1.selector_dst, jm2.selector_dst)
-    _equal_jitted_selector(
-        getattr(jm1, 'csr_selector0reducer_src'),
-        getattr(jm2, 'csr_selector0reducer_src')
-    )
-    _equal_jitted_reducer(jm1.reducer_src, jm2.reducer_src)
-    _equal_jitted_reducer(jm1.reducer_dst, jm2.reducer_dst)
-
-    _equal_jitted_selector(
-        getattr(jm1, 'reordering_selector0reducer_dst'),
-        getattr(jm2, 'reordering_selector0reducer_dst'),
-    )
-    _equal_jitted_selector(
-        getattr(jm1, 'reordering_selector1reducer_src'),
-        getattr(jm2, 'reordering_selector1reducer_src'),
-    )

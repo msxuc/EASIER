@@ -178,6 +178,46 @@ def worker__test_jitted_shared(
     )
 
 
+def worker__test_dump_jvp_module(
+    local_rank: int, world_size: int, dev_type: str, dumpdir: str
+):
+    torch.manual_seed(2345)
+    model_dev = torch.device(dev_type)
+
+    m = Model(3, model_dev)  # type: ignore
+    jvpm1 = esr.jvp(m, [m.vertex_tensor, m.edge_tensor, m.tensor], [])
+
+    jvpm1, = esr.compile([jvpm1], 'torch', partition_mode='evenly')  # type: ignore
+    esr.dump([jvpm1], dumpdir)
+
+    torch.manual_seed(2345)
+    m = Model(3, model_dev)  # type: ignore
+    jvpm2 = esr.jvp(m, [m.vertex_tensor, m.edge_tensor, m.tensor], [])
+    jvpm2, = esr.compile(
+        [jvpm2], 'torch', load_dir=dumpdir, partition_mode='evenly'  # type: ignore
+    )
+
+    _equal_jitted_selector(jvpm1.selector_src, jvpm2.selector_src)
+    _equal_jitted_selector(jvpm1.selector_dst, jvpm2.selector_dst)
+    _equal_jitted_selector(
+        getattr(jvpm1, 'csr_selector0reducer_src'),
+        getattr(jvpm2, 'csr_selector0reducer_src')
+    )
+    _equal_jitted_reducer(jvpm1.reducer_src, jvpm2.reducer_src)
+    _equal_jitted_reducer(jvpm1.reducer_dst, jvpm2.reducer_dst)
+
+    # Totally 4: each Reducer (dst/src) has two calls (0dst+1dst / 2src+3src)
+    # for primal and tangent
+    _equal_jitted_selector(
+        getattr(jvpm1, 'reordering_selector0reducer_dst'),
+        getattr(jvpm2, 'reordering_selector0reducer_dst'),
+    )
+    _equal_jitted_selector(
+        getattr(jvpm1, 'reordering_selector3reducer_src'),
+        getattr(jvpm2, 'reordering_selector3reducer_src'),
+    )
+
+
 @pytest.mark.parametrize('xrun_singlenode', [
     torchrun_singlenode,
     pytest.param(mpirun_singlenode, marks=mpi_e2e)
@@ -207,6 +247,16 @@ class TestModuleDump:
             (dev_type, dumpdir,),
             init_type=dev_type
         )
+
+    def test_jvp_module_dump(self, xrun_singlenode, dev_type):
+        dumpdir = os.path.join(tempfile.gettempdir(), "easier", "tests",
+                               get_random_str())
+        xrun_singlenode(
+            2, worker__test_dump_jvp_module,
+            (dev_type, dumpdir,),
+            init_type=dev_type
+        )
+
 
 
 def worker__test_smoke_zerolength_dump(
