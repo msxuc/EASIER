@@ -210,11 +210,12 @@ if __name__ == "__main__":
     p0_v = torch.zeros_like(init_h.p0)
     p0_v[0] = 1.0  # component x of gradient
 
+    h_t = esr.Tensor(esr.zeros_like(eqn.h), mode='partition')
     p0_t = esr.Tensor(p0_v, mode='replicate')
 
-    init_h_jvp = esr.jvp(init_h, [init_h.p0], [], vectors=[p0_t])
-    eqn_jvp = esr.jvp(eqn, [init_h.p0], [], vectors=[p0_t])
-    obj_jvp = esr.jvp(obj, [init_h.p0], [obj.obj], vectors=[p0_t])
+    init_h_jvp = esr.jvp(init_h, [init_h.p0, eqn.h], [], vectors=[p0_t, h_t])
+    eqn_jvp = esr.jvp(eqn, [init_h.p0, eqn.h], [], vectors=[p0_t, h_t])
+    obj_jvp = esr.jvp(obj, [init_h.p0, eqn.h], [obj.obj], vectors=[p0_t, h_t])
 
     [eqn, init_h, obj] = esr.compile([eqn_jvp, init_h_jvp, obj_jvp], args.backend)
 
@@ -232,4 +233,5 @@ if __name__ == "__main__":
     
     obj()
 
+    print(obj_jvp.obj.data)
     print(obj_jvp.products[0].data)
