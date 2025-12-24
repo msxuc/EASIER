@@ -30,7 +30,7 @@ if __name__ == '__main__':
     z_range = 0.1
 
     with writer.saving(fig, args.filename, dpi=72):
-        for i in tqdm(range(100)):
+        for i in tqdm(range(50)):
             data = np.load(f"{args.data_dir}/data{i:03d}.npz")
             x, y, z = (data['x'], data['y'], data['z'])
 

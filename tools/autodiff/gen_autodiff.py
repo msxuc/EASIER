@@ -455,6 +455,8 @@ op_ns_names = [
     # 'pow',
 
     'sign',
+    'sin',
+    'cos',
     'sub',
     'sub_',
     'sum',

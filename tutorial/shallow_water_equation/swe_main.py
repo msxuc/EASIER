@@ -10,6 +10,34 @@ import numpy as np
 import easier as esr
 
 
+class InitH(esr.Module):
+    def __init__(self, h: esr.Tensor, x: esr.Tensor, y: esr.Tensor):
+        super().__init__()
+        self.h = h
+        self.x = x
+        self.y = y
+        self.p0 = esr.Tensor(torch.tensor([0, 0], dtype=h.dtype), mode='replicate')
+    
+    def forward(self):
+        w = 2
+        self.h[:] = 0.05 / (1 + torch.exp(
+            10 * torch.sin(3.14* w *self.x) * torch.sin(3.14* w *self.y)
+        ))
+
+        self.h[:] += 1 + 0.1 * torch.exp(
+            -100 * ((self.x - self.p0[0])**2 + (self.y - self.p0[1])**2)
+        )
+
+class Objective(esr.Module):
+    def __init__(self, h: esr.Tensor):
+        super().__init__()
+        self.h = h
+        self.obj = esr.Tensor(torch.tensor([0], dtype=h.dtype), mode='replicate')
+    
+    def forward(self):
+        self.obj[:] = esr.sum(self.h)
+
+
 class ShallowWaterEquation(esr.Module):
     def __init__(self, mesh_path: str, sw_path: str, dt=0.005, device='cpu') -> None:
         super().__init__()
@@ -176,7 +204,21 @@ if __name__ == "__main__":
     eqn = ShallowWaterEquation(
         args.mesh, args.shallow_water, args.dt, args.device
     )
-    [eqn] = esr.compile([eqn], args.backend)
+    init_h = InitH(eqn.h, eqn.x, eqn.y)
+    obj = Objective(eqn.h)
+
+    p0_v = torch.zeros_like(init_h.p0)
+    p0_v[0] = 1.0  # component x of gradient
+
+    p0_t = esr.Tensor(p0_v, mode='replicate')
+
+    init_h_jvp = esr.jvp(init_h, [init_h.p0], [], vectors=[p0_t])
+    eqn_jvp = esr.jvp(eqn, [init_h.p0], [], vectors=[p0_t])
+    obj_jvp = esr.jvp(obj, [init_h.p0], [obj.obj], vectors=[p0_t])
+
+    [eqn, init_h, obj] = esr.compile([eqn_jvp, init_h_jvp, obj_jvp], args.backend)
+
+    init_h()
 
     for i in tqdm(range(1000)):
         if i % 10 == 0:
@@ -187,3 +229,7 @@ if __name__ == "__main__":
                 np.savez(f'{args.output}/data{i//10:03d}.npz', x=x, y=y, z=z)
 
         eqn()
+    
+    obj()
+
+    print(obj_jvp.products[0].data)

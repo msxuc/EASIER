@@ -618,6 +618,12 @@ class JvpTransformer(EasierInterpreter):
                     ) if isinstance(v, Node) else v
                     for k, v in raw_node_normalized_kwargs.items()
                 }
+
+                is_aten_api = 'aten' in function.__module__
+                if is_aten_api:
+                    self_input = kwvals.pop('input')
+                    kwvals['self'] = self_input
+
                 fake_res = function(**kwvals)
                 
                 from easier.core.runtime.jit_engine.jit_engine import \
