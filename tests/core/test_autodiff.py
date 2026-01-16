@@ -13,10 +13,10 @@ from torch.fx import Node
 
 import easier as esr
 from easier.core.runtime.data_loader import InMemoryTensorLoader
-from easier.core.autodiff.autodiff import Jvp, JvpTransformer
+from easier.core.autodiff.jvp import Jvp, JvpTransformer
 from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, \
-    tangent_rule_registry, differentiabilities
+    diff_rule_registry, differentiabilities
 from easier.core.runtime.metadata import Role, RuntimeTensorMeta
 from easier.core.utils import get_random_str
 from easier.core.passes.utils import SubmodNameAllocator, get_easier_objects
@@ -41,7 +41,7 @@ class TestJvpTransformation:
     
     def test_rule(self):
         # nest args; multi-res
-        reg: Dict[Callable, Type[DiffRuleBase]] = dict(tangent_rule_registry)
+        reg: Dict[Callable, Type[DiffRuleBase]] = dict(diff_rule_registry)
 
         class _Cat(DiffRuleBase):
             diffable_params = ['tensors']

@@ -27,7 +27,7 @@ from easier.core.runtime.metadata import \
     
 from easier.core.autodiff.autodiff_rule import \
     Differentiability, RequiredParam, \
-    tangent_rule_registry, differentiabilities
+    diff_rule_registry, differentiabilities
 from easier.core.autodiff.utils import simplify_torchfunc_fx_graph, FxConst
 from easier.core.utils import EasierJitException
 
@@ -383,8 +383,20 @@ class JvpTransformer(EasierInterpreter):
         The _operator_ here means Python syntactic operator like operator.add,
         operator.truediv etc.
 
-        We need to dispatch the normalization and JVP subgraph generation to
-        their corresponding torch ops like torch.add, torch.div etc.
+        We need to:
+
+        -   Treat the Python operator as their corresponding torch ops like
+            torch.add, torch.div etc.
+
+            And do the normalization and JVP subgraph generation
+            on the torch ops instead.
+        
+        -   If any operand is a literal scalar (int/float), convert them to
+            a ()-shape tensor Node in the JVP Graph.
+
+            Otherwise, torch.jvp() will insert calls to internal torch APIs
+            to prepare zero-tangent for such scalar operands, and worse,
+            involve complicated arguments on such calls.
 
         Then we follow the same rule as handling other ops, the scalar operands
         are converted-to and treated-as ()-shape tensors.
@@ -450,8 +462,8 @@ class JvpTransformer(EasierInterpreter):
         #
         # Op category
         #
-        if function in tangent_rule_registry:
-            rule_cls = tangent_rule_registry[function]
+        if function in diff_rule_registry:
+            rule_cls = diff_rule_registry[function]
             rule = rule_cls(
                 self.current_node, function, self._fake_eval_meta_ctor
             )

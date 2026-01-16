@@ -3,9 +3,8 @@
 
 from . import (
     autodiff_rule,
+    jvp,
 
     # Import auto-generated module to register all rules for torch ops.
-    torch_jvp_differentiabilities,
-
-    autodiff
+    torch_differentiabilities
 )

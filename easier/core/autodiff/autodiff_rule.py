@@ -214,7 +214,7 @@ class DiffRuleBase:
     ) -> Union[Node, Sequence[Node]]:
 
         from easier.core.jit import EasierProxy, EasierTracer
-        from easier.core.autodiff.autodiff import FxConst
+        from easier.core.autodiff.jvp import FxConst
 
         jvp_graphs: List[Graph] = collect_meta(
             primal_result, lambda n: n.graph, leaf_type=Node
@@ -280,7 +280,7 @@ class DiffRuleBase:
         )  # type: ignore
 
 
-tangent_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
+diff_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
 differentiabilities: Dict[Callable, List[Differentiability]] = {}
 
 #
@@ -310,7 +310,7 @@ class SetitemRule(DiffRuleBase):
 
         return target_t
 
-tangent_rule_registry[operator.setitem] = SetitemRule
+diff_rule_registry[operator.setitem] = SetitemRule
 
 
 class GetitemRule(DiffRuleBase):
@@ -358,7 +358,7 @@ class GetitemRule(DiffRuleBase):
     def jvp(self, input, index, input_t):
         return input_t[index]
 
-tangent_rule_registry[operator.getitem] = GetitemRule
+diff_rule_registry[operator.getitem] = GetitemRule
 
 
 class EsrSumRule(DiffRuleBase):
@@ -377,7 +377,7 @@ class EsrSumRule(DiffRuleBase):
         esr_sum = input_t.node.graph.call_function(esr.sum, (input_t.node,))
         return input_t.tracer.proxy(esr_sum)
 
-tangent_rule_registry[esr.sum] = EsrSumRule
+diff_rule_registry[esr.sum] = EsrSumRule
 
 
 class EsrNormRule(DiffRuleBase):
@@ -408,7 +408,7 @@ class EsrNormRule(DiffRuleBase):
         d = sum / norm_result
         return torch.where(norm_result == 0, 0, d)
 
-tangent_rule_registry[esr.norm] = EsrNormRule
+diff_rule_registry[esr.norm] = EsrNormRule
 
 
 class TorchNormRule(DiffRuleBase):
@@ -431,8 +431,8 @@ class TorchNormRule(DiffRuleBase):
         return torch.where(norm_result == 0, 0, d)
 
 
-tangent_rule_registry[torch.norm] = \
-tangent_rule_registry[torch.ops.aten.norm] = \
+diff_rule_registry[torch.norm] = \
+diff_rule_registry[torch.ops.aten.norm] = \
     TorchNormRule
 
 
@@ -483,8 +483,8 @@ class ClampRule(DiffRuleBase):
         else:
             return input_t
 
-tangent_rule_registry[torch.clamp] = \
-tangent_rule_registry[torch.ops.aten.clamp] = \
+diff_rule_registry[torch.clamp] = \
+diff_rule_registry[torch.ops.aten.clamp] = \
     ClampRule
 
 
@@ -525,8 +525,8 @@ class PowRule(DiffRuleBase):
             return input_t * (exponent * torch.pow(input, exponent - 1))
 
 
-tangent_rule_registry[operator.pow] = \
-tangent_rule_registry[torch.pow] = \
+diff_rule_registry[operator.pow] = \
+diff_rule_registry[torch.pow] = \
     PowRule
 
 
