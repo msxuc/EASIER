@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 import operator
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeAlias, TypeVar, Union, cast
 
 import more_itertools
 import torch
@@ -32,6 +32,8 @@ from easier.core.autodiff.autodiff_rule import \
     diff_rule_registry, differentiabilities
 from easier.core.autodiff.utils import PrimalMetaPropagator, simplify_torchfunc_fx_graph, FxConst
 from easier.core.utils import EasierJitException
+
+_T = TypeVar('_T')
 
 
 """
@@ -131,9 +133,12 @@ class VjpTransformer(EasierInterpreter):
 
         self.vjp_graph = Graph()
         self.nodemap_raw2primal: Dict[Node, Node] = {}
-        self.nodemap_raw2tangent: Dict[Node, Node] = {}
+        
+        # Each use of a diff-able primal value leads to a component of
+        # cotangent, i.e. partial derivative. Then we need to sum up all components.
+        self.nodemap_raw2cotangents: Dict[Node, List[Node]] = {}
 
-        self.tensormap_primal2tangent: Dict[esr.Tensor, esr.Tensor] = {}
+        self.tensormap_primal2cotangent: Dict[esr.Tensor, esr.Tensor] = {}
         
         # Primal inputs/outputs, tangent inputs/outputs have been setattr-ed
         # to Jvp Module in its `.inputs/.outputs/.vectors/.products`
@@ -143,24 +148,24 @@ class VjpTransformer(EasierInterpreter):
         # tangent, we only 1) ensure its GET_ATTR Node is unique; 2) inject a
         # zero_like Node for GET_ATTR Node.
         # I.e. we don't allocate an esr.Tensor for such immediate tangents.
-        self.jvp_tensors_attrpaths: Dict[esr.Tensor, str] = {}
+        self.vjp_tensors_attrpaths: Dict[esr.Tensor, str] = {}
 
         for i, (input, vector) in enumerate(zip(
             vjp_module.inputs, vjp_module.vectors
         )):
-            self.tensormap_primal2tangent[input] = vector
+            self.tensormap_primal2cotangent[input] = vector
 
-            self.jvp_tensors_attrpaths[input] = f'inputs.{i}'
-            self.jvp_tensors_attrpaths[vector] = f'vectors.{i}'
+            self.vjp_tensors_attrpaths[input] = f'inputs.{i}'
+            self.vjp_tensors_attrpaths[vector] = f'vectors.{i}'
 
 
         for i, (output, product) in enumerate(zip(
             vjp_module.outputs, vjp_module.products
         )):
-            self.tensormap_primal2tangent[output] = product
+            self.tensormap_primal2cotangent[output] = product
 
-            self.jvp_tensors_attrpaths[output] = f'outputs.{i}'
-            self.jvp_tensors_attrpaths[product] = f'products.{i}'
+            self.vjp_tensors_attrpaths[output] = f'outputs.{i}'
+            self.vjp_tensors_attrpaths[product] = f'products.{i}'
         
 
         self._setup_vjp_module_attrs()
@@ -169,6 +174,8 @@ class VjpTransformer(EasierInterpreter):
         # arguments, those constants are made attributes to make them aware
         # of AOT target device like CUDA.
         self.const_name_allocator = SubmodNameAllocator('const')
+
+        self.cotangent_part_generators = []
 
     def _setup_vjp_module_attrs(self):
         """
@@ -266,12 +273,14 @@ class VjpTransformer(EasierInterpreter):
                 )
             
             container_val = get_attr_value(self.raw_module, container)
-            if container_val not in self.vjp_module.outputs:
+            if container_val not in self.vjp_module.new_values:
                 # outputs are subset of new_values, not all new_values are
                 # bound with cotangents.
                 raise EasierJitException(
-                    "Primal setitem can only write to output Tensors"
+                    "Primal setitem can only write to new_values Tensors"
                 )
+            
+            assert container_val in self.vjp_module.outputs
                 
 
             return
@@ -292,6 +301,58 @@ class VjpTransformer(EasierInterpreter):
     def _is_cotangent_involved(self) -> bool:
         1
 
+
+    def _prepare_diffable_primals(
+        self,
+        function: Callable,
+        raw_node_diff_args: Dict[str, Union[FxConst, Node, Sequence[Node]]]
+    ) -> List[Union[Node, Sequence[Node]]]:
+        """
+        Given the order of raw diff-able args in `raw_node_diff_args`,
+        return a list of _prepared_ primals to
+        achieve the VJP calculation of this raw Node.
+
+        Being _prepared_ means scalar diff-able args will converted to
+        ()-shape Tensors/Nodes in the VJP Graph.
+        This can also be seen from the absence of FxConst in the result type.
+        """
+        # Must be in the same (whatever) order as `raw_node_diff_args`
+        input_primal_nodes: List[Union[Node, Sequence[Node]]] = []
+
+        for argname, raw_node_diff_arg in raw_node_diff_args.items():
+
+            if not isinstance(raw_node_diff_arg, (Node, Sequence)):
+                # const scalars
+                assert isinstance(raw_node_diff_arg, (int, float, str)), \
+                    "If a differentiable parameter is not a fx.Node" \
+                    " or Node list, it must be a scalar"
+                
+                # Zero tangent for scalar
+                #
+                # Because when invoking torch.jvp(), we convert scalar-type
+                # diffable arguments to ()-shape tensors.
+                # Because of this assumption, torch.jvp() will geneerate calls
+                # to operator overloading that requires args to be tensors.
+                # If we keep the raw scalar arguments, TypeError will occur.
+                #
+                # Therefore, before we do sub-Graph inlining, we need to
+                # convert raw scalar args to tensors/Nodes in the JVP graph.
+                #
+                primal_const_tensor_attrname = self._ensure_vjp_const_attr(
+                    torch.full((), raw_node_diff_arg, dtype=torch.float32),
+                    f"{function.__name__}_{argname}"
+                )
+                input_primal_nodes.append(
+                    self.vjp_graph.get_attr(primal_const_tensor_attrname)
+                )
+            
+            else:  # Node or Node list
+                input_primal_nodes.append(tree_map(
+                    raw_node_diff_arg, self.nodemap_raw2primal.__getitem__
+                ))
+
+
+        return input_primal_nodes
     
 
     def _handle_operation(self, function: Callable):
@@ -335,20 +396,46 @@ class VjpTransformer(EasierInterpreter):
                     f" with Differentiabilities {dfbs}," \
                     f" got {raw_node_normalized_kwargs}"
 
-            raw_node_diff_res: Sequence[
-                Union[FxConst, Node, Sequence[Node]]
-            ] = [
-                1 for p in dfb.output_differentiability
-            ]
-
-
-            cotangent_involved = self._is_cotangent_involved(raw_node_diff_args)
-
             raw_node_diff_args: Dict[
                 str, Union[FxConst, Node, Sequence[Node]]
             ] = {
                 p: raw_node_normalized_kwargs[p] for p in dfb.diffable_params
             }  # type: ignore
+            
+
+            cotangent_involved = True
+
+            if not cotangent_involved:
+                output_primal = self._strict_map_raw_to_vjp(
+                    self.current_node, self.nodemap_raw2primal
+                )
+                self.nodemap_raw2primal[self.current_node] = output_primal
+
+            else:
+                y_meta = get_node_meta(self.current_node)
+
+                # One result: positions == [0]
+                # Multi results: positions == [[0,1], [0,2], ...]
+                y_positions, _ = self._flatten([y_meta], leaf_type=RuntimeTensorMeta)
+
+                gm, flattened_primal_tree, nondiff_inputs_attrname2raw = \
+                    self._generate_vjp_subgraph_using_torchfunc(
+                        function, dfb, raw_node_normalized_kwargs
+                    )
+
+                input_primal_nodes = self._prepare_diffable_primals(
+                    function, raw_node_diff_args
+                )
+
+                subg = simplify_torchfunc_fx_graph(gm)
+                
+                primal_copier = _TorchVjpSubGraphPrimalPartCopier(
+
+                ).run()
+
+                cotangent_copier = _TorchVjpSubGraphCotangentPartCopier()
+
+                self.cotangent_part_generators.append(cotangent_copier)
 
 
     def _strict_map_raw_to_vjp(self, raw: Node, nodemap: Dict[Node, Node]):
@@ -361,7 +448,7 @@ class VjpTransformer(EasierInterpreter):
         in this class.
         """
         assert nodemap is self.nodemap_raw2primal \
-            or nodemap is self.nodemap_raw2tangent
+            or nodemap is self.nodemap_raw2cotangents
 
         for raw_input in raw.all_input_nodes:
             assert raw_input in self.nodemap_raw2primal, \
@@ -371,7 +458,522 @@ class VjpTransformer(EasierInterpreter):
             raw, arg_transform=nodemap.__getitem__
         )
 
-        return vjp_node   
+        return vjp_node
+
+
+    def _flatten(
+        self,
+        vals: List[Union[_T, Sequence[_T]]],
+        leaf_type: Type = torch.Tensor
+    ):
+        """
+        Always take a parameter list, therefore containing
+        the positions of parameters.
+        """
+        def _flatten_pos(
+            i_val: Tuple[int, Union[_T, Sequence[_T]]]
+        ) -> List[Tuple[List[int], _T]]:
+            i, val = i_val
+            if isinstance(val, leaf_type):
+                return [([i], val)]  # type: ignore
+            else:
+                i_ii_vals = []
+                for ii, item in enumerate(val):  # type: ignore
+                    i_ii_vals.append(([i, ii], item))
+                return i_ii_vals
+
+        i_ii_vals = list(
+            more_itertools.flatten(map(_flatten_pos, enumerate(vals)))
+        )
+        positions = list(map(lambda tp: tp[0], i_ii_vals))
+        items = tuple(map(lambda tp: tp[1], i_ii_vals))
+        return positions, items
+        
+    def _unflatten(
+        self, positions: List[List[int]], items: Sequence[torch.Tensor]
+    ):
+        unfltd_primals: List[Union[torch.Tensor, List[torch.Tensor]]] = []
+        for pos, val in zip(positions, items):
+            if len(pos) == 1:
+                [i] = pos
+                # single-elem pos is always not nested
+                unfltd_primals.append(val)
+
+            else:
+                [i, ii] = pos
+                # double-elem pos is always nested, and the inner list
+                # may have only 1 item.
+                if ii == 0:
+                    unfltd_primals.append([])
+                unfltd_primals[i].append(val)  # type: ignore
+        
+        return unfltd_primals
+
+    def _generate_vjp_subgraph_using_torchfunc(
+        self,
+        function: Callable,
+        dfb: Differentiability,
+        raw_normalized_kwargs: Dict[str, FxArg],
+    ) -> Tuple[
+        GraphModule,
+        List[List[int]],
+        Dict[str, Node]
+    ]:
+        jvp_diff_primal_vals: \
+            Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]] = {}
+
+        for diff_param in dfb.diffable_params:
+            diff_param: str
+            raw_node_diff_arg = raw_normalized_kwargs[diff_param]
+
+            if not isinstance(raw_node_diff_arg, (Node, Sequence)):
+                # const scalars
+                assert isinstance(raw_node_diff_arg, (int, float, str))
+                
+                # torch.vjp requires all positional inputs are Tensors
+                diff_argval = torch.zeros([], dtype=torch.float32)
+
+                jvp_diff_primal_vals[diff_param] = diff_argval
+
+            else:  # Node or Node list
+
+                # for a list-typed arg, we assume no mix of Node and scalar.
+                jvp_diff_primal_vals[diff_param] = \
+                    self._create_zero_val(raw_node_diff_arg)  # type: ignore
+                
+        nondiff_val2raw: Dict[torch.Tensor, Node] = {}
+
+        jvp_nondiff_env_vals: Dict[str, Union[torch.Tensor, FxConst]] = {}
+        for nondiff_param_name, default_arg in dfb.other_params:
+            raw_node_nondiff_arg = raw_normalized_kwargs[nondiff_param_name]
+
+            if isinstance(raw_node_nondiff_arg, Sequence):
+                raise NotImplementedError("Nested non-differentiable arg")
+                # PyTorch unlikely has this.
+            
+            if isinstance(raw_node_nondiff_arg, Node):
+                # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph,
+                # we can rely on the identity of this nondiff_val and the
+                # attrname like "_tensor_constants0" to connect JVP-graph
+                # nondiff-arg Nodes and the GET_ATTR Nodes in the subgraph.
+                jvp_nondiff_val = self._create_zero_val(raw_node_nondiff_arg)
+                assert isinstance(jvp_nondiff_val, torch.Tensor)
+
+                nondiff_val2raw[jvp_nondiff_val] = raw_node_nondiff_arg
+
+            else:
+                assert raw_node_nondiff_arg is None \
+                    or isinstance(raw_node_nondiff_arg, (int, float, str))
+                jvp_nondiff_val = raw_node_nondiff_arg
+
+            # TODO this takes effect even user specifies the value to be
+            # explicitly None.
+            # It seems ok that no common operators offer a default value
+            # (especially when the argument is omitted at callsite)
+            # that is not None.
+            if jvp_nondiff_val is None:
+                # Sometimes FX normalization will add omitted optional argument
+                # which is inferred from op definition, effectively same as
+                # `default_arg`. But if that arg appears in node.kwargs, it
+                # means user has explicitly specified it.
+                if nondiff_param_name in self.current_node.kwargs:
+                    raise NotImplementedError(
+                        "User explicitly specifies None arg in"
+                        f" {self.current_node}"
+                        ", may indicate that an internal assumption is broken"
+                    )
+                assert not isinstance(default_arg, RequiredParam)
+                jvp_nondiff_val = default_arg
+            
+            jvp_nondiff_env_vals[
+                nondiff_param_name
+            ] = jvp_nondiff_val  # type: ignore
+
+        # Differentiable Tensor-type parameters, must be passed via jvp()
+        # API param list.
+        # The names and the zero Tensors must be in the same order.
+        diff_arg_names: List[str] = dfb.diffable_params
+        diff_primal_vals = list(map(
+            jvp_diff_primal_vals.__getitem__, diff_arg_names
+        ))
+
+        if isinstance(dfb.output_differentiability, Sequence):
+            if not all(dfb.output_differentiability):
+                raise NotImplementedError(
+                    "EASIER VJP currently does not support"
+                    " partially non-differentiable outputs like torch.sort"
+                )
+
+        # y_meta = get_node_meta(self.current_node)
+        # y_positions, y_meta_items = self._flatten([y_meta], leaf_type=RuntimeTensorMeta)
+
+        cotangent_vals = [self._create_zero_val(self.current_node)]
+
+        flattened_primal_tree, flattened_primal_vals = \
+            self._flatten(diff_primal_vals)
+
+        # flattened_tangent_tree, flattened_tangent_vals = \
+        #     _flatten(tangent_vals)
+        # assert flattened_primal_tree == flattened_tangent_tree
+
+        # Other non-differentiable parameters must NOT be passed via jvp()
+        # API param list, but via function closure.
+
+        is_aten_api = 'aten' in function.__module__
+
+        def _primal_func(*flattened_primals: torch.Tensor):
+            # There preparations are not part of FX Proxy and won't be traced
+            unfltd_primals = self._unflatten(
+                flattened_primal_tree, flattened_primals
+            )
+
+            kw = {}
+            for diff_arg_name, v in zip(diff_arg_names, unfltd_primals):
+
+                if is_aten_api and diff_arg_name == 'input':
+                    diff_arg_name = 'self'
+
+                kw[diff_arg_name] = v
+            for other_arg_name, v in jvp_nondiff_env_vals.items():
+                kw[other_arg_name] = v
+            
+            # The core operation to let torch.func.jvp to analyze
+            return function(**kw)
+        
+        def _vjp(
+            flattened_primals: Tuple[torch.Tensor, ...],
+            cotangents: Tuple[torch.Tensor, ...]
+        ):
+            y, vjpfun = torch.func.vjp(_primal_func, *flattened_primals) # type: ignore
+            res_cot = vjpfun(*cotangents) # type: ignore
+            return y, res_cot
+        
+        gm: GraphModule = make_fx(_vjp)(
+            flattened_primal_vals, cotangent_vals
+        )
+
+        jvp_nondiff_attrname2raw: Dict[str, Node] = {}
+        for const_name, nondiff_val in gm.named_buffers():
+            jvp_nondiff_attrname2raw[const_name] = \
+                nondiff_val2raw[nondiff_val]
+        
+        # TODO return bijective position mapping
+        return gm, flattened_primal_tree, jvp_nondiff_attrname2raw
+    
+
+class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
+    def __init__(
+        self, subgm: GraphModule, subg: Graph, vjp_graph: Graph,
+        #
+        # Structural info about diff-able inputs
+        #
+        input_flatten_tree: List[List[int]],
+        vjp_input_primals: List[Union[Node, Sequence[Node]]],
+
+        # jvp_input_tangents: List[Union[Node, Sequence[Node]]],
+
+        #
+        # Structural info about outputs
+        #
+        n_flattened_primal_outputs: int,
+        #
+        # Structural info about non-diff-able inputs
+        #
+        vjp_input_nondiff_attrname2node: Dict[str, Node]
+    ) -> None:
+        super().__init__([subgm], [subg])  # type: ignore
+
+        self.vjp_graph = vjp_graph
+
+        self.input_flatten_tree = input_flatten_tree
+        self.vjp_input_primals = vjp_input_primals
+
+        # self.jvp_input_tangents = jvp_input_tangents
+
+        self.n_flattened_primal_inputs = len(input_flatten_tree)
+
+        self.n_flattened_primal_outputs =  n_flattened_primal_outputs
+
+        # Keys look like _tensor_constant0
+        self.vjp_input_nondiff_attr2node = vjp_input_nondiff_attrname2node
+
+
+        self._placeholder_i = 0  # totally 2*len(diff_arg_names)
+
+        # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
+        # allow constants, but the subgraph assumes all inputs are Nodes,
+        # making it erroneous to call torch function/method on constants.
+        self._nodemap_subg2vjp: Dict[Node, Union[Node, FxConst]] = {}
+
+        self.output_primal: Union[Node, Sequence[Node]]
+
+        self.input_cotangents: List[Node] = []
+
+
+    def run(self):
+        for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
+            self.current_module = root
+            self.current_graph = graph
+            self.current_module_index = i
+
+            # Before traversing, we fix the nodes by copying them into a list,
+            # in case the customized handler modifies the `graph.nodes` view.
+            nodes = list(graph.nodes)
+            if self.reverse:
+                nodes.reverse()
+
+            for node in nodes:
+                self.current_node = node
+                self.for_each_node()
+
+                for user in node.users:
+                    if user.op == FX.OUTPUT:
+                        break
+
+        return self
+        
+    def if_placeholder(self, param_name: str):
+        """
+        Same as torch.func.jvp requirements, the PLACEHOLDER Nodes only differ
+        in their positions and the order.
+
+        All placeholders are formed by first flattening the args of the raw
+        Node, e.g. torch.cat([A,B,C]) will have 3 placeholders A, B, C.
+        """
+        # param_name would be "primals_1" "tangents_2" (from `def _jvp` above)
+        # and not usable.
+        is_primal = self._placeholder_i < self.n_flattened_primal_inputs
+
+        def _from_flatten(
+            jvp_inputs: List[Union[Node, Sequence[Node]]],
+            tree: List[int]
+        ) -> Union[Node, FxConst]:
+            if len(tree) == 1:
+                [i] = tree
+                return jvp_inputs[i]  # type: ignore
+            else:
+                [i, ii] = tree
+                return jvp_inputs[i][ii] # type: ignore
+
+        if is_primal:
+            ph_pos = self._placeholder_i
+
+            vjp_primal = _from_flatten(
+                self.vjp_input_primals, self.input_flatten_tree[ph_pos]
+            )
+            self._nodemap_subg2vjp[self.current_node] = vjp_primal
+        else:
+            ph_pos = self._placeholder_i - self.n_flattened_primal_inputs
+
+            self.input_cotangents.append()
+
+        self._placeholder_i += 1
+    
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+        assert submod_path == ''
+        # attr_name looks like _tensor_constants0
+
+        self._nodemap_subg2vjp[self.current_node] = \
+            self.vjp_input_nondiff_attr2node[attr_name]
+    
+    def _strict_map_subg_to_jvp(self, subg_node: Node):
+        for subg_input in subg_node.all_input_nodes:
+            assert subg_input in self._nodemap_subg2vjp, \
+                "Sub-Graph Node's Node input must be in subg2jvp Node map"
+        
+        jvp_node = self.vjp_graph.node_copy(
+            subg_node,
+            arg_transform=self._nodemap_subg2vjp.__getitem__  # type: ignore
+        )
+
+        return jvp_node
+    
+    def if_call_function(self, function):
+        jvp_node = self._strict_map_subg_to_jvp(
+            self.current_node
+        )
+
+        self._nodemap_subg2vjp[self.current_node] = jvp_node
+    
+    def if_output(self):
+        """
+        When without AD, a multi-res Node stands individually, it's from
+        tensor metadata level can we know it's multi-res.
+
+        However, in torch.func.jvp sub-Graph, the primal multi-res Node will
+        first be unpacked, then all primal result items are put in OUTPUT
+        Node's args[0] list, making it NO LONGER an individual Node.
+        When copying the sub-Graph into jvp Graph, we need to handle this.
+        """
+        jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
+        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs, \
+            "With currently organization of _primal_func and _jvp above," \
+            " We expect torch.func.jvp() sub-Graph flatten and concat all" \
+            " primal and tangent result items"
+
+        convert = self._nodemap_subg2vjp.__getitem__
+
+        if self.n_flattened_primal_outputs == 1:
+            self.output_primal = tree_map(jvp_subgraph_out[0], convert)
+            self.output_tangent = tree_map(jvp_subgraph_out[1], convert)
+        else:
+            self.output_primal = tree_map(
+                jvp_subgraph_out[:self.n_flattened_primal_outputs], convert
+            )
+            self.output_tangent = tree_map(
+                jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
+            )
+    
+    def if_call_method(self, method_name: str):
+        raise NotImplementedError(
+            "It's unlikely that torch.func.jvp generates method calls"
+        )
+    
+    def if_call_module(self, submod: Module):
+        raise NotImplementedError(
+            "It's unlikely that torch.func.jvp generates module calls"
+        )
+
+
+
+
+class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
+    """
+    CotangentPartCopiers are run in the reversed order.
+    """
+
+    def __init__(
+        self, subgm: GraphModule, subg: Graph, vjp_graph: Graph,
+        #
+        # Structural info about diff-able inputs
+        #
+        input_flatten_tree: List[List[int]],
+        vjp_input_primals: List[Union[Node, Sequence[Node]]],
+
+        # jvp_input_tangents: List[Union[Node, Sequence[Node]]],
+
+        #
+        # Structural info about outputs
+        #
+        n_flattened_primal_outputs: int,
+        #
+        # Structural info about non-diff-able inputs
+        #
+        vjp_input_nondiff_attrname2node: Dict[str, Node]
+    ) -> None:
+        super().__init__([subgm], [subg])  # type: ignore
+
+        self.vjp_graph = vjp_graph
+
+        self.input_flatten_tree = input_flatten_tree
+        self.vjp_input_primals = vjp_input_primals
+
+        # self.jvp_input_tangents = jvp_input_tangents
+
+        self.n_flattened_primal_inputs = len(input_flatten_tree)
+
+        self.n_flattened_primal_outputs =  n_flattened_primal_outputs
+
+        # Keys look like _tensor_constant0
+        self.vjp_input_nondiff_attr2node = vjp_input_nondiff_attrname2node
+
+
+
+        # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
+        # allow constants, but the subgraph assumes all inputs are Nodes,
+        # making it erroneous to call torch function/method on constants.
+        self._nodemap_subg2vjp: Dict[Node, Union[Node, FxConst]] = {}
+
+        self.output_primal: Union[Node, Sequence[Node]]
+
+        self.last_primal_node: Node
+
+        for subg_ph_cot, vjp_cot in zip():
+            self._nodemap_subg2vjp[subg_ph_cot] = vjp_cot
+
+    def run(self):
+        for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
+            self.current_module = root
+            self.current_graph = graph
+            self.current_module_index = i
+
+            # Before traversing, we fix the nodes by copying them into a list,
+            # in case the customized handler modifies the `graph.nodes` view.
+            nodes = list(graph.nodes)
+            if self.reverse:
+                nodes.reverse()
+            
+            cotangent_part_began = False
+
+            for node in nodes:
+
+                if cotangent_part_began:
+                    self.current_node = node
+                    self.for_each_node()
+
+                if node is self.last_primal_node:
+                    cotangent_part_began = True
+
+        return self
+
+    def _strict_map_subg_to_vjp(self, subg_node: Node):
+        for subg_input in subg_node.all_input_nodes:
+            assert subg_input in self._nodemap_subg2vjp, \
+                "Sub-Graph Node's Node input must be in subg2jvp Node map"
+        
+        vjp_node = self.vjp_graph.node_copy(
+            subg_node,
+            arg_transform=self._nodemap_subg2vjp.__getitem__  # type: ignore
+        )
+
+        return vjp_node
+    
+    def if_call_function(self, function):
+        jvp_node = self._strict_map_subg_to_vjp(
+            self.current_node
+        )
+
+        self._nodemap_subg2vjp[self.current_node] = jvp_node
+    
+    def if_output(self):
+        """
+        When without AD, a multi-res Node stands individually, it's from
+        tensor metadata level can we know it's multi-res.
+
+        However, in torch.func.jvp sub-Graph, the primal multi-res Node will
+        first be unpacked, then all primal result items are put in OUTPUT
+        Node's args[0] list, making it NO LONGER an individual Node.
+        When copying the sub-Graph into jvp Graph, we need to handle this.
+        """
+        jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
+        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs, \
+            "With currently organization of _primal_func and _jvp above," \
+            " We expect torch.func.jvp() sub-Graph flatten and concat all" \
+            " primal and tangent result items"
+
+        convert = self._nodemap_subg2vjp.__getitem__
+
+        if self.n_flattened_primal_outputs == 1:
+            self.output_primal = tree_map(jvp_subgraph_out[0], convert)
+            self.output_tangent = tree_map(jvp_subgraph_out[1], convert)
+        else:
+            self.output_primal = tree_map(
+                jvp_subgraph_out[:self.n_flattened_primal_outputs], convert
+            )
+            self.output_tangent = tree_map(
+                jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
+            )
+    
+    def if_call_method(self, method_name: str):
+        raise NotImplementedError(
+            "It's unlikely that torch.func.jvp generates method calls"
+        )
+    
+    def if_call_module(self, submod: Module):
+        raise NotImplementedError(
+            "It's unlikely that torch.func.jvp generates module calls"
+        )
+    
 
 class Vjp(Jvp):
     # TODO the resultant module Vjp and Jvp are basically the same,
@@ -408,6 +1010,9 @@ def vjp(
     
     vjpm = _Vjp(inputs, outputs, vectors)
     vjp_transformer = VjpTransformer(module, vjpm).run()
+
+    for gen in reversed(vjp_transformer.cotangent_part_generators):
+        gen.run()
 
     gm = GraphModule(vjpm, vjp_transformer.vjp_graph)
     vjpm.graph_module = gm

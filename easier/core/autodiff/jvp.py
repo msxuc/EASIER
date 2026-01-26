@@ -1181,7 +1181,8 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
                 "Sub-Graph Node's Node input must be in subg2jvp Node map"
         
         jvp_node = self.jvp_graph.node_copy(
-            subg_node, arg_transform=self._nodemap_subg2jvp.__getitem__
+            subg_node,
+            arg_transform=self._nodemap_subg2jvp.__getitem__  # type: ignore
         )
 
         return jvp_node
