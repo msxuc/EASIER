@@ -427,14 +427,46 @@ class VjpTransformer(EasierInterpreter):
                     function, raw_node_diff_args
                 )
 
+                out_diff = dfb.output_differentiability
+
+                nondiff_inputs_attrname2vjp = {
+                    k: self.nodemap_raw2primal[v]
+                    for k, v in nondiff_inputs_attrname2raw.items()
+                }
+
                 subg = simplify_torchfunc_fx_graph(gm)
                 
                 primal_copier = _TorchVjpSubGraphPrimalPartCopier(
-
+                    gm, subg, self.vjp_graph,
+                    flattened_primal_tree, input_primal_nodes,
+                    len(y_positions),
+                    nondiff_inputs_attrname2vjp
                 ).run()
 
-                cotangent_copier = _TorchVjpSubGraphCotangentPartCopier()
+                if isinstance(out_diff, bool):
+                    assert isinstance(primal_copier.output_primal, Node)
+                    assert out_diff == True
+                    self.nodemap_raw2primal[self.current_node] = \
+                        primal_copier.output_primal
+                
+                else:
+                    assert isinstance(primal_copier.output_primal, Sequence)
+                    assert isinstance(out_diff, Sequence)
 
+                    # NOTE it's likely the RAW multi-res Node doesn't have
+                    # explicit primal/tangent counterpart Nodes, so we can only
+                    # set up binding on the unpacking getitem Nodes.
+
+                    for raw_getitem in self.current_node.users:
+                        assert raw_getitem.target is operator.getitem
+                        _, item_i = raw_getitem.args
+                        assert isinstance(item_i, int)
+
+                        self.nodemap_raw2primal[raw_getitem] = \
+                            primal_copier.output_primal[item_i]
+                # endif out_diff
+
+                cotangent_copier = _TorchVjpSubGraphCotangentPartCopier()
                 self.cotangent_part_generators.append(cotangent_copier)
 
 
@@ -597,6 +629,11 @@ class VjpTransformer(EasierInterpreter):
             jvp_diff_primal_vals.__getitem__, diff_arg_names
         ))
 
+        # TODO if some outputs are not diff-able, like the index of torch.sort
+        # when creating the _primal_func below, an extra getitem will be added
+        # to the primal result.
+        # TODO Additionally, we need to pick all primal getitem Nodes in the
+        # torch.vjp subgraph.
         if isinstance(dfb.output_differentiability, Sequence):
             if not all(dfb.output_differentiability):
                 raise NotImplementedError(
@@ -703,11 +740,12 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
         # allow constants, but the subgraph assumes all inputs are Nodes,
         # making it erroneous to call torch function/method on constants.
-        self._nodemap_subg2vjp: Dict[Node, Union[Node, FxConst]] = {}
+        self.nodemap_subg2vjp: Dict[Node, Union[Node, FxConst]] = {}
 
         self.output_primal: Union[Node, Sequence[Node]]
 
-        self.input_cotangents: List[Node] = []
+        self.cotangent_placeholders: List[Node] = []
+        self.cotangent_part_start: Node
 
 
     def run(self):
@@ -719,16 +757,30 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
             # Before traversing, we fix the nodes by copying them into a list,
             # in case the customized handler modifies the `graph.nodes` view.
             nodes = list(graph.nodes)
-            if self.reverse:
-                nodes.reverse()
+
+            assert not self.reverse
+            
+            has_met_primal_output = False
+            output_i = 0
 
             for node in nodes:
                 self.current_node = node
                 self.for_each_node()
 
                 for user in node.users:
-                    if user.op == FX.OUTPUT:
-                        break
+                    has_met_primal_output = has_met_primal_output or user.op == FX.OUTPUT
+
+                if has_met_primal_output:
+                    output_i += 1
+
+                if output_i >= self.n_flattened_primal_outputs:
+                    break
+            
+            self.cotangent_part_start = node.next
+
+            # Because sequential handling has been broken, we need to
+            # manually handle the OUTPUT Node here.
+            self._record_output(self.current_graph.output_node())
 
         return self
         
@@ -761,11 +813,11 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
             vjp_primal = _from_flatten(
                 self.vjp_input_primals, self.input_flatten_tree[ph_pos]
             )
-            self._nodemap_subg2vjp[self.current_node] = vjp_primal
+            self.nodemap_subg2vjp[self.current_node] = vjp_primal
         else:
             ph_pos = self._placeholder_i - self.n_flattened_primal_inputs
 
-            self.input_cotangents.append()
+            self.cotangent_placeholders.append(self.current_node)
 
         self._placeholder_i += 1
     
@@ -773,17 +825,17 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         assert submod_path == ''
         # attr_name looks like _tensor_constants0
 
-        self._nodemap_subg2vjp[self.current_node] = \
+        self.nodemap_subg2vjp[self.current_node] = \
             self.vjp_input_nondiff_attr2node[attr_name]
     
     def _strict_map_subg_to_jvp(self, subg_node: Node):
         for subg_input in subg_node.all_input_nodes:
-            assert subg_input in self._nodemap_subg2vjp, \
+            assert subg_input in self.nodemap_subg2vjp, \
                 "Sub-Graph Node's Node input must be in subg2jvp Node map"
         
         jvp_node = self.vjp_graph.node_copy(
             subg_node,
-            arg_transform=self._nodemap_subg2vjp.__getitem__  # type: ignore
+            arg_transform=self.nodemap_subg2vjp.__getitem__  # type: ignore
         )
 
         return jvp_node
@@ -793,36 +845,24 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
             self.current_node
         )
 
-        self._nodemap_subg2vjp[self.current_node] = jvp_node
+        self.nodemap_subg2vjp[self.current_node] = jvp_node
     
-    def if_output(self):
-        """
-        When without AD, a multi-res Node stands individually, it's from
-        tensor metadata level can we know it's multi-res.
+    def _record_output(self, output: Node):
+        jvp_subgraph_out = cast(Sequence[Node], output.args[0])
 
-        However, in torch.func.jvp sub-Graph, the primal multi-res Node will
-        first be unpacked, then all primal result items are put in OUTPUT
-        Node's args[0] list, making it NO LONGER an individual Node.
-        When copying the sub-Graph into jvp Graph, we need to handle this.
-        """
-        jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
-        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs, \
-            "With currently organization of _primal_func and _jvp above," \
-            " We expect torch.func.jvp() sub-Graph flatten and concat all" \
-            " primal and tangent result items"
-
-        convert = self._nodemap_subg2vjp.__getitem__
+        convert = self.nodemap_subg2vjp.__getitem__
 
         if self.n_flattened_primal_outputs == 1:
             self.output_primal = tree_map(jvp_subgraph_out[0], convert)
-            self.output_tangent = tree_map(jvp_subgraph_out[1], convert)
         else:
             self.output_primal = tree_map(
                 jvp_subgraph_out[:self.n_flattened_primal_outputs], convert
             )
-            self.output_tangent = tree_map(
-                jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
-            )
+    
+    def if_output(self):
+        raise EasierJitException(
+            "Primal part copier should not meet OUTPUT Node"
+        )
     
     def if_call_method(self, method_name: str):
         raise NotImplementedError(
@@ -844,6 +884,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
 
     def __init__(
         self, subgm: GraphModule, subg: Graph, vjp_graph: Graph,
+        primal_copier: _TorchVjpSubGraphPrimalPartCopier,
         #
         # Structural info about diff-able inputs
         #
@@ -863,6 +904,8 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
+        self.primal_copier = primal_copier
+
         self.vjp_graph = vjp_graph
 
         self.input_flatten_tree = input_flatten_tree
@@ -877,21 +920,31 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         # Keys look like _tensor_constant0
         self.vjp_input_nondiff_attr2node = vjp_input_nondiff_attrname2node
 
+        self.nodemap_raw2sumcot: Dict[Node, Node]
 
+        # Let esr.vjp() bind this in the reversed order.
+        self.input_cotangent: Union[Node, Sequence[Node]]
 
-        # TODO as JvpTransformer._prepare_diffable_primals_and_tangents, we
-        # allow constants, but the subgraph assumes all inputs are Nodes,
-        # making it erroneous to call torch function/method on constants.
-        self._nodemap_subg2vjp: Dict[Node, Union[Node, FxConst]] = {}
+        self.output_cotangent: Union[Node, Sequence[Node]]
 
-        self.output_primal: Union[Node, Sequence[Node]]
-
-        self.last_primal_node: Node
-
-        for subg_ph_cot, vjp_cot in zip():
-            self._nodemap_subg2vjp[subg_ph_cot] = vjp_cot
+    def _from_flatten(
+        self,
+        jvp_inputs: List[Union[Node, Sequence[Node]]],
+        tree: List[int]
+    ) -> Union[Node, FxConst]:
+        if len(tree) == 1:
+            [i] = tree
+            return jvp_inputs[i]  # type: ignore
+        else:
+            [i, ii] = tree
+            return jvp_inputs[i][ii] # type: ignore
 
     def run(self):
+        
+        for cot_ph_pos, cot_ph in enumerate(self.primal_copier.cotangent_placeholders):
+            vjp_cotangent = self._from_flatten([self.input_cotangent], self.input_flatten_tree[cot_ph_pos])
+            self.primal_copier.nodemap_subg2vjp[cot_ph] = vjp_cotangent
+
         for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
             self.current_module = root
             self.current_graph = graph
@@ -900,40 +953,26 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
             # Before traversing, we fix the nodes by copying them into a list,
             # in case the customized handler modifies the `graph.nodes` view.
             nodes = list(graph.nodes)
-            if self.reverse:
-                nodes.reverse()
+
+            assert not self.reverse
             
-            cotangent_part_began = False
+            start_pos = nodes.index(self.primal_copier.cotangent_part_start)
+            nodes = nodes[start_pos:]
 
             for node in nodes:
-
-                if cotangent_part_began:
-                    self.current_node = node
-                    self.for_each_node()
-
-                if node is self.last_primal_node:
-                    cotangent_part_began = True
-
-        return self
-
-    def _strict_map_subg_to_vjp(self, subg_node: Node):
-        for subg_input in subg_node.all_input_nodes:
-            assert subg_input in self._nodemap_subg2vjp, \
-                "Sub-Graph Node's Node input must be in subg2jvp Node map"
+                self.current_node = node
+                self.for_each_node()
         
-        vjp_node = self.vjp_graph.node_copy(
-            subg_node,
-            arg_transform=self._nodemap_subg2vjp.__getitem__  # type: ignore
-        )
+        return self
+    
 
-        return vjp_node
+    def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
+        raise EasierJitException(
+            "Cotangent part copier should not meet GET_ATTR Node"
+        )
     
     def if_call_function(self, function):
-        jvp_node = self._strict_map_subg_to_vjp(
-            self.current_node
-        )
-
-        self._nodemap_subg2vjp[self.current_node] = jvp_node
+        self.primal_copier.if_call_function(function)
     
     def if_output(self):
         """
@@ -946,23 +985,25 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         When copying the sub-Graph into jvp Graph, we need to handle this.
         """
         jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
-        assert len(jvp_subgraph_out) == 2 * self.n_flattened_primal_outputs, \
-            "With currently organization of _primal_func and _jvp above," \
-            " We expect torch.func.jvp() sub-Graph flatten and concat all" \
-            " primal and tangent result items"
 
-        convert = self._nodemap_subg2vjp.__getitem__
+        convert = self.primal_copier.nodemap_subg2vjp.__getitem__
 
         if self.n_flattened_primal_outputs == 1:
-            self.output_primal = tree_map(jvp_subgraph_out[0], convert)
-            self.output_tangent = tree_map(jvp_subgraph_out[1], convert)
+            self.output_cotangent = tree_map(jvp_subgraph_out[1], convert)
         else:
-            self.output_primal = tree_map(
-                jvp_subgraph_out[:self.n_flattened_primal_outputs], convert
-            )
-            self.output_tangent = tree_map(
+            self.output_cotangent = tree_map(
                 jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
             )
+
+        """
+        After traversing and copying all cotangent Nodes, we need to handle:
+
+        -   The aggregation of components of cotangents for each primal value.
+        -   Maintain the primal-Node-cotangent-Node
+            and primal-Tensor-cotangent-Tensor relationships in VJP module.
+        """
+
+
     
     def if_call_method(self, method_name: str):
         raise NotImplementedError(
