@@ -28,7 +28,7 @@ from easier.core.runtime.metadata import \
 from easier.core.autodiff.jvp import Jvp
 
 from easier.core.autodiff.autodiff_rule import \
-    Differentiability, RequiredParam, \
+    DiffRuleBase, Differentiability, RequiredParam, \
     diff_rule_registry, differentiabilities
 from easier.core.autodiff.utils import PrimalMetaPropagator, simplify_torchfunc_fx_graph, FxConst
 from easier.core.utils import EasierJitException
@@ -133,10 +133,17 @@ class VjpTransformer(EasierInterpreter):
 
         self.vjp_graph = Graph()
         self.nodemap_raw2primal: Dict[Node, Node] = {}
+
+        # Some primal Nodes will be replaced if it's decided to carry cotangent
+        # during reverse traversal.
+        for raw_node in graph.nodes:
+            vjp_primal_node = self._strict_map_raw_to_vjp(raw_node)
+            self.nodemap_raw2primal[raw_node] = vjp_primal_node
         
-        # Each use of a diff-able primal value leads to a component of
-        # cotangent, i.e. partial derivative. Then we need to sum up all components.
-        self.nodemap_raw2cotangents: Dict[Node, List[Node]] = {}
+        # When the reverse traversal reaches the definition of a raw Node,
+        # if that raw Node is not in this dict, it means that raw Node does not
+        # have cotangent paired.
+        self.nodemap_primal2sumcot: Dict[Node, Node] = {}
 
         self.tensormap_primal2cotangent: Dict[esr.Tensor, esr.Tensor] = {}
         
@@ -260,6 +267,7 @@ class VjpTransformer(EasierInterpreter):
             # Tensors.
             container, index, value = self.current_node.args
             assert isinstance(container, Node)
+            assert isinstance(value, Node)
 
             if index != Ellipsis:
                 raise NotImplementedError(
@@ -273,6 +281,8 @@ class VjpTransformer(EasierInterpreter):
                 )
             
             container_val = get_attr_value(self.raw_module, container)
+            assert isinstance(container_val, esr.Tensor)
+
             if container_val not in self.vjp_module.new_values:
                 # outputs are subset of new_values, not all new_values are
                 # bound with cotangents.
@@ -280,8 +290,14 @@ class VjpTransformer(EasierInterpreter):
                     "Primal setitem can only write to new_values Tensors"
                 )
             
-            assert container_val in self.vjp_module.outputs
-                
+            if container_val in self.vjp_module.outputs:
+                cot_tensor = self.tensormap_primal2cotangent[container_val]
+
+                cot_attrname = self.vjp_tensors_attrpaths[cot_tensor]
+                cot_node = self.vjp_graph.get_attr(cot_attrname)
+
+                # Writes to `output` is the final use of the `value` Node.
+                self.nodemap_primal2sumcot[value] = cot_node
 
             return
 
@@ -298,8 +314,47 @@ class VjpTransformer(EasierInterpreter):
         self._handle_operation(function)
     
 
-    def _is_cotangent_involved(self) -> bool:
-        1
+    def _try_prepare_get_cotangent(self, dfb: Union[DiffRuleBase, Differentiability]) -> Union[Node, Sequence[Node], None]:
+        primal_node = self.nodemap_raw2primal[self.current_node]
+
+        if isinstance(dfb, Differentiability):
+            out_diff = dfb.output_differentiability
+        else:
+            dfb.input_differentiability()
+            out_diff = dfb.output_differentiability()
+
+        if isinstance(out_diff, bool):
+            assert out_diff == True
+
+            return self.nodemap_primal2sumcot.get(primal_node, None)            
+        
+        else:
+            assert isinstance(out_diff, Sequence)
+            assert all(out_diff)
+
+            comps = [None] * len(out_diff)
+            for raw_getitem in self.current_node.users:
+                assert raw_getitem.target is operator.getitem
+                _, item_i = raw_getitem.args
+                assert isinstance(item_i, int)
+
+                cot_comp = self.nodemap_primal2sumcot.get(self.nodemap_raw2primal[raw_getitem], None)
+                comps[item_i] = cot_comp # type: ignore
+            
+            missing = any(comp is None for comp in comps)
+
+            if missing:
+                assert all(comp is None for comp in comps), "TODO"
+                return None
+
+            meta = get_node_meta(self.current_node)
+            assert isinstance(meta, Sequence)
+
+            # Must be exactly the same tuple type like `torch.types.svd`
+            cot_coll = type(meta)(comps) # type: ignore
+
+            return cot_coll # type: ignore
+
 
 
     def _prepare_diffable_primals(
@@ -362,9 +417,20 @@ class VjpTransformer(EasierInterpreter):
                 self.current_node, function, self._fake_eval_meta_ctor
             )
 
-            #
-            # primal
-            #
+            cotangent = self._try_prepare_get_cotangent(rule)
+            if cotangent is None:
+                return
+            
+            raw_node_diff_args = rule.input_differentiability(
+                *self.current_node.args, **self.current_node.kwargs
+            )
+     
+            input_primal_nodes = self._prepare_diffable_primals(
+                function, raw_node_diff_args
+            )
+
+            rule.inject_vjp_subgraph()
+
         
         else: # not in diff_rule_registry
             if getattr(operator, function.__name__, None) is function:
@@ -379,7 +445,7 @@ class VjpTransformer(EasierInterpreter):
                 raise NotImplementedError(
                     f"Operator {function} is not registered in EASIER AutoDiff"
                 )
-            
+
             raw_node_normalized_kwargs: Dict[str, FxArg] = \
                 fx_normalize_function_variant_into_kwargs(
                     function, self.current_node.args, self.current_node.kwargs
@@ -395,6 +461,12 @@ class VjpTransformer(EasierInterpreter):
                     "Failed to resolve overloading:" \
                     f" with Differentiabilities {dfbs}," \
                     f" got {raw_node_normalized_kwargs}"
+            
+
+            cotangent = self._try_prepare_get_cotangent(dfb)
+            if cotangent is None:
+                return
+
 
             raw_node_diff_args: Dict[
                 str, Union[FxConst, Node, Sequence[Node]]
@@ -402,75 +474,75 @@ class VjpTransformer(EasierInterpreter):
                 p: raw_node_normalized_kwargs[p] for p in dfb.diffable_params
             }  # type: ignore
             
+            y_meta = get_node_meta(self.current_node)
 
-            cotangent_involved = True
+            # One result: positions == [0]
+            # Multi results: positions == [[0,1], [0,2], ...]
+            flattened_output_tree, _ = self._flatten([y_meta], leaf_type=RuntimeTensorMeta)
 
-            if not cotangent_involved:
-                output_primal = self._strict_map_raw_to_vjp(
-                    self.current_node, self.nodemap_raw2primal
+            gm, flattened_input_tree, nondiff_inputs_attrname2raw = \
+                self._generate_vjp_subgraph_using_torchfunc(
+                    function, dfb, raw_node_normalized_kwargs
                 )
-                self.nodemap_raw2primal[self.current_node] = output_primal
+            subg = simplify_torchfunc_fx_graph(gm)
 
-            else:
-                y_meta = get_node_meta(self.current_node)
+            out_diff = dfb.output_differentiability
 
-                # One result: positions == [0]
-                # Multi results: positions == [[0,1], [0,2], ...]
-                y_positions, _ = self._flatten([y_meta], leaf_type=RuntimeTensorMeta)
-
-                gm, flattened_primal_tree, nondiff_inputs_attrname2raw = \
-                    self._generate_vjp_subgraph_using_torchfunc(
-                        function, dfb, raw_node_normalized_kwargs
-                    )
-
+            nondiff_inputs_attrname2vjp = {
+                k: self.nodemap_raw2primal[v]
+                for k, v in nondiff_inputs_attrname2raw.items()
+            }
+            
+            # Edit VJP primal Node
+            with self.vjp_graph.inserting_after(self.nodemap_raw2primal[self.current_node]):
                 input_primal_nodes = self._prepare_diffable_primals(
                     function, raw_node_diff_args
                 )
 
-                out_diff = dfb.output_differentiability
-
-                nondiff_inputs_attrname2vjp = {
-                    k: self.nodemap_raw2primal[v]
-                    for k, v in nondiff_inputs_attrname2raw.items()
-                }
-
-                subg = simplify_torchfunc_fx_graph(gm)
-                
                 primal_copier = _TorchVjpSubGraphPrimalPartCopier(
                     gm, subg, self.vjp_graph,
-                    flattened_primal_tree, input_primal_nodes,
-                    len(y_positions),
+                    flattened_input_tree, input_primal_nodes,
+                    len(flattened_output_tree),
                     nondiff_inputs_attrname2vjp
                 ).run()
 
-                if isinstance(out_diff, bool):
-                    assert isinstance(primal_copier.output_primal, Node)
-                    assert out_diff == True
-                    self.nodemap_raw2primal[self.current_node] = \
-                        primal_copier.output_primal
-                
-                else:
-                    assert isinstance(primal_copier.output_primal, Sequence)
-                    assert isinstance(out_diff, Sequence)
+                # TODO replace IO Nodes
 
-                    # NOTE it's likely the RAW multi-res Node doesn't have
-                    # explicit primal/tangent counterpart Nodes, so we can only
-                    # set up binding on the unpacking getitem Nodes.
+            # Resume to insert at the end of VJP graph
+            cotangent_copier = _TorchVjpSubGraphCotangentPartCopier(
+                gm, subg, self.vjp_graph, primal_copier,
+                flattened_output_tree,
+                nondiff_inputs_attrname2vjp,
+                self.nodemap_primal2sumcot
+            ).run()
 
-                    for raw_getitem in self.current_node.users:
-                        assert raw_getitem.target is operator.getitem
-                        _, item_i = raw_getitem.args
-                        assert isinstance(item_i, int)
+            # if isinstance(out_diff, bool):
+            #     assert isinstance(primal_copier.output_primal, Node)
+            #     assert out_diff == True
+            #     self.nodemap_raw2primal[self.current_node] = \
+            #         primal_copier.output_primal
+            
+            # else:
+            #     assert isinstance(primal_copier.output_primal, Sequence)
+            #     assert isinstance(out_diff, Sequence)
 
-                        self.nodemap_raw2primal[raw_getitem] = \
-                            primal_copier.output_primal[item_i]
-                # endif out_diff
+            #     # NOTE it's likely the RAW multi-res Node doesn't have
+            #     # explicit primal/tangent counterpart Nodes, so we can only
+            #     # set up binding on the unpacking getitem Nodes.
 
-                cotangent_copier = _TorchVjpSubGraphCotangentPartCopier()
-                self.cotangent_part_generators.append(cotangent_copier)
+            #     for raw_getitem in self.current_node.users:
+            #         assert raw_getitem.target is operator.getitem
+            #         _, item_i = raw_getitem.args
+            #         assert isinstance(item_i, int)
+
+            #         self.nodemap_raw2primal[raw_getitem] = \
+            #             primal_copier.output_primal[item_i]
+            # # endif out_diff
+
+            # self.cotangent_part_generators.append(cotangent_copier)
 
 
-    def _strict_map_raw_to_vjp(self, raw: Node, nodemap: Dict[Node, Node]):
+    def _strict_map_raw_to_vjp(self, raw: Node):
         """
         fx.Graph.node_copy tends to silently hide raw-not-existing error in
         nodemap.__getitem__ arg transformation (in torch C++ level),
@@ -479,15 +551,12 @@ class VjpTransformer(EasierInterpreter):
         This aux method validates the consistency of both nodemaps
         in this class.
         """
-        assert nodemap is self.nodemap_raw2primal \
-            or nodemap is self.nodemap_raw2cotangents
-
         for raw_input in raw.all_input_nodes:
             assert raw_input in self.nodemap_raw2primal, \
                 "Raw Node's Node input must be in raw-primal Node map"
         
         vjp_node = self.vjp_graph.node_copy(
-            raw, arg_transform=nodemap.__getitem__
+            raw, arg_transform=self.nodemap_raw2primal.__getitem__
         )
 
         return vjp_node
@@ -706,7 +775,7 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         #
         input_flatten_tree: List[List[int]],
         vjp_input_primals: List[Union[Node, Sequence[Node]]],
-
+        
         # jvp_input_tangents: List[Union[Node, Sequence[Node]]],
 
         #
@@ -726,6 +795,8 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         self.vjp_input_primals = vjp_input_primals
 
         # self.jvp_input_tangents = jvp_input_tangents
+
+
 
         self.n_flattened_primal_inputs = len(input_flatten_tree)
 
@@ -888,19 +959,23 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         #
         # Structural info about diff-able inputs
         #
-        input_flatten_tree: List[List[int]],
-        vjp_input_primals: List[Union[Node, Sequence[Node]]],
+        # input_flatten_tree: List[List[int]],
+        # vjp_input_primals: List[Union[Node, Sequence[Node]]],
 
         # jvp_input_tangents: List[Union[Node, Sequence[Node]]],
+        
+        output_flatten_tree: List[List[int]],
 
         #
         # Structural info about outputs
         #
-        n_flattened_primal_outputs: int,
+        # n_flattened_primal_outputs: int,
         #
         # Structural info about non-diff-able inputs
         #
-        vjp_input_nondiff_attrname2node: Dict[str, Node]
+        vjp_input_nondiff_attrname2node: Dict[str, Node],
+
+        nodemap_primal2sumcot: Dict[Node, Node]
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
@@ -908,30 +983,27 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
 
         self.vjp_graph = vjp_graph
 
-        self.input_flatten_tree = input_flatten_tree
-        self.vjp_input_primals = vjp_input_primals
+        # self.input_flatten_tree = input_flatten_tree
+        # self.vjp_input_primals = vjp_input_primals
 
         # self.jvp_input_tangents = jvp_input_tangents
 
-        self.n_flattened_primal_inputs = len(input_flatten_tree)
+        self.output_flatten_tree = output_flatten_tree
 
-        self.n_flattened_primal_outputs =  n_flattened_primal_outputs
+        # self.n_flattened_primal_inputs = len(input_flatten_tree)
+
+        self.n_flattened_primal_outputs =  len(output_flatten_tree)
 
         # Keys look like _tensor_constant0
         self.vjp_input_nondiff_attr2node = vjp_input_nondiff_attrname2node
 
-        self.nodemap_raw2sumcot: Dict[Node, Node]
-
-        # Let esr.vjp() bind this in the reversed order.
-        self.input_cotangent: Union[Node, Sequence[Node]]
-
-        self.output_cotangent: Union[Node, Sequence[Node]]
+        self.nodemap_primal2sumcot: Dict[Node, Node] = nodemap_primal2sumcot
 
     def _from_flatten(
         self,
         jvp_inputs: List[Union[Node, Sequence[Node]]],
         tree: List[int]
-    ) -> Union[Node, FxConst]:
+    ) -> Node:
         if len(tree) == 1:
             [i] = tree
             return jvp_inputs[i]  # type: ignore
@@ -942,8 +1014,8 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
     def run(self):
         
         for cot_ph_pos, cot_ph in enumerate(self.primal_copier.cotangent_placeholders):
-            vjp_cotangent = self._from_flatten([self.input_cotangent], self.input_flatten_tree[cot_ph_pos])
-            self.primal_copier.nodemap_subg2vjp[cot_ph] = vjp_cotangent
+            vjp_in_cot = self._from_flatten([self.input_cotangent], self.output_flatten_tree[cot_ph_pos])
+            self.primal_copier.nodemap_subg2vjp[cot_ph] = vjp_in_cot
 
         for i, (root, graph) in enumerate(zip(self.modules, self.graphs)):
             self.current_module = root
@@ -967,34 +1039,12 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
     
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        raise EasierJitException(
-            "Cotangent part copier should not meet GET_ATTR Node"
-        )
+        self.primal_copier.if_get_attr(submod_path, attr_name, attr_val)
     
     def if_call_function(self, function):
         self.primal_copier.if_call_function(function)
     
     def if_output(self):
-        """
-        When without AD, a multi-res Node stands individually, it's from
-        tensor metadata level can we know it's multi-res.
-
-        However, in torch.func.jvp sub-Graph, the primal multi-res Node will
-        first be unpacked, then all primal result items are put in OUTPUT
-        Node's args[0] list, making it NO LONGER an individual Node.
-        When copying the sub-Graph into jvp Graph, we need to handle this.
-        """
-        jvp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
-
-        convert = self.primal_copier.nodemap_subg2vjp.__getitem__
-
-        if self.n_flattened_primal_outputs == 1:
-            self.output_cotangent = tree_map(jvp_subgraph_out[1], convert)
-        else:
-            self.output_cotangent = tree_map(
-                jvp_subgraph_out[self.n_flattened_primal_outputs:], convert
-            )
-
         """
         After traversing and copying all cotangent Nodes, we need to handle:
 
@@ -1002,7 +1052,25 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         -   Maintain the primal-Node-cotangent-Node
             and primal-Tensor-cotangent-Tensor relationships in VJP module.
         """
+        vjp_subgraph_out = cast(Sequence[Node], self.current_node.args[0])
+        convert = self.primal_copier.nodemap_subg2vjp.__getitem__
+        
+        vjp_out_cots = tree_map(vjp_subgraph_out[self.n_flattened_primal_outputs:], convert)
 
+        for i in range(self.primal_copier.n_flattened_primal_inputs):
+            vjp_primal = self._from_flatten(
+                self.primal_copier.vjp_input_primals, self.primal_copier.input_flatten_tree[i]
+            )
+            vjp_out_cot = vjp_out_cots[i]
+
+            if vjp_primal in self.nodemap_primal2sumcot:
+                vjp_out_cot_comp = self.nodemap_primal2sumcot[vjp_primal]
+                vjp_out_cot = self.vjp_graph.call_function(
+                    torch.add,
+                    (vjp_out_cot_comp, vjp_out_cot)
+                )
+        
+            self.nodemap_primal2sumcot[vjp_primal] = vjp_out_cot
 
     
     def if_call_method(self, method_name: str):
@@ -1019,7 +1087,10 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
 class Vjp(Jvp):
     # TODO the resultant module Vjp and Jvp are basically the same,
     # we may have a common base class like _VpBase
-    pass
+    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor], vectors: Sequence[esr.Tensor] | None = None):
+        super().__init__(inputs, outputs, vectors)
+
+        self.new_values: Sequence[esr.Tensor]
 
 def vjp(
     module: esr.Module,
@@ -1051,9 +1122,6 @@ def vjp(
     
     vjpm = _Vjp(inputs, outputs, vectors)
     vjp_transformer = VjpTransformer(module, vjpm).run()
-
-    for gen in reversed(vjp_transformer.cotangent_part_generators):
-        gen.run()
 
     gm = GraphModule(vjpm, vjp_transformer.vjp_graph)
     vjpm.graph_module = gm
