@@ -10,6 +10,7 @@ from .core.module import (
     hdf5, full, zeros, ones, full_like, zeros_like, ones_like, arange
 )
 from .core.autodiff.jvp import jvp
+from .core.autodiff.vjp import vjp
 from .core.jit import init, compile
 from .core.utils import logger, EasierJitException
 from . import numeric

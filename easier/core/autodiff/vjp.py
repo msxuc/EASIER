@@ -137,6 +137,8 @@ class VjpTransformer(EasierInterpreter):
         # Some primal Nodes will be replaced if it's decided to carry cotangent
         # during reverse traversal.
         for raw_node in graph.nodes:
+            if raw_node.op == FX.OUTPUT:
+                break
             vjp_primal_node = self._strict_map_raw_to_vjp(raw_node)
             self.nodemap_raw2primal[raw_node] = vjp_primal_node
         
@@ -157,21 +159,21 @@ class VjpTransformer(EasierInterpreter):
         # I.e. we don't allocate an esr.Tensor for such immediate tangents.
         self.vjp_tensors_attrpaths: Dict[esr.Tensor, str] = {}
 
-        for i, (input, vector) in enumerate(zip(
-            vjp_module.inputs, vjp_module.vectors
+        for i, (output, vector) in enumerate(zip(
+            vjp_module.outputs, vjp_module.vectors
         )):
-            self.tensormap_primal2cotangent[input] = vector
+            self.tensormap_primal2cotangent[output] = vector
 
-            self.vjp_tensors_attrpaths[input] = f'inputs.{i}'
+            self.vjp_tensors_attrpaths[output] = f'outputs.{i}'
             self.vjp_tensors_attrpaths[vector] = f'vectors.{i}'
 
 
-        for i, (output, product) in enumerate(zip(
-            vjp_module.outputs, vjp_module.products
+        for i, (input, product) in enumerate(zip(
+            vjp_module.inputs, vjp_module.products
         )):
-            self.tensormap_primal2cotangent[output] = product
+            self.tensormap_primal2cotangent[input] = product
 
-            self.vjp_tensors_attrpaths[output] = f'outputs.{i}'
+            self.vjp_tensors_attrpaths[input] = f'inputs.{i}'
             self.vjp_tensors_attrpaths[product] = f'products.{i}'
         
 
@@ -182,7 +184,12 @@ class VjpTransformer(EasierInterpreter):
         # of AOT target device like CUDA.
         self.const_name_allocator = SubmodNameAllocator('const')
 
-        self.cotangent_part_generators = []
+        self.bp_submod_name_allocator = SubmodNameAllocator('bp')
+
+        self.sr_map: Dict[
+            Union[esr.Selector, esr.Reducer],
+            Tuple[Union[esr.Selector, esr.Reducer], str]
+        ] = {}
 
     def _setup_vjp_module_attrs(self):
         """
@@ -216,6 +223,16 @@ class VjpTransformer(EasierInterpreter):
             self.vjp_module, attrname_hint
         )
         setattr(self.vjp_module, primal_attrname, const)
+
+        return primal_attrname
+    
+    def _ensure_bp_submod_attr(
+        self, bp: Union[esr.Selector, esr.Reducer], attrname_hint: str = ''
+    ) -> str:
+        primal_attrname = self.const_name_allocator.alloc_name(
+            self.vjp_module, attrname_hint
+        )
+        setattr(self.vjp_module, primal_attrname, bp)
 
         return primal_attrname
 
@@ -258,18 +275,26 @@ class VjpTransformer(EasierInterpreter):
     
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
-        pass
+        primal = self.nodemap_raw2primal[self.current_node]
+        if primal in self.nodemap_primal2sumcot:
+            cot = self.nodemap_primal2sumcot[primal]
+            if attr_val in self.tensormap_primal2cotangent:
+                grad_tensor = self.tensormap_primal2cotangent[attr_val]
+                path = self.vjp_tensors_attrpaths[grad_tensor]
+                grad_node = self.vjp_graph.get_attr(path)
+                self.vjp_graph.call_function(operator.setitem, (grad_node, (slice(None),), cot))
+
 
 
     def if_call_function(self, function: Callable) -> None:
         if function is operator.setitem:
             # A special syntactic Node for VJP to write the resultant primal
             # Tensors.
-            container, index, value = self.current_node.args
+            container, index, value = self.nodemap_raw2primal[self.current_node].args
             assert isinstance(container, Node)
             assert isinstance(value, Node)
 
-            if index != Ellipsis:
+            if index not in [slice(None), Ellipsis]:
                 raise NotImplementedError(
                     "EASIER VJP currently only supports setitem with Ellipsis"
                 )
@@ -302,7 +327,7 @@ class VjpTransformer(EasierInterpreter):
             return
 
         if function is operator.getitem:
-            container = self.current_node.args[0]
+            container, index = self.nodemap_raw2primal[self.current_node].args
             assert isinstance(container, Node)
             imeta = get_node_meta(container)
 
@@ -492,9 +517,11 @@ class VjpTransformer(EasierInterpreter):
                 k: self.nodemap_raw2primal[v]
                 for k, v in nondiff_inputs_attrname2raw.items()
             }
+
+            primal = self.nodemap_raw2primal[self.current_node]
             
             # Edit VJP primal Node
-            with self.vjp_graph.inserting_after(self.nodemap_raw2primal[self.current_node]):
+            with self.vjp_graph.inserting_after(primal):
                 input_primal_nodes = self._prepare_diffable_primals(
                     function, raw_node_diff_args
                 )
@@ -503,14 +530,17 @@ class VjpTransformer(EasierInterpreter):
                     gm, subg, self.vjp_graph,
                     flattened_input_tree, input_primal_nodes,
                     len(flattened_output_tree),
+                    self.current_node,
                     nondiff_inputs_attrname2vjp
                 ).run()
 
                 # TODO replace IO Nodes
+                raise NotImplementedError("replace primal IO Node")
 
             # Resume to insert at the end of VJP graph
             cotangent_copier = _TorchVjpSubGraphCotangentPartCopier(
                 gm, subg, self.vjp_graph, primal_copier,
+                cotangent,
                 flattened_output_tree,
                 nondiff_inputs_attrname2vjp,
                 self.nodemap_primal2sumcot
@@ -561,6 +591,69 @@ class VjpTransformer(EasierInterpreter):
 
         return vjp_node
 
+
+    def if_call_module(self, submod: Module):
+        primal_node = self.nodemap_raw2primal[self.current_node]
+
+        if isinstance(submod, esr.Module):
+            raise NotImplementedError()
+            # Nested easier.Module, must be JVP-ed.
+            # sub_jvp_transformer = JvpTransformer(self.root_jvp, submod).run()
+
+        # TODO make Selector/Reducer rules.
+
+        elif isinstance(submod, esr.Selector):
+            input = normalize_selector_call_into_args(
+                *self.current_node.args, **self.current_node.kwargs
+            )
+            assert isinstance(input, Node)
+            input_primal = self.nodemap_raw2primal[input]
+
+            # Don't use meta as it has fake 1000 bs
+            co_reducer_n = get_node_tensor_group(input).n
+
+            if primal_node in self.nodemap_primal2sumcot:
+                vjp_out_cot = self.nodemap_primal2sumcot[primal_node]
+
+                if submod not in self.sr_map:
+                    reducer = esr.Reducer(submod.easier_data_loader, n=co_reducer_n)
+                    reducer_name = self._ensure_bp_submod_attr(reducer, submod.easier_hint_name)
+                    self.sr_map[submod] = (reducer, reducer_name)
+                else:
+                    _, reducer_name = self.sr_map[submod]
+
+                cot_node = self.vjp_graph.call_module(reducer_name, (vjp_out_cot,))
+        
+                self.nodemap_primal2sumcot[input_primal] = cot_node
+
+
+        elif isinstance(submod, esr.Reducer):
+            if submod.reduce != 'sum':
+                raise NotImplementedError()
+
+            input_primal, out = normalize_reducer_call_into_args(
+                *primal_node.args, **primal_node.kwargs
+            )
+            assert isinstance(input_primal, Node)
+            if out is not None:
+                raise EasierJitException("cannot use Reducer(out=...)")
+
+            if primal_node in self.nodemap_primal2sumcot:
+                vjp_out_cot = self.nodemap_primal2sumcot[primal_node]
+
+                if submod not in self.sr_map:
+                    selector = esr.Selector(submod.easier_data_loader)
+                    selector_name = self._ensure_bp_submod_attr(selector, submod.easier_hint_name)
+                    self.sr_map[submod] = (selector, selector_name)
+                else:
+                    _, selector_name = self.sr_map[submod]
+
+                cot_node = self.vjp_graph.call_module(selector_name, (vjp_out_cot,))
+        
+                self.nodemap_primal2sumcot[input_primal] = cot_node
+
+        else:
+            assert False, 'unreachable'
 
     def _flatten(
         self,
@@ -782,6 +875,8 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         # Structural info about outputs
         #
         n_flattened_primal_outputs: int,
+        raw_node: Node,
+
         #
         # Structural info about non-diff-able inputs
         #
@@ -796,6 +891,7 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
 
         # self.jvp_input_tangents = jvp_input_tangents
 
+        self.raw_node = raw_node
 
 
         self.n_flattened_primal_inputs = len(input_flatten_tree)
@@ -904,12 +1000,33 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
             assert subg_input in self.nodemap_subg2vjp, \
                 "Sub-Graph Node's Node input must be in subg2jvp Node map"
         
-        jvp_node = self.vjp_graph.node_copy(
-            subg_node,
-            arg_transform=self.nodemap_subg2vjp.__getitem__  # type: ignore
-        )
+        ng = get_node_tensor_group(self.raw_node)
+        if ng is not None:
+            # Sometimes literal batch size 1000 (we picked for fake vjp run)
+            # appears in the arg list.
+            bs = ng.n
 
-        return jvp_node
+            def _map_with_bs(x):
+                if isinstance(x, Node):
+                    return self.nodemap_subg2vjp[x]
+                elif x == 1000:
+                    return bs
+                else:
+                    return x
+            
+            args = tree_map(subg_node.args, _map_with_bs)
+            kwargs = { k: tree_map(v, _map_with_bs) for k,v in subg_node.kwargs.items() }
+            vjp_node = self.vjp_graph.create_node(
+                subg_node.op, subg_node.target, args, kwargs, subg_node.name, subg_node.type
+            )
+        
+        else:
+            vjp_node = self.vjp_graph.node_copy(
+                subg_node,
+                arg_transform=self.nodemap_subg2vjp.__getitem__  # type: ignore
+            )
+
+        return vjp_node
     
     def if_call_function(self, function):
         jvp_node = self._strict_map_subg_to_jvp(
@@ -963,6 +1080,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         # vjp_input_primals: List[Union[Node, Sequence[Node]]],
 
         # jvp_input_tangents: List[Union[Node, Sequence[Node]]],
+        input_cotangent: Union[Node, Sequence[Node]],
         
         output_flatten_tree: List[List[int]],
 
@@ -987,6 +1105,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         # self.vjp_input_primals = vjp_input_primals
 
         # self.jvp_input_tangents = jvp_input_tangents
+        self.input_cotangent = input_cotangent
 
         self.output_flatten_tree = output_flatten_tree
 
@@ -1039,10 +1158,18 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
     
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val):
-        self.primal_copier.if_get_attr(submod_path, attr_name, attr_val)
-    
+        assert submod_path == ''
+        # attr_name looks like _tensor_constants0
+
+        self.primal_copier.nodemap_subg2vjp[self.current_node] = \
+            self.vjp_input_nondiff_attr2node[attr_name]
+
     def if_call_function(self, function):
-        self.primal_copier.if_call_function(function)
+        jvp_node = self.primal_copier._strict_map_subg_to_jvp(
+            self.current_node
+        )
+
+        self.primal_copier.nodemap_subg2vjp[self.current_node] = jvp_node
     
     def if_output(self):
         """
@@ -1084,18 +1211,97 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
         )
     
 
-class Vjp(Jvp):
+class Vjp(esr.Module):
     # TODO the resultant module Vjp and Jvp are basically the same,
     # we may have a common base class like _VpBase
-    def __init__(self, inputs: Sequence[esr.Tensor], outputs: Sequence[esr.Tensor], vectors: Sequence[esr.Tensor] | None = None):
-        super().__init__(inputs, outputs, vectors)
+    def __init__(
+        self,
+        new_values: Sequence[esr.Tensor],
+        inputs: Sequence[esr.Tensor],
+        outputs: Sequence[esr.Tensor],
+        vectors: Optional[Sequence[esr.Tensor]] = None
+    ):
+        super().__init__()
+        
+        self.new_values = new_values
 
-        self.new_values: Sequence[esr.Tensor]
+        # nn.ParamList is not actually a Sequence[Tensor] because it lacks
+        # __contains__.
+        self.inputs: Sequence[esr.Tensor] = \
+            torch.nn.ParameterList(inputs)  # type: ignore
+        self.outputs: Sequence[esr.Tensor] = \
+            torch.nn.ParameterList(outputs)  # type: ignore
+
+        if vectors is not None:
+            self._check_args_nondup_and_dtype(
+                list(inputs) + list(outputs) + list(vectors),
+                'inputs + outputs + vectors'
+            )
+
+            if len(vectors) != len(outputs):
+                raise ValueError(
+                    f"The number of vectors {len(vectors)} does not match the"
+                    f" number of outputs {len(outputs)}"
+                )
+            
+            for i, v in zip(outputs, vectors):
+                if i.dtype != v.dtype or i.shape != v.shape:
+                    raise ValueError(
+                        "Vector's dtype/shape does not match the output"
+                    )
+
+            self.vectors = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
+                vectors
+            ))
+
+        else:
+            self._check_args_nondup_and_dtype(
+                list(inputs) + list(outputs),
+                'inputs + outputs'
+            )
+
+            self.vectors = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
+                esr.Tensor(
+                    esr.zeros_like(output),
+                    mode=('partition' if output.is_partition else 'replicate')
+                )
+                for output in outputs
+            ))
+        
+
+        self.products = cast(Sequence[esr.Tensor], torch.nn.ParameterList(
+            esr.Tensor(
+                esr.zeros_like(input),
+                mode=('partition' if input.is_partition else 'replicate')
+            )
+            for input in inputs
+        ))
+
+        # Type hint for local _Jvp class created by esr.jvp()
+        self.graph_module: GraphModule
+    
+
+    def _check_args_nondup_and_dtype(
+        self, args: Sequence[esr.Tensor], param_name: str
+    ):
+        for pos, arg in enumerate(args):
+            if not arg.dtype.is_floating_point:
+                raise ValueError(
+                    f"The {pos}-th easier.Tensor does not have floating-point"
+                    f" dtype in {param_name}"
+                )
+
+        if len(set(args)) != len(args):
+            raise ValueError(
+                f"Some easier.Tensor gets specified multiple times"
+                f" in {param_name}"
+            )
+        
 
 def vjp(
     module: esr.Module,
-    inputs: Sequence[esr.Tensor],
     new_values: Sequence[esr.Tensor],
+    inputs: Sequence[esr.Tensor],
     outputs: Sequence[esr.Tensor],
     vectors: Optional[Sequence[esr.Tensor]] = None
 ) -> Vjp:
@@ -1120,7 +1326,7 @@ def vjp(
             
             self.graph_module()
     
-    vjpm = _Vjp(inputs, outputs, vectors)
+    vjpm = _Vjp(new_values, inputs, outputs, vectors)
     vjp_transformer = VjpTransformer(module, vjpm).run()
 
     gm = GraphModule(vjpm, vjp_transformer.vjp_graph)

@@ -14,6 +14,7 @@ from torch.fx import Node
 import easier as esr
 from easier.core.runtime.data_loader import InMemoryTensorLoader
 from easier.core.autodiff.jvp import Jvp, JvpTransformer
+from easier.core.autodiff.vjp import Vjp, VjpTransformer
 from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, \
     diff_rule_registry, differentiabilities
@@ -242,6 +243,70 @@ class TestJvp:
             ['h', 'uh', 'vh'],
             rtol=1e-5, atol=1e-6
         )
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
+class TestVjp:
+    def test_spmv(self):
+        nx = 30
+        ny = 20
+
+        _ne = nx * ny // 2
+        nnz = torch.randint(0, nx * ny, [_ne]).unique(sorted=True)
+        ne = nnz.shape[0]
+
+        Ae = torch.rand_like(nnz, dtype=torch.float64)
+        x = torch.rand(nx, dtype=torch.float64)
+        y = torch.zeros(ny, dtype=torch.float64)
+
+        # matrix form
+        A = torch.zeros([ny, nx], dtype=torch.float64)
+        A.flatten()[nnz] = Ae
+
+        class SpMV(esr.Module):
+            def __init__(self):
+                super().__init__()
+
+                p = torch.randperm(ne)
+                nnz2 = nnz[p]
+                s_idx = nnz2 % nx
+                r_idx = nnz2 // nx
+
+                self.Ae = esr.Tensor(Ae[p], mode='partition')
+                self.selector = esr.Selector(s_idx)
+                self.reducer = esr.Reducer(r_idx, ny)
+
+                self.x = esr.Tensor(x, mode='partition')
+                self.y = esr.Tensor(y, mode='partition')
+
+            def forward(self):
+                y = self.reducer(
+                    self.selector(self.x) * self.Ae
+                )
+                self.y[:] = y
+        
+        cot_y_datasrc = torch.rand_like(y)
+
+        raw = SpMV()
+        cot_y = esr.Tensor(cot_y_datasrc, mode='partition')
+        vjp = esr.vjp(raw, [raw.y], [raw.x], [raw.y], vectors=[cot_y]) # type: ignore
+        [vjp] = esr.compile([vjp], backend='torch') # type: ignore
+        vjp: Vjp
+
+        vjp()
+
+        esr_y = vjp.outputs[0].collect()
+        esr_gradx = vjp.products[0].collect()
+
+        # classical mv and jvp grounding
+        torch_y, vjpfunc = torch.func.vjp( # type: ignore
+            torch.mv,
+            A, x
+        )
+        torch_gradA, torch_gradx = vjpfunc(cot_y_datasrc)
+
+        torch.testing.assert_close(esr_y, torch_y)
+        torch.testing.assert_close(esr_gradx, torch_gradx)
 
 
 def _test_jvp(
