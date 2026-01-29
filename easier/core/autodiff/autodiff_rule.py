@@ -74,6 +74,7 @@ class DiffRuleBase:
     # Especially for 'self' param in torch yaml, use 'input' instead.
     diffable_params: Optional[List[str]] = None
 
+    output_differentiability: Union[Literal[True], List[bool]] = True
 
     def input_differentiability(
         self, *args, **kwargs
@@ -165,7 +166,12 @@ class DiffRuleBase:
             not a single Node such that indexing it will result in extra
             getitem Nodes.
 
-        -   EasierProxy for primal input Nodes
+        -   EasierProxies for primal input Nodes
+        -   EasierProxies for tangent input Nodes
+
+            A primal or tangent input Node may have structure e.g. tuple
+            if the raw arg is a nested structure.
+
         -   Constants remain constants
 
         Returns:
@@ -175,6 +181,30 @@ class DiffRuleBase:
             Resultant tangent items for a multiple-result operator.
             For primal item that doesn't have a tangent, the result item should
             be None.
+        """
+        raise NotImplementedError("Derived class should implement this")
+    
+    def vjp(self, *args, **kwargs):
+        """
+        Inputs:
+        -   Optional Union[EasierProxy, Tuple[EasierProxy]] for primal result
+            if needed.
+
+            NOTE: for multi-res op, this param for result is an explicit tuple,
+            not a single Node such that indexing it will result in extra
+            getitem Nodes.
+
+        -   EasierProxies for primal input Nodes
+        -   One EasierProxy for cotangent input Node
+
+            A primal or the cotangent input Node may have structure e.g. tuple
+            if the raw arg/result is a nested structure.
+
+        -   Constants remain constants
+
+        Returns:
+        -   List[Tensor/Proxy | Tuple[Tensor/Proxy]]:
+            Resultant cotangent items for each differentiable input.
         """
         raise NotImplementedError("Derived class should implement this")
     
@@ -279,6 +309,79 @@ class DiffRuleBase:
             lambda p: None if p is None else p.node
         )  # type: ignore
 
+    def inject_vjp_subgraph(
+        self,
+        primal_result: Union[Node, Sequence[Node]],
+        diff_input_names: List[str],
+        raw2primal: Dict[Node, Node],
+        cotangent: Union[Node, Sequence[Node]]
+    ) -> List[Union[Node, Sequence[Node]]]:
+        from easier.core.jit import EasierProxy, EasierTracer
+        from easier.core.autodiff.jvp import FxConst
+
+        vjp_graphs: List[Graph] = collect_meta(
+            primal_result, lambda n: n.graph, leaf_type=Node
+        )
+        assert len(set(vjp_graphs)) == 1
+        vjp_graph = vjp_graphs[0]
+
+        tracer = EasierTracer()
+        tracer.graph = vjp_graph
+
+        primal_result_proxies = []
+        if self.needs_result:
+            primal_proxy = tree_map(primal_result, lambda n: tracer.proxy(n))
+            primal_result_proxies = [primal_proxy]
+        
+
+        def _raw_arg_proxy(raw_arg):
+            if isinstance(raw_arg, FxConst.__args__):
+                return raw_arg
+            else:
+                assert raw_arg.graph is not vjp_graph
+
+                primal_arg = raw2primal[raw_arg]
+                # Including Node and nested structure -- will result in
+                # explicit getitem Nodes
+                return tracer.proxy(primal_arg)
+
+
+        # Tangent parameters are suffixed by _t .e.g input_t, other_t
+        kw_cotangent_proxy = tree_map(cotangent, tracer.proxy)
+
+        if self.fx_normalize_to_kwargs_only:
+            norm_kw_proxies = {
+                k: tree_map(raw, _raw_arg_proxy)
+                for k, raw in self.raw_normalized_kwargs.items()
+            }
+            res_cotangent_proxy = self.jvp(
+                *primal_result_proxies,
+                **norm_kw_proxies, **kw_cotangent_proxy
+            )
+
+        else:
+            args_proxies = tree_map(self.raw_node.args, _raw_arg_proxy)
+            kwargs_proxies = {
+                k: tree_map(raw, _raw_arg_proxy)
+                for k, raw in self.raw_node.kwargs.items()
+            }
+            res_cotangent_proxy = self.jvp(
+                *primal_result_proxies, *args_proxies,
+                **kwargs_proxies, **kw_cotangent_proxy
+            )
+        
+        assert get_node_meta(self.raw_node), \
+            f"Rule {self} should set metadata on the raw Node"
+        
+        res_cotangent_proxy: List[Union[
+            EasierProxy, Sequence[EasierProxy]
+        ]]
+        return tree_map(
+            res_cotangent_proxy,
+            lambda p: None if p is None else p.node
+        )  # type: ignore
+
+
 
 diff_rule_registry: Dict[Callable, Type[DiffRuleBase]] = {}
 differentiabilities: Dict[Callable, List[Differentiability]] = {}
@@ -309,6 +412,9 @@ class SetitemRule(DiffRuleBase):
         target_t[index] = input_t
 
         return target_t
+    
+    def vjp(self, *args, **kwargs):
+        raise EasierJitException("Setitem does not support VJP")
 
 diff_rule_registry[operator.setitem] = SetitemRule
 
@@ -357,6 +463,13 @@ class GetitemRule(DiffRuleBase):
 
     def jvp(self, input, index, input_t):
         return input_t[index]
+    
+    def vjp(self, input, index, cotangent):
+        input_diff = torch.zeros_like(input)
+
+        raise NotImplementedError("handle complex case of index to non-inplace style")
+
+        return [input_diff]
 
 diff_rule_registry[operator.getitem] = GetitemRule
 
@@ -376,6 +489,9 @@ class EsrSumRule(DiffRuleBase):
         # Roles.
         esr_sum = input_t.node.graph.call_function(esr.sum, (input_t.node,))
         return input_t.tracer.proxy(esr_sum)
+    
+    def vjp(self, input, cotangent: 'EasierProxy'):
+        return [cotangent.expand_as(input)]
 
 diff_rule_registry[esr.sum] = EsrSumRule
 
@@ -408,6 +524,13 @@ class EsrNormRule(DiffRuleBase):
         d = sum / norm_result
         return torch.where(norm_result == 0, 0, d)
 
+    def vjp(self, norm_result, input, cotangent, p=2):
+        if p != 2:
+            raise NotImplementedError(f"esr.norm p = {p} and != 2")
+        
+        d = cotangent * (input / norm_result)
+        return [torch.where(norm_result == 0, 0, d)]
+
 diff_rule_registry[esr.norm] = EsrNormRule
 
 
@@ -430,6 +553,12 @@ class TorchNormRule(DiffRuleBase):
         d = torch.sum(input_t * input) / norm_result
         return torch.where(norm_result == 0, 0, d)
 
+    def vjp(self, norm_result, input, cotangent, p=2):
+        if p != 2:
+            raise NotImplementedError(f"esr.norm p = {p} and != 2")
+        
+        d = cotangent * (input / norm_result)
+        return [torch.where(norm_result == 0, 0, d)]
 
 diff_rule_registry[torch.norm] = \
 diff_rule_registry[torch.ops.aten.norm] = \
@@ -482,7 +611,7 @@ class ClampRule(DiffRuleBase):
             return torch.where(input < max, input_t, max_t)
         else:
             return input_t
-
+    
 diff_rule_registry[torch.clamp] = \
 diff_rule_registry[torch.ops.aten.clamp] = \
     ClampRule
@@ -523,6 +652,14 @@ class PowRule(DiffRuleBase):
             return torch.zeros_like(input)
         else:
             return input_t * (exponent * torch.pow(input, exponent - 1))
+    
+
+    def vjp(self, input, exponent, cotangent):
+        if exponent == 0:
+            return [torch.zeros_like(input)]
+        else:
+            d = cotangent * (exponent * torch.pow(input, exponent - 1))
+            return [d]
 
 
 diff_rule_registry[operator.pow] = \

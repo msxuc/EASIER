@@ -84,7 +84,7 @@ class TestJvpTransformation:
 
                 sort, idxes = torch.sort(vc, dim=1)
 
-        with patch(f'{JvpTransformer.__module__}.tangent_rule_registry', new=reg):
+        with patch(f'{JvpTransformer.__module__}.diff_rule_registry', new=reg):
 
             m = M()
             jvpm = esr.jvp(m, [m.v], [])
@@ -112,6 +112,32 @@ class TestJvpTransformation:
             assert neg.target == torch.neg and neg.args == (add,)
 
             # the 2nd res item for sort has no tangent
+    
+    def test_no_jvp_ops(self):
+        # nest args; multi-res
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.x = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+    
+            def forward(self):
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
+
+                sort, idxes = torch.sort(vc, dim=1)
+
+                b = v0 < v1
+                torch.where(b, v0, v1)
+
+        m = M()
+        jvpm = esr.jvp(m, [m.x], [])
+        jvpm: Jvp
 
     def test_torch_jvp_ops(self):
         # nest args; multi-res
@@ -246,6 +272,63 @@ class TestJvp:
 
 
 @pytest.mark.usefixtures('dummy_dist_env')
+class TestVjpTransformer:
+
+    def test_rule(self):
+        # nest args; multi-res
+        reg: Dict[Callable, Type[DiffRuleBase]] = dict(diff_rule_registry)
+
+        class _Cat(DiffRuleBase):
+            diffable_params = ['tensors']
+            
+            def output_meta(self, tensors, dim):
+                return RuntimeTensorMeta(
+                    Role.DISTRIBUTED, (10, 2), torch.float32
+                )
+            
+            def vjp(self, tensors, dim, cotangent):
+                n = len(tensors)
+                return cotangent.chunk(n, dim=dim)
+        reg[torch.concat] = _Cat
+
+        class _Aminmax(DiffRuleBase):
+            diffable_params = ['input']
+            output_differentiability = [True, True]
+
+            def output_meta(self, input, dim, keepdim):
+                item_meta = RuntimeTensorMeta(
+                    Role.DISTRIBUTED, (10,), torch.float32
+                )
+                return [item_meta, item_meta]
+        reg[torch.aminmax] = _Aminmax
+
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+                self.amin_out = esr.Tensor(
+                    esr.zeros([10], dtype=torch.float32), mode='partition'
+                )
+
+            def forward(self):
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
+
+                amin, amax = torch.aminmax(vc, dim=1)
+
+                self.amin_out[:] = amin
+
+        with patch(f'{VjpTransformer.__module__}.diff_rule_registry', new=reg):
+
+            m = M()
+            vjpm = esr.vjp(m, [m.v], [])
+            vjpm: Jvp
+
+
+@pytest.mark.usefixtures('dummy_dist_env')
 class TestVjp:
     def test_spmv(self):
         nx = 30
@@ -289,7 +372,7 @@ class TestVjp:
 
         raw = SpMV()
         cot_y = esr.Tensor(cot_y_datasrc, mode='partition')
-        vjp = esr.vjp(raw, [raw.y], [raw.x], [raw.y], vectors=[cot_y]) # type: ignore
+        vjp = esr.vjp(raw, [raw.x], [raw.y], vectors=[cot_y]) # type: ignore
         [vjp] = esr.compile([vjp], backend='torch') # type: ignore
         vjp: Vjp
 

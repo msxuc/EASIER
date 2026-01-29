@@ -125,6 +125,24 @@ class VjpTransformer(EasierInterpreter):
                 _getattr_vals.add(attr_val)
         _SingleGetAttrValidator([module], [graph]).run()
 
+        class _ReadWriteValidator(EasierInterpreter):
+            def if_call_function(self, function):
+                if function is operator.setitem:
+                    container, index, value = self.current_node.args
+                    assert isinstance(container, Node)
+                    assert isinstance(value, Node)
+
+                    if container.op != FX.GET_ATTR:
+                        raise NotImplementedError(
+                            "EASIER VJP currently only supports setitem to"
+                            " GET_ATTR new_value Tensors"
+                        )
+                    
+                    if len(container.users) > 1:
+                        raise EasierJitException(
+                            "EASIER VJP currently only allows writing to"
+                            " a Tensor without any readers and only once."
+                        )
 
         super().__init__([module], [graph], reverse=True)
 
@@ -229,12 +247,12 @@ class VjpTransformer(EasierInterpreter):
     def _ensure_bp_submod_attr(
         self, bp: Union[esr.Selector, esr.Reducer], attrname_hint: str = ''
     ) -> str:
-        primal_attrname = self.const_name_allocator.alloc_name(
+        bp_attrname = self.bp_submod_name_allocator.alloc_name(
             self.vjp_module, attrname_hint
         )
-        setattr(self.vjp_module, primal_attrname, bp)
+        setattr(self.vjp_module, bp_attrname, bp)
 
-        return primal_attrname
+        return bp_attrname
 
     def _fake_eval_meta_ctor(self, shape, dtype):
         # Special function needed by get_value_runtime_info, to provide
@@ -276,11 +294,14 @@ class VjpTransformer(EasierInterpreter):
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
         primal = self.nodemap_raw2primal[self.current_node]
+
         if primal in self.nodemap_primal2sumcot:
             cot = self.nodemap_primal2sumcot[primal]
+
             if attr_val in self.tensormap_primal2cotangent:
                 grad_tensor = self.tensormap_primal2cotangent[attr_val]
                 path = self.vjp_tensors_attrpaths[grad_tensor]
+
                 grad_node = self.vjp_graph.get_attr(path)
                 self.vjp_graph.call_function(operator.setitem, (grad_node, (slice(None),), cot))
 
@@ -308,13 +329,6 @@ class VjpTransformer(EasierInterpreter):
             container_val = get_attr_value(self.raw_module, container)
             assert isinstance(container_val, esr.Tensor)
 
-            if container_val not in self.vjp_module.new_values:
-                # outputs are subset of new_values, not all new_values are
-                # bound with cotangents.
-                raise EasierJitException(
-                    "Primal setitem can only write to new_values Tensors"
-                )
-            
             if container_val in self.vjp_module.outputs:
                 cot_tensor = self.tensormap_primal2cotangent[container_val]
 
@@ -332,8 +346,8 @@ class VjpTransformer(EasierInterpreter):
             imeta = get_node_meta(container)
 
             if isinstance(imeta, Sequence):
-                # This is the raw Node for unpacking a tuple, has been handled
-                # when handling the multi-res raw Node.
+                # This is the raw Node for unpacking a tuple, will be handled
+                # when handling the multi-res raw Node in a few future steps.
                 return
 
         self._handle_operation(function)
@@ -342,11 +356,7 @@ class VjpTransformer(EasierInterpreter):
     def _try_prepare_get_cotangent(self, dfb: Union[DiffRuleBase, Differentiability]) -> Union[Node, Sequence[Node], None]:
         primal_node = self.nodemap_raw2primal[self.current_node]
 
-        if isinstance(dfb, Differentiability):
-            out_diff = dfb.output_differentiability
-        else:
-            dfb.input_differentiability()
-            out_diff = dfb.output_differentiability()
+        out_diff = dfb.output_differentiability
 
         if isinstance(out_diff, bool):
             assert out_diff == True
@@ -446,6 +456,25 @@ class VjpTransformer(EasierInterpreter):
             if cotangent is None:
                 return
             
+            primal_node = self.nodemap_raw2primal[self.current_node]
+
+            out_meta = get_node_meta(self.current_node)
+            if isinstance(out_meta, Sequence):  # multi-res Node
+                rule_jvp_result = []
+
+                for user_i, raw_getitem in enumerate(self.current_node.users):
+                    assert raw_getitem.target is operator.getitem
+                    _, item_i = raw_getitem.args
+                    assert isinstance(item_i, int)
+                    assert item_i == user_i
+
+                    primal_getitem = self.nodemap_raw2primal[raw_getitem]
+                    rule_jvp_result.append(primal_getitem)
+                
+                rule_jvp_result = tuple(rule_jvp_result)
+            else:
+                rule_jvp_result = primal_node
+            
             raw_node_diff_args = rule.input_differentiability(
                 *self.current_node.args, **self.current_node.kwargs
             )
@@ -454,7 +483,34 @@ class VjpTransformer(EasierInterpreter):
                 function, raw_node_diff_args
             )
 
-            rule.inject_vjp_subgraph()
+            # Append the VJP graph
+            input_cotangents = rule.inject_vjp_subgraph(
+                primal_node,
+                list(raw_node_diff_args.keys()),
+                self.nodemap_raw2primal,
+                cotangent
+            )
+
+            for ip, ic in zip(input_primal_nodes, input_cotangents):
+                if isinstance(ip, Node):
+                    assert isinstance(ic, Node)
+                    if ip in self.nodemap_primal2sumcot:
+                        self.nodemap_primal2sumcot[ip] = self.vjp_graph.call_function(
+                            torch.add, (self.nodemap_primal2sumcot[ip], ic)
+                        )
+                    else:
+                        self.nodemap_primal2sumcot[ip] = ic
+                
+                else:
+                    assert isinstance(ip, Sequence)
+                    assert isinstance(ic, Sequence)
+                    for sub_ip, sub_ic in zip(ip, ic):
+                        if sub_ip in self.nodemap_primal2sumcot:
+                            self.nodemap_primal2sumcot[sub_ip] = self.vjp_graph.call_function(
+                                torch.add, (self.nodemap_primal2sumcot[sub_ip], sub_ic)
+                            )
+                        else:
+                            self.nodemap_primal2sumcot[sub_ip] = sub_ic
 
         
         else: # not in diff_rule_registry
@@ -518,10 +574,10 @@ class VjpTransformer(EasierInterpreter):
                 for k, v in nondiff_inputs_attrname2raw.items()
             }
 
-            primal = self.nodemap_raw2primal[self.current_node]
+            primal_node = self.nodemap_raw2primal[self.current_node]
             
             # Edit VJP primal Node
-            with self.vjp_graph.inserting_after(primal):
+            with self.vjp_graph.inserting_after(primal_node):
                 input_primal_nodes = self._prepare_diffable_primals(
                     function, raw_node_diff_args
                 )
@@ -534,9 +590,6 @@ class VjpTransformer(EasierInterpreter):
                     nondiff_inputs_attrname2vjp
                 ).run()
 
-                # TODO replace IO Nodes
-                raise NotImplementedError("replace primal IO Node")
-
             # Resume to insert at the end of VJP graph
             cotangent_copier = _TorchVjpSubGraphCotangentPartCopier(
                 gm, subg, self.vjp_graph, primal_copier,
@@ -546,30 +599,39 @@ class VjpTransformer(EasierInterpreter):
                 self.nodemap_primal2sumcot
             ).run()
 
-            # if isinstance(out_diff, bool):
-            #     assert isinstance(primal_copier.output_primal, Node)
-            #     assert out_diff == True
-            #     self.nodemap_raw2primal[self.current_node] = \
-            #         primal_copier.output_primal
+            if isinstance(out_diff, bool):
+                assert isinstance(primal_copier.output_primal, Node)
+                assert out_diff == True
+                primal_node.replace_all_uses_with(primal_copier.output_primal)
+                self.vjp_graph.erase_node(primal_node)
+
+                self.nodemap_raw2primal[self.current_node] = \
+                    primal_copier.output_primal
             
-            # else:
-            #     assert isinstance(primal_copier.output_primal, Sequence)
-            #     assert isinstance(out_diff, Sequence)
+            else:
+                assert isinstance(primal_copier.output_primal, Sequence)
+                assert isinstance(out_diff, Sequence)
 
-            #     # NOTE it's likely the RAW multi-res Node doesn't have
-            #     # explicit primal/tangent counterpart Nodes, so we can only
-            #     # set up binding on the unpacking getitem Nodes.
+                # NOTE it's likely the RAW multi-res Node doesn't have
+                # explicit primal/tangent counterpart Nodes, so we can only
+                # set up binding on the unpacking getitem Nodes.
 
-            #     for raw_getitem in self.current_node.users:
-            #         assert raw_getitem.target is operator.getitem
-            #         _, item_i = raw_getitem.args
-            #         assert isinstance(item_i, int)
+                for raw_getitem in self.current_node.users:
+                    assert raw_getitem.target is operator.getitem
+                    _, item_i = raw_getitem.args
+                    assert isinstance(item_i, int)
 
-            #         self.nodemap_raw2primal[raw_getitem] = \
-            #             primal_copier.output_primal[item_i]
-            # # endif out_diff
+                    primal_getitem = self.nodemap_raw2primal[raw_getitem]
+                    primal_getitem.replace_all_uses_with(
+                        primal_copier.output_primal[item_i]
+                    )
+                    self.vjp_graph.erase_node(primal_getitem)
 
-            # self.cotangent_part_generators.append(cotangent_copier)
+                    self.nodemap_raw2primal[raw_getitem] = \
+                        primal_copier.output_primal[item_i]
+                
+                self.vjp_graph.erase_node(primal_node)
+            # endif out_diff
 
 
     def _strict_map_raw_to_vjp(self, raw: Node):
@@ -1216,15 +1278,12 @@ class Vjp(esr.Module):
     # we may have a common base class like _VpBase
     def __init__(
         self,
-        new_values: Sequence[esr.Tensor],
         inputs: Sequence[esr.Tensor],
         outputs: Sequence[esr.Tensor],
         vectors: Optional[Sequence[esr.Tensor]] = None
     ):
         super().__init__()
         
-        self.new_values = new_values
-
         # nn.ParamList is not actually a Sequence[Tensor] because it lacks
         # __contains__.
         self.inputs: Sequence[esr.Tensor] = \
@@ -1300,7 +1359,6 @@ class Vjp(esr.Module):
 
 def vjp(
     module: esr.Module,
-    new_values: Sequence[esr.Tensor],
     inputs: Sequence[esr.Tensor],
     outputs: Sequence[esr.Tensor],
     vectors: Optional[Sequence[esr.Tensor]] = None
@@ -1308,12 +1366,7 @@ def vjp(
     """
     Args:
     -   inputs: primal input Tensors of `module`, cannot be written.
-    -   new_values:
-            output Tensors to store the primal output values,
-            cannot be overlapping with `inputs`.
-    -   outputs:
-            subset of `new_values`, cotangents for this subset of outputs
-            will be passed-in in the resultant VJP module.
+    -   outputs: primal output Tensors of `module`, can only be written and written once.
     -   vectors: User-defined cotangent Tensors for primal Tensors `outputs`.
     """
 
@@ -1326,7 +1379,7 @@ def vjp(
             
             self.graph_module()
     
-    vjpm = _Vjp(new_values, inputs, outputs, vectors)
+    vjpm = _Vjp(inputs, outputs, vectors)
     vjp_transformer = VjpTransformer(module, vjpm).run()
 
     gm = GraphModule(vjpm, vjp_transformer.vjp_graph)
