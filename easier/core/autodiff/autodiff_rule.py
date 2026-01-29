@@ -55,6 +55,7 @@ class Differentiability:
     # items as input items.
     output_differentiability: Union[Literal[True], List[bool]] = True
 
+    # TODO this is actually shared by all Differentiability overloadings.
     kwargs_normalizer: Callable[[Callable, tuple, dict], Dict[str, FxArg]] = \
         fx_normalize_function_variant_into_kwargs
 
@@ -346,17 +347,16 @@ class DiffRuleBase:
                 return tracer.proxy(primal_arg)
 
 
-        # Tangent parameters are suffixed by _t .e.g input_t, other_t
-        kw_cotangent_proxy = tree_map(cotangent, tracer.proxy)
+        cotangent_proxy = [tree_map(cotangent, tracer.proxy)]
 
         if self.fx_normalize_to_kwargs_only:
             norm_kw_proxies = {
                 k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_normalized_kwargs.items()
             }
-            res_cotangent_proxy = self.jvp(
-                *primal_result_proxies,
-                **norm_kw_proxies, **kw_cotangent_proxy
+            res_cotangent_proxy = self.vjp(
+                *primal_result_proxies, *cotangent_proxy,
+                **norm_kw_proxies
             )
 
         else:
@@ -365,9 +365,9 @@ class DiffRuleBase:
                 k: tree_map(raw, _raw_arg_proxy)
                 for k, raw in self.raw_node.kwargs.items()
             }
-            res_cotangent_proxy = self.jvp(
-                *primal_result_proxies, *args_proxies,
-                **kwargs_proxies, **kw_cotangent_proxy
+            res_cotangent_proxy = self.vjp(
+                *primal_result_proxies, *args_proxies, *cotangent_proxy,
+                **kwargs_proxies
             )
         
         assert get_node_meta(self.raw_node), \
@@ -417,61 +417,6 @@ class SetitemRule(DiffRuleBase):
         raise EasierJitException("Setitem does not support VJP")
 
 diff_rule_registry[operator.setitem] = SetitemRule
-
-
-class GetitemRule(DiffRuleBase):
-    fx_normalize_to_kwargs_only = False
-
-    def input_differentiability(
-        self, input, index
-    ) -> Dict[str, Union[FxConst, Node, Sequence[Node]]]:
-        return {'input': input}
-
-    def output_meta(self, input, index):
-        imeta = get_node_meta(input)
-        assert isinstance(imeta, RuntimeTensorMeta), \
-            "Tuple unpacking is handled elsewhere"
-        
-        # there may be nested Proxies in `index` e.g.
-        # `X[:, self.i:self.j]` where i j are ()-shape int tensors.
-        if not isinstance(index, tuple):
-            index = (index,)
-        
-        def _maybe_zero_index_tensor(pos):
-            if isinstance(pos, Node):
-                pos_meta = get_node_meta(pos)
-                assert isinstance(pos_meta, RuntimeTensorMeta)
-                index_val = torch.zeros(pos_meta.shape, dtype=torch.int64)
-                return index_val
-            else:
-                return pos
-        
-        index_vals = []
-        for pos in index:
-            if isinstance(pos, (slice, range)):
-                index_val = type(pos)(*[
-                    _maybe_zero_index_tensor(item)
-                    for item in [pos.start, pos.stop, pos.step]
-                ])
-            else:
-                index_val = _maybe_zero_index_tensor(pos)
-
-            index_vals.append(index_val)
-
-        out_shp = tuple(torch.zeros(imeta.shape)[*index_vals].shape)
-        return RuntimeTensorMeta(imeta.role, out_shp, imeta.dtype)
-
-    def jvp(self, input, index, input_t):
-        return input_t[index]
-    
-    def vjp(self, input, index, cotangent):
-        input_diff = torch.zeros_like(input)
-
-        raise NotImplementedError("handle complex case of index to non-inplace style")
-
-        return [input_diff]
-
-diff_rule_registry[operator.getitem] = GetitemRule
 
 
 class EsrSumRule(DiffRuleBase):
@@ -686,6 +631,26 @@ diff_rule_registry[torch.pow] = \
 
 
 #
+# getitem, depending on index being scalars, slices, tensors,
+# will lead to a lot of backprop aten::op calls for each kind of indexing
+#
+
+def getitem_aux_kw(input, index):
+    return input[index]
+def _normalize_operator_getitem(op, args, kwargs):
+    input, index = args
+    return { 'input': input, 'index': index }
+differentiabilities[operator.getitem] = \
+differentiabilities[getitem_aux_kw] = [
+    Differentiability(
+        ['input'],
+        [('index', required)],
+        kwargs_normalizer=_normalize_operator_getitem
+    )
+]
+
+
+#
 # Ops not in derivatives.yaml
 #
 
@@ -696,10 +661,27 @@ differentiabilities[torch.ops.aten.add_] = [
     )
 ]
 
+differentiabilities[torch.aminmax] = [
+    Differentiability(
+        ['input'],
+        [('dim', None), ('keepdim', None)],
+
+        # TODO VJP not supported by torch yet
+        output_differentiability=[True, True]
+    )
+]
+
 differentiabilities[torch.concat] = [
     Differentiability(
         ['tensors'],
         [('dim', 0)]
+    )
+]
+
+differentiabilities[torch.frexp] = [
+    Differentiability(
+        ['input'],
+        output_differentiability=[True, True]
     )
 ]
 

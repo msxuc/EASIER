@@ -25,6 +25,32 @@ from easier.core.runtime.metadata import Role, RuntimeTensorMeta, \
 FxConst: TypeAlias = Union[_FxConstBase, slice, range, EllipsisType, None]
 
 
+def create_zero_arg_val(
+    raw_node_arg: Union[Node, Sequence[Node]]
+) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
+    """
+    `raw_node_arg` is an argument of raw Graph Node, it may be a nested
+    structure,
+    e.g. torch.cat Node may have `args[0] == [x1, x2, x3]`.
+    e.g. getitem may have `args == (input, (slice(), 3, slice()))`
+    
+    The result may also be a nested structure of many zero tensors.
+
+    Always on CPU.
+    """
+    def _make(x):
+        if isinstance(x, Node):
+            meta = get_node_meta(x)
+            assert isinstance(meta, RuntimeTensorMeta), \
+                "Value of ARG Node cannot be nested structure"
+
+            return torch.zeros(meta.shape, dtype=meta.dtype)
+        else:
+            return x
+
+    return tree_map(raw_node_arg, _make)  # type: ignore
+
+
 class PrimalMetaPropagator(EasierInterpreter):
     def _fake_eval_meta_ctor(self, shape, dtype):
         # Special function needed by get_value_runtime_info, to provide
@@ -39,29 +65,6 @@ class PrimalMetaPropagator(EasierInterpreter):
 
         return RuntimeTensorMeta(role, shape, dtype)
 
-    def _create_zero_val(
-        self, raw_node_arg: Union[Node, Sequence[Node]]
-    ) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
-        """
-        `raw_node_arg` is an argument of raw Graph Node, it may be a nested
-        structure,
-        e.g. torch.cat Node may have `args[0] == [x1, x2, x3]`.
-        
-        The result may also be a nested structure of many zero tensors.
-
-        Always on CPU.
-        """
-        def _make(x):
-            assert isinstance(x, Node), \
-                "In a list, Node and scalar are not expected to be mixed"
-
-            meta = get_node_meta(x)
-            assert isinstance(meta, RuntimeTensorMeta), \
-                "Value of arg Node cannot be nested structure"
-
-            return torch.zeros(meta.shape, dtype=meta.dtype)
-
-        return tree_map(raw_node_arg, _make)  # type: ignore
     
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
         # Avoid circle import
@@ -89,8 +92,7 @@ class PrimalMetaPropagator(EasierInterpreter):
         
     def _handle_operation(self, function: Callable):
         from easier.core.autodiff.autodiff_rule import \
-    Differentiability, RequiredParam, \
-    diff_rule_registry, differentiabilities
+            diff_rule_registry, differentiabilities, getitem_aux_kw
 
         if function in diff_rule_registry:
             rule_cls = diff_rule_registry[function]
@@ -103,17 +105,24 @@ class PrimalMetaPropagator(EasierInterpreter):
         
         else:
             if getattr(operator, function.__name__, None) is function:
-                if function is operator.truediv:
+                if function is operator.getitem:
+                    # Special path, see differentiabilities[operator.getitem]
+                    function = getitem_aux_kw
+                elif function is operator.truediv:
                     function = torch.div  # torch does not have truediv
                 else:
                     function = getattr(torch, function.__name__)
 
-            raw_node_normalized_kwargs: Dict[str, FxArg] = \
-                fx_normalize_function_variant_into_kwargs(
-                    function, self.current_node.args, self.current_node.kwargs
-                )  # type: ignore
             dfbs = differentiabilities[function]
             for dfb in dfbs:
+                # TODO this is actually shared by all Differentiability
+                # overloadings.
+                raw_node_normalized_kwargs: Dict[str, FxArg] = \
+                    dfb.kwargs_normalizer(
+                        function,
+                        self.current_node.args,
+                        self.current_node.kwargs
+                    )  # type: ignore
                 if dfb.all_param_names() == set(
                     raw_node_normalized_kwargs.keys()
                 ):
@@ -124,16 +133,10 @@ class PrimalMetaPropagator(EasierInterpreter):
                     f" with Differentiabilities {dfbs}," \
                     f" got {raw_node_normalized_kwargs}"
             
-            raw_node_diff_args: Dict[
-                str, Union[FxConst, Node, Sequence[Node]]
-            ] = {
-                p: raw_node_normalized_kwargs[p] for p in dfb.diffable_params
-            }  # type: ignore
-
             kwvals = {
                 k: tree_map(
-                    v, self._create_zero_val
-                ) if isinstance(v, Node) else v
+                    v, create_zero_arg_val
+                ) if not isinstance(v, FxConst.__args__) else v
                 for k, v in raw_node_normalized_kwargs.items()
             }
             fake_res = function(**kwvals)

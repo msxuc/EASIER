@@ -29,8 +29,8 @@ from easier.core.autodiff.jvp import Jvp
 
 from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, RequiredParam, \
-    diff_rule_registry, differentiabilities
-from easier.core.autodiff.utils import PrimalMetaPropagator, simplify_torchfunc_fx_graph, FxConst
+    diff_rule_registry, differentiabilities, getitem_aux_kw
+from easier.core.autodiff.utils import PrimalMetaPropagator, create_zero_arg_val, simplify_torchfunc_fx_graph, FxConst
 from easier.core.utils import EasierJitException
 
 _T = TypeVar('_T')
@@ -267,30 +267,19 @@ class VjpTransformer(EasierInterpreter):
 
         return RuntimeTensorMeta(role, shape, dtype)
     
-    def _create_zero_val(
-        self, raw_node_arg: Union[Node, Sequence[Node]]
+
+    def _create_zero_cotangent(
+        self, raw_node: Node
     ) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
-        """
-        `raw_node_arg` is an argument of raw Graph Node, it may be a nested
-        structure,
-        e.g. torch.cat Node may have `args[0] == [x1, x2, x3]`.
-        
-        The result may also be a nested structure of many zero tensors.
-
-        Always on CPU.
-        """
         def _make(x):
-            assert isinstance(x, Node), \
-                "In a list, Node and scalar are not expected to be mixed"
+            assert isinstance(x, RuntimeTensorMeta)
+            return torch.zeros(x.shape, dtype=x.dtype)
 
-            meta = get_node_meta(x)
-            assert isinstance(meta, RuntimeTensorMeta), \
-                "Value of arg Node cannot be nested structure"
+        meta = get_node_meta(raw_node)
+        return tree_map(meta, _make)
+        
 
-            return torch.zeros(meta.shape, dtype=meta.dtype)
 
-        return tree_map(raw_node_arg, _make)  # type: ignore
-    
 
     def if_get_attr(self, submod_path: str, attr_name: str, attr_val) -> None:
         primal = self.nodemap_raw2primal[self.current_node]
@@ -329,7 +318,7 @@ class VjpTransformer(EasierInterpreter):
             container_val = get_attr_value(self.raw_module, container)
             assert isinstance(container_val, esr.Tensor)
 
-            if container_val in self.vjp_module.outputs:
+            if container_val in self.tensormap_primal2cotangent:
                 cot_tensor = self.tensormap_primal2cotangent[container_val]
 
                 cot_attrname = self.vjp_tensors_attrpaths[cot_tensor]
@@ -379,7 +368,12 @@ class VjpTransformer(EasierInterpreter):
             missing = any(comp is None for comp in comps)
 
             if missing:
-                assert all(comp is None for comp in comps), "TODO"
+                if not all(comp is None for comp in comps):
+                    raise NotImplementedError(
+                        "For the call to multiple-result operator"
+                        f" {self.current_node.target}, some of its result"
+                        " components have cotangent while some do not"
+                    )
                 return None
 
             meta = get_node_meta(self.current_node)
@@ -515,7 +509,10 @@ class VjpTransformer(EasierInterpreter):
         
         else: # not in diff_rule_registry
             if getattr(operator, function.__name__, None) is function:
-                if function is operator.truediv:
+                if function is operator.getitem:
+                    # Special path, see differentiabilities[operator.getitem]
+                    function = getitem_aux_kw
+                elif function is operator.truediv:
                     function = torch.div  # torch does not have truediv
                 else:
                     function = getattr(torch, function.__name__)
@@ -527,12 +524,17 @@ class VjpTransformer(EasierInterpreter):
                     f"Operator {function} is not registered in EASIER AutoDiff"
                 )
 
-            raw_node_normalized_kwargs: Dict[str, FxArg] = \
-                fx_normalize_function_variant_into_kwargs(
-                    function, self.current_node.args, self.current_node.kwargs
-                )  # type: ignore
             dfbs = differentiabilities[function]
+
             for dfb in dfbs:
+                # TODO this is actually shared by all Differentiability
+                # overloadings.
+                raw_node_normalized_kwargs: Dict[str, FxArg] = \
+                    dfb.kwargs_normalizer(
+                        function,
+                        self.current_node.args,
+                        self.current_node.kwargs
+                    )  # type: ignore
                 if dfb.all_param_names() == set(
                     raw_node_normalized_kwargs.keys()
                 ):
@@ -589,6 +591,9 @@ class VjpTransformer(EasierInterpreter):
                     self.current_node,
                     nondiff_inputs_attrname2vjp
                 ).run()
+            
+            # TODO it seems unnecessary to have two Copiers, can be refactored
+            # to just one and two sub-phases.
 
             # Resume to insert at the end of VJP graph
             cotangent_copier = _TorchVjpSubGraphCotangentPartCopier(
@@ -795,7 +800,7 @@ class VjpTransformer(EasierInterpreter):
 
                 # for a list-typed arg, we assume no mix of Node and scalar.
                 jvp_diff_primal_vals[diff_param] = \
-                    self._create_zero_val(raw_node_diff_arg)  # type: ignore
+                    create_zero_arg_val(raw_node_diff_arg)  # type: ignore
                 
         nondiff_val2raw: Dict[torch.Tensor, Node] = {}
 
@@ -804,15 +809,24 @@ class VjpTransformer(EasierInterpreter):
             raw_node_nondiff_arg = raw_normalized_kwargs[nondiff_param_name]
 
             if isinstance(raw_node_nondiff_arg, Sequence):
-                raise NotImplementedError("Nested non-differentiable arg")
-                # PyTorch unlikely has this.
+                if function is getitem_aux_kw:
+                    index_nodes = collect_meta(raw_node_nondiff_arg, leaf_type=Node)
+                    if len(index_nodes) != 0:
+                        raise NotImplementedError(
+                            "Using indices like `:self.i` in getitem is not supported"
+                        )
+                    jvp_nondiff_val = raw_node_nondiff_arg
+
+                else:
+                    raise NotImplementedError("Nested non-differentiable arg")
+                    # PyTorch unlikely has this.
             
-            if isinstance(raw_node_nondiff_arg, Node):
+            elif isinstance(raw_node_nondiff_arg, Node):
                 # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph,
                 # we can rely on the identity of this nondiff_val and the
                 # attrname like "_tensor_constants0" to connect JVP-graph
                 # nondiff-arg Nodes and the GET_ATTR Nodes in the subgraph.
-                jvp_nondiff_val = self._create_zero_val(raw_node_nondiff_arg)
+                jvp_nondiff_val = create_zero_arg_val(raw_node_nondiff_arg)
                 assert isinstance(jvp_nondiff_val, torch.Tensor)
 
                 nondiff_val2raw[jvp_nondiff_val] = raw_node_nondiff_arg
@@ -865,17 +879,15 @@ class VjpTransformer(EasierInterpreter):
                     " partially non-differentiable outputs like torch.sort"
                 )
 
-        # y_meta = get_node_meta(self.current_node)
-        # y_positions, y_meta_items = self._flatten([y_meta], leaf_type=RuntimeTensorMeta)
-
-        cotangent_vals = [self._create_zero_val(self.current_node)]
+        # NOTE strictly speaking a cotangent is not the exactly same as an arg,
+        # because a cotangent is isomorphic to the result of a Node, which
+        # may be NESTED, but an arg will never be nested -- but many args may
+        # form a nested structure in the arg list.
+        cotangent_val = self._create_zero_cotangent(self.current_node)
 
         flattened_primal_tree, flattened_primal_vals = \
             self._flatten(diff_primal_vals)
 
-        # flattened_tangent_tree, flattened_tangent_vals = \
-        #     _flatten(tangent_vals)
-        # assert flattened_primal_tree == flattened_tangent_tree
 
         # Other non-differentiable parameters must NOT be passed via jvp()
         # API param list, but via function closure.
@@ -903,14 +915,14 @@ class VjpTransformer(EasierInterpreter):
         
         def _vjp(
             flattened_primals: Tuple[torch.Tensor, ...],
-            cotangents: Tuple[torch.Tensor, ...]
+            cotangent: Union[torch.Tensor, Sequence[torch.Tensor]]
         ):
             y, vjpfun = torch.func.vjp(_primal_func, *flattened_primals) # type: ignore
-            res_cot = vjpfun(*cotangents) # type: ignore
+            res_cot = vjpfun(cotangent) # type: ignore
             return y, res_cot
         
         gm: GraphModule = make_fx(_vjp)(
-            flattened_primal_vals, cotangent_vals
+            flattened_primal_vals, cotangent_val
         )
 
         jvp_nondiff_attrname2raw: Dict[str, Node] = {}
@@ -997,7 +1009,12 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
                 self.for_each_node()
 
                 for user in node.users:
-                    has_met_primal_output = has_met_primal_output or user.op == FX.OUTPUT
+                    if user.op == FX.OUTPUT:
+                        if user.args[0][0] is node:
+                            # Must be 0-th, because sometimes in vjp subgraph
+                            # an argument cotangent will be directly returned,
+                            # e.g. A + B => dA = d; dB = d
+                            has_met_primal_output = True
 
                 if has_met_primal_output:
                     output_i += 1

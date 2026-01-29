@@ -113,7 +113,7 @@ class TestJvpTransformation:
 
             # the 2nd res item for sort has no tangent
     
-    def test_no_jvp_ops(self):
+    def test_no_tangent_flow_ops(self):
         # nest args; multi-res
         class M(esr.Module):
             def __init__(self):
@@ -138,6 +138,14 @@ class TestJvpTransformation:
         m = M()
         jvpm = esr.jvp(m, [m.x], [])
         jvpm: Jvp
+
+        v, v0, v1, vc, sort, sort0, sort1, lt, where = \
+            jvpm.graph_module.graph.nodes
+
+        assert sort.target == torch.sort
+        assert lt.target == operator.lt
+        assert where.target == torch.where
+
 
     def test_torch_jvp_ops(self):
         # nest args; multi-res
@@ -325,9 +333,9 @@ class TestVjpTransformer:
 
             m = M()
             vjpm = esr.vjp(m, [m.v], [])
-            vjpm: Jvp
+            vjpm: Vjp
 
-    def test_no_vjp_ops(self):
+    def test_no_cotangent_flow_ops(self):
         # nest args; multi-res
         class M(esr.Module):
             def __init__(self):
@@ -344,22 +352,42 @@ class TestVjpTransformer:
                 v1 = self.v[:, 1:2]
                 vc = torch.concat([v0, v1], dim=1)
 
-                sort, idxes = torch.sort(vc, dim=1)
+                m0, m1 = torch.aminmax(vc, dim=1)
 
                 b = v0 < v1
-                torch.where(b, v0, v1)
+                torch.where(b, m0, m1)
 
         m = M()
-        jvpm = esr.jvp(m, [m.not_used], [])
-        jvpm: Jvp
+        vjpm = esr.vjp(m, [m.not_used], [])
+        vjpm: Vjp
+
+        v, v0, v1, vc, minmax, mm0, mm1, lt, where = \
+            vjpm.graph_module.graph.nodes
+
+        assert minmax.target == torch.aminmax
+        assert lt.target == operator.lt
+        assert where.target == torch.where
 
     def test_torch_vjp_ops(self):
         # nest args; multi-res
         class M(esr.Module):
             def __init__(self):
                 super().__init__()
+
+                # inputs
                 self.v = esr.Tensor(
-                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                    esr.zeros([10, 3], dtype=torch.float32), mode='replicate'
+                )
+
+                # outputs
+                self.u = esr.Tensor(
+                    esr.zeros([10, 10], dtype=torch.float32), mode='replicate'
+                )
+                self.s = esr.Tensor(
+                    esr.zeros([2], dtype=torch.float32), mode='replicate'
+                )
+                self.vh = esr.Tensor(
+                    esr.zeros([2, 2], dtype=torch.float32), mode='replicate'
                 )
     
             def forward(self):
@@ -367,14 +395,28 @@ class TestVjpTransformer:
                 v1 = self.v[:, 1:2]
                 vc = torch.concat([v0, v1], dim=1)
 
-                v0, v1 = torch.aminmax(vc, dim=1)
+                U, S, Vh = torch.linalg.svd(vc)
 
                 b = v0 < v1
-                torch.where(b, v0, v1)
+                u = torch.where(b, U, U + 1)
 
+                self.u[:] = u
+                self.s[:] = S
+                self.vh[:] = Vh
+        
         m = M()
-        jvpm = esr.jvp(m, [m.v], [])
-        jvpm: Jvp
+        vjpm = esr.vjp(m, [m.v], [m.u, m.s, m.vh])
+        vjpm: Vjp
+
+        v, v0, v1, vc, svd, U, S, Vh, lt, Up1, where, \
+            u, set_u, s, set_s, vh, set_vh, \
+            cot_vh, cot_s, cot_u, \
+            *LOTS_OF_BP_NODES_FOR_GETITEM = \
+                vjpm.graph_module.graph.nodes
+
+        assert svd.target == torch.frexp
+        assert lt.target == operator.lt
+        assert where.target == torch.where
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestVjp:
