@@ -327,6 +327,54 @@ class TestVjpTransformer:
             vjpm = esr.vjp(m, [m.v], [])
             vjpm: Jvp
 
+    def test_no_vjp_ops(self):
+        # nest args; multi-res
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.not_used = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+    
+            def forward(self):
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
+
+                sort, idxes = torch.sort(vc, dim=1)
+
+                b = v0 < v1
+                torch.where(b, v0, v1)
+
+        m = M()
+        jvpm = esr.jvp(m, [m.not_used], [])
+        jvpm: Jvp
+
+    def test_torch_vjp_ops(self):
+        # nest args; multi-res
+        class M(esr.Module):
+            def __init__(self):
+                super().__init__()
+                self.v = esr.Tensor(
+                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                )
+    
+            def forward(self):
+                v0 = self.v[:, 0:1]
+                v1 = self.v[:, 1:2]
+                vc = torch.concat([v0, v1], dim=1)
+
+                v0, v1 = torch.aminmax(vc, dim=1)
+
+                b = v0 < v1
+                torch.where(b, v0, v1)
+
+        m = M()
+        jvpm = esr.jvp(m, [m.v], [])
+        jvpm: Jvp
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestVjp:
