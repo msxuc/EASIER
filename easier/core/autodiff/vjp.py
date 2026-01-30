@@ -330,7 +330,7 @@ class VjpTransformer(EasierInterpreter):
             return
 
         if function is operator.getitem:
-            container, index = self.nodemap_raw2primal[self.current_node].args
+            container, index = self.current_node.args
             assert isinstance(container, Node)
             imeta = get_node_meta(container)
 
@@ -579,7 +579,7 @@ class VjpTransformer(EasierInterpreter):
             primal_node = self.nodemap_raw2primal[self.current_node]
             
             # Edit VJP primal Node
-            with self.vjp_graph.inserting_after(primal_node):
+            with self.vjp_graph.inserting_before(primal_node.next):
                 input_primal_nodes = self._prepare_diffable_primals(
                     function, raw_node_diff_args
                 )

@@ -347,7 +347,7 @@ class DiffRuleBase:
                 return tracer.proxy(primal_arg)
 
 
-        cotangent_proxy = [tree_map(cotangent, tracer.proxy)]
+        cotangent_proxy = tree_map(cotangent, tracer.proxy)
 
         if self.fx_normalize_to_kwargs_only:
             norm_kw_proxies = {
@@ -355,7 +355,8 @@ class DiffRuleBase:
                 for k, raw in self.raw_normalized_kwargs.items()
             }
             res_cotangent_proxy = self.vjp(
-                *primal_result_proxies, *cotangent_proxy,
+                *primal_result_proxies,
+                cotangent=cotangent_proxy,
                 **norm_kw_proxies
             )
 
@@ -366,7 +367,8 @@ class DiffRuleBase:
                 for k, raw in self.raw_node.kwargs.items()
             }
             res_cotangent_proxy = self.vjp(
-                *primal_result_proxies, *args_proxies, *cotangent_proxy,
+                *primal_result_proxies, *args_proxies,
+                cotangent=cotangent_proxy,
                 **kwargs_proxies
             )
         
@@ -631,10 +633,11 @@ diff_rule_registry[torch.pow] = \
 
 
 #
-# getitem, depending on index being scalars, slices, tensors,
-# will lead to a lot of backprop aten::op calls for each kind of indexing
+# Python-syntax getitem, depending on index being scalars, slices, tensors,
+# will lead to a lot of backprop aten::op calls for each kind of indexing.
 #
-
+# We add a aux, kwargs-style method to go into the torch.vjp pipeline.
+#
 def getitem_aux_kw(input, index):
     return input[index]
 def _normalize_operator_getitem(op, args, kwargs):

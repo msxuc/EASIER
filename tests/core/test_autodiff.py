@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 from unittest.mock import patch
 import pytest
 import torch
-from torch.fx import Node
+from torch.fx import Node, Graph
 
 import easier as esr
 from easier.core.runtime.data_loader import InMemoryTensorLoader
@@ -295,28 +295,35 @@ class TestVjpTransformer:
                 )
             
             def vjp(self, tensors, dim, cotangent):
-                n = len(tensors)
-                return cotangent.chunk(n, dim=dim)
+                d0 = cotangent[:, 3:4]
+                d1 = cotangent[:, 4:5]
+                return [[d0, d1]]
         reg[torch.concat] = _Cat
 
         class _Aminmax(DiffRuleBase):
             diffable_params = ['input']
             output_differentiability = [True, True]
 
-            def output_meta(self, input, dim, keepdim):
+            def output_meta(self, input, *, dim, keepdim):
                 item_meta = RuntimeTensorMeta(
                     Role.DISTRIBUTED, (10,), torch.float32
                 )
                 return [item_meta, item_meta]
+            def vjp(self, input, cotangent, *, dim, keepdim):
+                grad = torch.abs(input)
+                return [grad]
         reg[torch.aminmax] = _Aminmax
 
         class M(esr.Module):
             def __init__(self):
                 super().__init__()
                 self.v = esr.Tensor(
-                    esr.zeros([10, 3], dtype=torch.float32), mode='partition'
+                    esr.zeros([10, 7], dtype=torch.float32), mode='partition'
                 )
                 self.amin_out = esr.Tensor(
+                    esr.zeros([10], dtype=torch.float32), mode='partition'
+                )
+                self.amax_out = esr.Tensor(
                     esr.zeros([10], dtype=torch.float32), mode='partition'
                 )
 
@@ -328,12 +335,21 @@ class TestVjpTransformer:
                 amin, amax = torch.aminmax(vc, dim=1)
 
                 self.amin_out[:] = amin
+                self.amax_out[:] = amax
 
         with patch(f'{VjpTransformer.__module__}.diff_rule_registry', new=reg):
 
             m = M()
-            vjpm = esr.vjp(m, [m.v], [])
+            vjpm = esr.vjp(m, [m.v], [m.amin_out, m.amax_out])
             vjpm: Vjp
+
+        v, v0, v1, vc, aminmax, m0, m1, \
+            amin, set_amin, amax, set_amax, \
+            cot_amax, cot_amin, grad_vc, \
+            *LOTS_OF_BP_NODES = \
+                vjpm.graph_module.graph.nodes
+        
+        assert grad_vc.target == torch.abs
 
     def test_no_cotangent_flow_ops(self):
         # nest args; multi-res
@@ -380,14 +396,8 @@ class TestVjpTransformer:
                 )
 
                 # outputs
-                self.u = esr.Tensor(
+                self.y = esr.Tensor(
                     esr.zeros([10, 10], dtype=torch.float32), mode='replicate'
-                )
-                self.s = esr.Tensor(
-                    esr.zeros([2], dtype=torch.float32), mode='replicate'
-                )
-                self.vh = esr.Tensor(
-                    esr.zeros([2, 2], dtype=torch.float32), mode='replicate'
                 )
     
             def forward(self):
@@ -395,28 +405,71 @@ class TestVjpTransformer:
                 v1 = self.v[:, 1:2]
                 vc = torch.concat([v0, v1], dim=1)
 
-                U, S, Vh = torch.linalg.svd(vc)
+                m0, m1 = torch.aminmax(vc)
 
                 b = v0 < v1
-                u = torch.where(b, U, U + 1)
+                u = torch.where(b, m0, m1)
 
-                self.u[:] = u
-                self.s[:] = S
-                self.vh[:] = Vh
+                self.y[:] = u
         
-        m = M()
-        vjpm = esr.vjp(m, [m.v], [m.u, m.s, m.vh])
-        vjpm: Vjp
+        def _fake_amm_vjp(primals_1, cotangents_1, cotangents_2):
+            ret1, ret2 = torch.aminmax(primals_1)
+            ret1 = torch.neg(ret1)
+            ret2 = torch.pow(ret2, 2)
+            grad = torch.abs(primals_1) * cotangents_1 + ret2
+            return [ret1, ret2, grad]
+        
+        from torch.fx.experimental.proxy_tensor import make_fx as _orig_make_fx
+        def _fake_make_fx(_vjp):
+            if any(
+                c.cell_contents is torch.aminmax
+                for c in _vjp.__closure__[0].cell_contents.__closure__
+            ):
+                def _wrapped(*args):
+                    return torch.fx.symbolic_trace(_fake_amm_vjp)
+                return _wrapped
+            else:
+                return _orig_make_fx(_vjp)
+        
+        with patch(f'{VjpTransformer.__module__}.make_fx', new=_fake_make_fx):
+            m = M()
+            vjpm = esr.vjp(m, [m.v], [m.y])
+            vjpm: Vjp
 
-        v, v0, v1, vc, svd, U, S, Vh, lt, Up1, where, \
-            u, set_u, s, set_s, vh, set_vh, \
-            cot_vh, cot_s, cot_u, \
-            *LOTS_OF_BP_NODES_FOR_GETITEM = \
+        v, v0, v1, vc, \
+            aminmax, m0, m1, neg, pow, \
+            lt, where, y, set_y, \
+            cot_y, \
+            const0L, dwhere_left, const0R, dwhere_right, sum_mA, sum_mB, \
+            abs, mul, add, \
+            dcat_0, dcat_1, dv1, dv0, dv, \
+            cot_v, set_cot_y = \
                 vjpm.graph_module.graph.nodes
 
-        assert svd.target == torch.frexp
+        assert aminmax.target == torch.aminmax
         assert lt.target == operator.lt
-        assert where.target == torch.where
+        assert where.target is torch.ops.aten.where.self \
+            and where.args == (lt, neg, pow)
+
+        assert cot_y.target == 'vectors.0'
+        assert dwhere_left.target is torch.ops.aten.where.self \
+            and dwhere_left.args == (lt, const0L, cot_y)
+        assert dwhere_right.target is torch.ops.aten.where.self \
+            and dwhere_right.args == (lt, cot_y, const0R)
+
+        assert abs.target == torch.abs and abs.args == (vc,)
+        assert mul.target == operator.mul and mul.args[:1] == (abs,)
+        # ...and with one sum_mX
+        assert add.target == operator.add and add.args == (mul, pow)
+
+        assert dv1.target is torch.ops.aten.slice_backward.default \
+            and dv1.args[0] == dcat_1
+        assert dv0.target is torch.ops.aten.slice_backward.default \
+            and dv0.args[0] == dcat_0
+        assert dv.target == torch.add
+
+        assert cot_v.target == 'products.0'
+        assert set_cot_y.target == operator.setitem
 
 @pytest.mark.usefixtures('dummy_dist_env')
 class TestVjp:

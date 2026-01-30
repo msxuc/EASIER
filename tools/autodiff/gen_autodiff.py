@@ -371,7 +371,7 @@ def dump_torch_jvp_differentiabilities_file(
     
     fp = os.path.join(
         os.path.dirname(__file__),
-        '../../easier/core/autodiff/torch_jvp_differentiabilities.py'
+        '../../easier/core/autodiff/torch_differentiabilities.py'
     )
     with open(fp, 'w') as fs:
         fs.write(
