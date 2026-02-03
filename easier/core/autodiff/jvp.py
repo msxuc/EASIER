@@ -47,7 +47,8 @@ class JvpTransformer(EasierInterpreter):
         module: esr.Module,
         jvp_module: 'Jvp',
     ):
-        [module], [graph] = collectively_initialize_and_validate([module])
+        # coll_init returns all nested esr.Modules, here we takes only the top
+        (module, *_), (graph, *_) = collectively_initialize_and_validate([module])
         [module], [graph] = group_tensors([module], [graph])
 
         _getattr_vals = set()
@@ -380,29 +381,19 @@ class JvpTransformer(EasierInterpreter):
         assert callable(self.current_node.target)
         assert getattr(operator, self.current_node.target.__name__) \
             is self.current_node.target
-
-        enforced_dtype = None
-
-        for arg in self.current_node.args:
-            if arg in self.nodemap_raw2tangent:
-                # Given this is an syntactic operator, if any operand
-                # has tangent, other constants must be of floating-point dtype
-                # to be handled by torch.func.jvp().
-                enforced_dtype = torch.float32
+        
+        if self.current_node.target is operator.getitem:
+            enforced_dtype = None
+        else:
+            enforced_dtype = torch.float32
 
         for arg_i, const in enumerate(list(self.current_node.args)):
             if isinstance(const, (int, float)):
                 with self.current_graph.inserting_before(self.current_node):
 
-                    # NOTE this raw const node doesn't have propert device
-                    # option, therefore it's a BAD Node. But we are not going
-                    # to evaluate the raw Node, only to fulfill the assumption
-                    # that raw Node holds the metadata.
+                    const_tensor_val = torch.full((), const, dtype=enforced_dtype)
                     raw_operand_node = self.current_graph.call_function(
-                        print, ("should never be evaluated",) 
-                    )
-                    const_tensor_val = torch.full(
-                        (), const, dtype=enforced_dtype
+                        torch.full, ((), const), { 'dtype': enforced_dtype }
                     )
 
                     self.current_node.update_arg(arg_i, raw_operand_node)
@@ -597,7 +588,7 @@ class JvpTransformer(EasierInterpreter):
                     "Failed to resolve overloading:" \
                     f" with Differentiabilities {dfbs}," \
                     f" got {raw_node_normalized_kwargs}"
-            
+
             raw_node_diff_args: Dict[
                 str, Union[FxConst, Node, Sequence[Node]]
             ] = {
@@ -754,6 +745,7 @@ class JvpTransformer(EasierInterpreter):
         jvp_node = self.jvp_graph.node_copy(
             raw, arg_transform=nodemap.__getitem__
         )
+        jvp_node.meta = {}
 
         return jvp_node
 
@@ -907,7 +899,7 @@ class JvpTransformer(EasierInterpreter):
                 raise NotImplementedError("Nested non-differentiable arg")
                 # PyTorch unlikely has this.
             
-            if isinstance(raw_node_nondiff_arg, Node):
+            elif isinstance(raw_node_nondiff_arg, Node):
                 # Will result in GET_ATTR[tensor_contants0] Nodes in subgraph,
                 # we can rely on the identity of this nondiff_val and the
                 # attrname like "_tensor_constants0" to connect JVP-graph
@@ -919,7 +911,7 @@ class JvpTransformer(EasierInterpreter):
 
             else:
                 assert raw_node_nondiff_arg is None \
-                    or isinstance(raw_node_nondiff_arg, (int, float, str))
+                    or isinstance(raw_node_nondiff_arg, (int, float, str, slice))
                 jvp_nondiff_val = raw_node_nondiff_arg
 
             # TODO this takes effect even user specifies the value to be
@@ -1179,6 +1171,7 @@ class _TorchJvpSubGraphCopier(EasierInterpreter):
             subg_node,
             arg_transform=self._nodemap_subg2jvp.__getitem__  # type: ignore
         )
+        jvp_node.meta = {}
 
         return jvp_node
     
@@ -1391,7 +1384,7 @@ def jvp(
             # zero-initialize them every time, since uninvolved tensors will
             # have zero tangents.
             for p in self.products:
-                p.zero_()
+                p[:] = 0
 
             # The JvpTransformer-generated Graph will be inlined here.
             # 

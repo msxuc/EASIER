@@ -34,6 +34,14 @@ differentiabilities[torch.ops.aten.clone] = [
     ),
 ]
 
+differentiabilities[torch.cos] = \
+differentiabilities[torch.ops.aten.cos] = [
+    Differentiability(
+        ['input', ],
+        [],
+    ),
+]
+
 differentiabilities[torch.diag_embed] = \
 differentiabilities[torch.ops.aten.diag_embed] = [
     Differentiability(
@@ -80,6 +88,14 @@ differentiabilities[torch.ops.aten.neg] = [
 
 differentiabilities[torch.sign] = \
 differentiabilities[torch.ops.aten.sign] = [
+    Differentiability(
+        ['input', ],
+        [],
+    ),
+]
+
+differentiabilities[torch.sin] = \
+differentiabilities[torch.ops.aten.sin] = [
     Differentiability(
         ['input', ],
         [],

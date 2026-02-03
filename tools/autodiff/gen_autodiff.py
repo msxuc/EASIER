@@ -438,6 +438,7 @@ op_ns_names = [
 
     'clone',
     'concat',
+    'cos',
     'diag_embed',
     'div',
     'einsum',
@@ -455,6 +456,7 @@ op_ns_names = [
     # 'pow',
 
     'sign',
+    'sin',
     'sub',
     'sub_',
     'sum',

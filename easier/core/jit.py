@@ -45,7 +45,8 @@ class EasierProxy(Proxy):
         """
 
         # Prompt common errors.
-        if name in ['shape', 'size', 'dim', 'ndim', 'numel', 'nelement']:
+        if name in ['shape', 'dim', 'ndim', 'numel', 'nelement']:
+        # if name in ['shape', 'size', 'dim', 'ndim', 'numel', 'nelement']:
             raise NotImplementedError(
                 "Currently EASIER does not support accessing common"
                 " hyperparameter information '" + name + "' during tracing."

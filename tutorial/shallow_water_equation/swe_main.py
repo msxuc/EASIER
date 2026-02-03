@@ -11,7 +11,7 @@ import easier as esr
 
 
 class ShallowWaterEquation(esr.Module):
-    def __init__(self, mesh_path: str, sw_path: str, dt=0.005, device='cpu') -> None:
+    def __init__(self, mesh_path: str, sw_path: str, dt=0.005, device='cpu', for_backprop=False) -> None:
         super().__init__()
 
         self.dt = dt
@@ -81,6 +81,18 @@ class ShallowWaterEquation(esr.Module):
             esr.zeros((self.nc,), dtype=torch.double), mode='partition'
         )
 
+        self.for_backprop = for_backprop
+        if for_backprop:
+            self.h_new = esr.Tensor(
+                esr.hdf5(sw_path, 'h', dtype=torch.double), mode='partition'
+            )
+            self.uh_new = esr.Tensor(
+                esr.zeros((self.nc,), dtype=torch.double), mode='partition'
+            )
+            self.vh_new = esr.Tensor(
+                esr.zeros((self.nc,), dtype=torch.double), mode='partition'
+            )
+
         self.to(device)
 
     def face_reconstruct(self, phi):
@@ -133,15 +145,21 @@ class ShallowWaterEquation(esr.Module):
             self.uh + self.dt * delta_uh3,
             self.vh + self.dt * delta_vh3,)
 
-        self.h.add_(
+        h_delta = \
             self.dt / 6 * (delta_h1 + delta_h2 + delta_h3 + delta_h4)
-        )
-        self.uh.add_(
+        uh_delta = \
             self.dt / 6 * (delta_uh1 + delta_uh2 + delta_uh3 + delta_uh4)
-        )
-        self.vh.add_(
+        vh_delta = \
             self.dt / 6 * (delta_vh1 + delta_vh2 + delta_vh3 + delta_vh4)
-        )
+
+        if not self.for_backprop:
+            self.h.add_(h_delta)
+            self.uh.add_(uh_delta)
+            self.vh.add_(vh_delta)
+        else:
+            self.h_new[:] = self.h + h_delta
+            self.uh_new[:] = self.uh + uh_delta
+            self.vh_new[:] = self.vh + vh_delta
 
 
 if __name__ == "__main__":

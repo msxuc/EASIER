@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from torch import nn
 from torch.fx.graph import Graph
@@ -53,6 +53,11 @@ class CsrSelectorInserter(EasierInterpreter[None]):
         self.tgrp2reducer = tgrp2reducer
         self.selector_name_allocator = SubmodNameAllocator('csr_selector')
 
+        self.csr_selector_cache: Dict[
+            Tuple[EasierTensorGroup, esr.Reducer],
+            Tuple[esr.Selector, Dict[esr.Module, str]]
+        ] = {}
+
     def if_call_module(self, submod: nn.Module) -> None:
         if not isinstance(submod, esr.Reducer):
             return
@@ -69,29 +74,47 @@ class CsrSelectorInserter(EasierInterpreter[None]):
         bound_reducer = self.tgrp2reducer[tgrp]
         if bound_reducer is not submod:
 
-            # TODO reuse selector instance if <tgrp, reducer> met.
+            insert_type = 'reuse'
 
-            selector_attrname = self.selector_name_allocator.alloc_name(
-                self.current_module, hint=self.current_node.name
-            )
+            if (tgrp, submod) not in self.csr_selector_cache:
+                selector_attrname = self.selector_name_allocator.alloc_name(
+                    self.current_module, hint=self.current_node.name
+                )
 
-            # Collectively create and insert.
-            # During module dumping, this Selector will be dumped
-            # as normal Selectors, and during loading this Selector will be
-            # created again -- it's ok as this is merely a data loader,
-            # till its `.idx` get directly overwritten with the loaded data.
-            csr_selector = esr.Selector(esr.arange(
-                submod.easier_data_loader.shape[0],
-                dtype=submod.easier_data_loader.dtype,
-                device=submod.easier_data_loader.device
-            ))
-            csr_selector.easier_hint_name = \
-                f"{submod.easier_hint_name}.{selector_attrname}"
-            # TODO if we reuse the Selector instance the naming will be
-            # as consistent as dataflow_distribution
-            # f"{submod.easier_hint_name}.reorderingSelector"
+                # Collectively create and insert.
+                # During module dumping, this Selector will be dumped
+                # as normal Selectors, and during loading this Selector will be
+                # created again -- it's ok as this is merely a data loader,
+                # till its `.idx` get directly overwritten with the loaded data.
+                csr_selector = esr.Selector(esr.arange(
+                    submod.easier_data_loader.shape[0],
+                    dtype=submod.easier_data_loader.dtype,
+                    device=submod.easier_data_loader.device
+                ))
+                csr_selector.easier_hint_name = \
+                    f"{submod.easier_hint_name}.{selector_attrname}"
+                
+                self.current_module.add_module(selector_attrname, csr_selector)
 
-            self.current_module.add_module(selector_attrname, csr_selector)
+                self.csr_selector_cache[(tgrp, submod)] = (
+                    csr_selector, { self.current_module: selector_attrname }
+                )
+
+                insert_type = 'alloc'
+            
+            else:
+                csr_selector, attrname_cache = self.csr_selector_cache[(tgrp, submod)]
+
+                if self.current_module not in attrname_cache:
+                    selector_attrname = self.selector_name_allocator.alloc_name(
+                        self.current_module, hint=self.current_node.name
+                    )
+                    self.current_module.add_module(selector_attrname, csr_selector)
+                    
+                    attrname_cache[self.current_module] = selector_attrname
+                
+                else:
+                    selector_attrname = attrname_cache[self.current_module]
 
             with self.current_graph.inserting_before(self.current_node):
                 csr_selector_node = self.current_graph.call_module(
@@ -101,7 +124,10 @@ class CsrSelectorInserter(EasierInterpreter[None]):
                     input_node, csr_selector_node
                 )
 
-            logger.info(f"Insert arange-Selector for {self.current_node.name}")
+            logger.info(
+                f"Insert arange-Selector for {self.current_node.name}"
+                f" ({insert_type})"
+            )
 
 
 def bind_reducer(modules: List[esr.Module], graphs: List[Graph]):

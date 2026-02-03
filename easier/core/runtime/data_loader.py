@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from easier.core.runtime.dist_env import \
-    get_default_dist_env, get_runtime_dist_env
+    get_default_dist_env
 from easier.core.runtime.utils import check_collective_equality
 from easier.core.utils import EasierJitException
 
@@ -161,7 +161,7 @@ class DataLoaderBase:
         raise NotImplementedError()
 
     def _pre_partially_load_by_chunk(self, chunk_size):
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         assert dist_env.rank == 0, \
             "Loading-by-chunk is only available on rank-0"
 
@@ -373,7 +373,7 @@ class InMemoryTensorLoader(DataLoaderBase):
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         world_size = dist_env.world_size
         rank = dist_env.rank
         orig_len = self.tensor.shape[0]
@@ -497,7 +497,7 @@ class H5DataLoader(DataLoaderBase):
         if self.dtype.is_floating_point:
             raise NotImplementedError("Not supporting floats yet")
 
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         if dist_env.rank == 0:
             # TODO basically this is only used for idx, which are ints,
             # but if we want this to be a universal component, we need to
@@ -531,7 +531,7 @@ class H5DataLoader(DataLoaderBase):
             raise NotImplementedError("simplify for Reducer.fullness cases")
         assert isinstance(amax, int)
 
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         if dist_env.rank == 0:
             nunique = 0
 
@@ -589,7 +589,7 @@ class H5DataLoader(DataLoaderBase):
                 yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         rank = dist_env.rank
 
         orig_len = self.shape[0]
@@ -648,7 +648,7 @@ class H5DataLoader(DataLoaderBase):
         """
         sorted_index, sort_pos = torch.sort(index, stable=True)
 
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
 
         orig_len = self.shape[0]
         sub_shape = self.shape[1:]
@@ -799,7 +799,7 @@ class FulledTensorLoader(DataLoaderBase):
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
         start, end = _get_offset_exactly_nparts(
@@ -886,7 +886,7 @@ class ArangeTensorLoader(DataLoaderBase):
             yield chunk
 
     def partially_load_by_rank(self) -> Tuple[torch.Tensor, int, int]:
-        dist_env = get_runtime_dist_env()
+        dist_env = get_default_dist_env()
         rank = dist_env.rank
         orig_len = self.shape[0]
         offset_start, offset_end = _get_offset_exactly_nparts(

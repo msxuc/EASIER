@@ -2,7 +2,8 @@
 # Licensed under the MIT License.
 
 import itertools
-from typing import List, Tuple, Union, cast
+import operator
+from typing import TYPE_CHECKING, List, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -15,6 +16,10 @@ from easier.core.utils import EasierJitException
 import easier.core.module as _EsrMod
 
 from easier.core.runtime.utils import check_collective_equality
+
+if TYPE_CHECKING:
+    from easier.core.autodiff.vjp import Jvp
+    from easier.core.autodiff.vjp import Vjp
 
 
 class SyntaxChecker(EasierInterpreter):
@@ -105,6 +110,19 @@ def validate_idx_range(
                 f" must be smaller than {hint_name}.n {n}"
             )
 
+def _copy_autodiff_graph(ad_mod: Union['Jvp', 'Vjp']):
+    ad_g = Graph()
+    ad_g.graph_copy(ad_mod.graph_module.graph, {})
+
+    with ad_g.inserting_before(list(ad_g.nodes)[0]):
+        # at the head of the AD graph
+        for i in range(len(ad_mod.products)):
+            p = ad_g.get_attr(f'products.{i}')
+            ad_g.call_function(
+                operator.setitem, (p, slice(None), 0)
+            )
+    
+    return ad_g
 
 def collectively_initialize_and_validate(
     top_modules: List[_EsrMod.Module]
@@ -126,6 +144,8 @@ def collectively_initialize_and_validate(
     # avoid cyclic import
     from easier.core.jit import EasierTracer
     from easier.core.dump import ConstantsCollector
+    from easier.core.autodiff.jvp import Jvp
+    from easier.core.autodiff.vjp import Vjp
 
     modules: List[_EsrMod.Module] = []
 
@@ -135,9 +155,16 @@ def collectively_initialize_and_validate(
             modules.append(obj)
 
         obj.easier_hint_name = names[0]
-
+    
     tracer = EasierTracer()
-    graphs: List[Graph] = [tracer.trace(m) for m in modules]
+
+    def _trace(m: _EsrMod.Module):
+        if isinstance(m, (Jvp, Vjp)):
+            return _copy_autodiff_graph(m)
+        else:
+            return tracer.trace(m)
+
+    graphs: List[Graph] = [_trace(m) for m in modules]
 
     #
     # Check EASIER-specific syntax

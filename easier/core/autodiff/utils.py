@@ -51,6 +51,38 @@ def create_zero_arg_val(
     return tree_map(raw_node_arg, _make)  # type: ignore
 
 
+def wrap_operator_specific_kwargs_normalizer(
+    normalizer: Callable[[Callable, tuple, dict], Dict[str, FxArg]]
+) -> Callable[[Callable, tuple, dict], Dict[str, FxArg]]:
+    # Python syntactic operator like 1+a may have operands being ints, which
+    # is unsupported by standard FX normalizer.
+    def _wrap(function_variant, args: tuple, kwargs: dict):
+        assert len(args) <= 2
+        assert len(kwargs) == 0
+        mapping = {}
+        f_args = []
+        for arg in args:
+            # getitem is not allowed here, so only possibilities are int/float
+            if isinstance(arg, (int, float)):
+                f_arg = torch.tensor([1.0])
+                mapping[f_arg] = arg
+                arg = f_arg
+            f_args.append(arg)
+
+        d = normalizer(function_variant, tuple(f_args), kwargs)
+
+        # Revert f_arg above back to raw arg
+        d_raw = {}
+        for k, v in d.items():
+            if v in mapping:
+                v = mapping[v]
+            d_raw[k] = v
+        
+        return d_raw
+
+    return _wrap
+
+
 class PrimalMetaPropagator(EasierInterpreter):
     def _fake_eval_meta_ctor(self, shape, dtype):
         # Special function needed by get_value_runtime_info, to provide
@@ -104,21 +136,27 @@ class PrimalMetaPropagator(EasierInterpreter):
             set_node_meta(self.current_node, out_meta)
         
         else:
+            wrap_normalizer = lambda f: f
+
             if getattr(operator, function.__name__, None) is function:
                 if function is operator.getitem:
                     # Special path, see differentiabilities[operator.getitem]
                     function = getitem_aux_kw
                 elif function is operator.truediv:
                     function = torch.div  # torch does not have truediv
+                    wrap_normalizer = wrap_operator_specific_kwargs_normalizer
                 else:
                     function = getattr(torch, function.__name__)
+                    wrap_normalizer = wrap_operator_specific_kwargs_normalizer
 
             dfbs = differentiabilities[function]
             for dfb in dfbs:
                 # TODO this is actually shared by all Differentiability
                 # overloadings.
                 raw_node_normalized_kwargs: Dict[str, FxArg] = \
-                    dfb.kwargs_normalizer(
+                    (
+                        wrap_normalizer(dfb.kwargs_normalizer)
+                    )(
                         function,
                         self.current_node.args,
                         self.current_node.kwargs
