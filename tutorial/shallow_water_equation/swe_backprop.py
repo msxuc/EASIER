@@ -15,6 +15,7 @@ if swe_dir not in sys.path:
     sys.path.append(swe_dir)
 from swe_main import ShallowWaterEquation  # type: ignore
 
+
 class Swap(esr.Module):
     def __init__(self, eqn: ShallowWaterEquation):
         super().__init__()
@@ -30,9 +31,10 @@ class Obj(esr.Module):
         super().__init__()
         self.eqn = eqn
         self.loss = esr.Tensor(torch.tensor([0.0], dtype=torch.float64), mode='replicate')
+        self.target_h = esr.Tensor(esr.hdf5(TARGET_H_HDF5, 'h'), mode='partition')
     
     def forward(self):
-        loss = esr.sum(self.eqn.h)
+        loss = esr.norm(self.eqn.h - self.target_h)
         self.loss[:] = loss
 
 class Optimizer(esr.Module):
@@ -42,8 +44,46 @@ class Optimizer(esr.Module):
         self.grah_h = grad_h
     
     def forward(self):
-        self.h.sub_(self.grah_h * 100)
+        self.h.sub_(self.grah_h * 10.0**55)
 
+
+class InitTarget(esr.Module):
+    def __init__(self, eqn: ShallowWaterEquation, img_arr: torch.Tensor):
+        super().__init__()
+        self.eqn = eqn
+        self.img_arr = esr.Tensor(img_arr, mode='replicate')
+        self.target_h = esr.Tensor(esr.zeros_like(eqn.h), mode='partition')
+    
+    def forward(self):
+        x = self.eqn.x
+        y = self.eqn.y
+        img_x = (x * self.img_arr.shape[0]).long()
+        img_y = (y * self.img_arr.shape[1]).long()
+        gray = self.img_arr[img_x, img_y]
+
+        target_h = (gray / 255.0 - 0.5) * 0.1 + 1.0
+        self.target_h[:] = target_h
+
+
+TARGET_H_HDF5 = os.path.join(swe_dir, 'target_h.hdf5')
+
+def init_target(eqn: ShallowWaterEquation) -> None:
+    from PIL import Image
+    logo = Image.open(os.path.join(swe_dir, '../logo.png')).convert('L')
+
+    logo = logo.crop((0, 245, 1300, 1560))
+    logo = logo.resize((1000, 1000))
+    logo.save(os.path.join(swe_dir, 'logo_gray.png'))
+
+    img_arr = torch.from_numpy(np.array(logo)).double()
+
+    init_target = InitTarget(eqn, img_arr)
+    [init_target] = esr.compile([init_target], backend='none') # type: ignore
+    init_target: InitTarget
+
+    init_target()
+    
+    init_target.target_h.save(TARGET_H_HDF5, 'h')
 
 if __name__ == "__main__":
     """
@@ -80,6 +120,11 @@ if __name__ == "__main__":
         args.mesh, args.shallow_water, args.dt, args.device, for_backprop=True
     )
 
+    if not os.path.exists(TARGET_H_HDF5):
+        init_target(eqn)
+        print("Init target H. Rerun this torchrun command")
+        exit(0)
+
     swap = Swap(eqn)
 
     obj = Obj(eqn)
@@ -92,6 +137,9 @@ if __name__ == "__main__":
     opt = Optimizer(eqn.h, eqn_vjp.products[0])
 
     [eqn, eqn_vjp, swap, obj_vjp, opt] = esr.compile([eqn, eqn_vjp, swap, obj_vjp, opt], args.backend)
+
+    # remove assembled initial height
+    eqn.h.data[:] = 1.0
 
     for ti in range(args.train_step):
 
@@ -127,4 +175,16 @@ if __name__ == "__main__":
         eqn.vh.zero_()
         opt()
 
-        print(ti, loss)
+        print(ti, loss.item(), eqn_vjp.products[0].aminmax())
+    
+
+    print("Final simulation")
+    for i in tqdm(range(args.sim_step)):
+        if i % 10 == 0:
+            x = eqn.x.collect().cpu().numpy(),
+            y = eqn.y.collect().cpu().numpy(),
+            z = eqn.h.collect().cpu().numpy(),
+            if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                np.savez(f'{args.output}/data{i//10:03d}.npz', x=x, y=y, z=z)
+
+        eqn()
