@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str)
     parser.add_argument("--filename", type=str)
+    parser.add_argument("--samples", type=int, default=100)
     args = parser.parse_args()
 
     fig = plot.figure()
@@ -30,7 +31,7 @@ if __name__ == '__main__':
     z_range = 0.1
 
     with writer.saving(fig, args.filename, dpi=72):
-        for i in tqdm(range(10)):
+        for i in tqdm(range(args.samples)):
             data = np.load(f"{args.data_dir}/data{i:03d}.npz")
             x, y, z = (data['x'], data['y'], data['z'])
 

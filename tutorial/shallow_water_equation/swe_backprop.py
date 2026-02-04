@@ -26,25 +26,38 @@ class Swap(esr.Module):
         self.eqn.uh[:] = self.eqn.uh_new
         self.eqn.vh[:] = self.eqn.vh_new
 
+class SwapCot(esr.Module):
+    def __init__(self, prev_product: esr.Tensor, next_vector: esr.Tensor):
+        super().__init__()
+        self.prev_product = prev_product
+        self.next_vector = next_vector
+    
+    def forward(self):
+        self.next_vector[:] = self.prev_product
+
 class Obj(esr.Module):
     def __init__(self, eqn: ShallowWaterEquation):
         super().__init__()
         self.eqn = eqn
         self.loss = esr.Tensor(torch.tensor([0.0], dtype=torch.float64), mode='replicate')
         self.target_h = esr.Tensor(esr.hdf5(TARGET_H_HDF5, 'h'), mode='partition')
+
+        self.nv = self.target_h.shape[0]
+
     
     def forward(self):
         loss = esr.norm(self.eqn.h - self.target_h)
         self.loss[:] = loss
 
 class Optimizer(esr.Module):
-    def __init__(self, h: esr.Tensor, grad_h: esr.Tensor):
+    def __init__(self, h0: esr.Tensor, grad_h0: esr.Tensor, learning_rate: float):
         super().__init__()
-        self.h = h
-        self.grah_h = grad_h
+        self.h0 = h0
+        self.grad_h0 = grad_h0
+        self.learning_rate = learning_rate
     
     def forward(self):
-        self.h.sub_(self.grah_h * 10.0**55)
+        self.h0.sub_(self.grad_h0 * self.learning_rate)
 
 
 class InitTarget(esr.Module):
@@ -61,7 +74,7 @@ class InitTarget(esr.Module):
         img_y = (y * self.img_arr.shape[1]).long()
         gray = self.img_arr[img_x, img_y]
 
-        target_h = (gray / 255.0 - 0.5) * 0.1 + 1.0
+        target_h = gray / 255.0 * 0.1 - 0.05 + 1.0
         self.target_h[:] = target_h
 
 
@@ -109,6 +122,7 @@ if __name__ == "__main__":
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--sim_step", type=int, default=1000)
     parser.add_argument("--train_step", type=int, default=1000)
+    parser.add_argument("--learning_rate", type=str, default='1e3')
     parser.add_argument("--output", type=str)
     parser.add_argument("mesh", type=str)
     parser.add_argument("shallow_water", type=str)
@@ -125,18 +139,29 @@ if __name__ == "__main__":
         print("Init target H. Rerun this torchrun command")
         exit(0)
 
+    # unless we are storing/restoring the same esr.Tensor, for exchanging data
+    # between two esr.Tensors like d_h_next and d_h_prev, we need a dedicated
+    # esr.Module like Swap or SwapCot to ensure the element identities,
+    # i.e. ElemParts, between these two esr.Tensors match.
     swap = Swap(eqn)
 
     obj = Obj(eqn)
     dloss = esr.Tensor(torch.tensor([1.0], dtype=torch.float64), mode='replicate')
     obj_vjp = esr.vjp(obj, [obj.eqn.h], [obj.loss], vectors=[dloss])
 
-    eqn_vjp = esr.vjp(eqn, [eqn.h], [eqn.h_new], vectors=obj_vjp.products)
+    d_h_next_vector = obj_vjp.products[0]
+
+    eqn_vjp = esr.vjp(eqn, [eqn.h], [eqn.h_new], vectors=[d_h_next_vector])
+    d_h_prev_product = eqn_vjp.products[0]
+    swap_cot = SwapCot(d_h_prev_product, d_h_next_vector)
 
     # h and grad_h never meet, so elempart may be not the same.
-    opt = Optimizer(eqn.h, eqn_vjp.products[0])
+    opt = Optimizer(eqn.h, d_h_prev_product, float(args.learning_rate))
 
-    [eqn, eqn_vjp, swap, obj_vjp, opt] = esr.compile([eqn, eqn_vjp, swap, obj_vjp, opt], args.backend)
+    [eqn, eqn_vjp, swap, swap_cot, obj_vjp, opt] = esr.compile(
+        [eqn, eqn_vjp, swap, swap_cot, obj_vjp, opt],
+        args.backend
+    )
 
     # remove assembled initial height
     eqn.h.data[:] = 1.0
@@ -161,30 +186,34 @@ if __name__ == "__main__":
         obj_vjp()
         loss = obj_vjp.loss.collect()
         
-        for i in tqdm(reversed(range(args.sim_step))):
-            eqn_vjp.h.copy_(hs[i])
-            eqn_vjp.uh.copy_(uhs[i])
-            eqn_vjp.vh.copy_(vhs[i])
+        print(f"BP for train step {ti}")
+        for i in tqdm(range(args.sim_step)):
+            sim_i = args.sim_step - i - 1
+            eqn_vjp.h.data.copy_(hs[sim_i])
+            eqn_vjp.uh.data.copy_(uhs[sim_i])
+            eqn_vjp.vh.data.copy_(vhs[sim_i])
 
             eqn_vjp()
-
-            eqn_vjp.vectors[0].copy_(eqn_vjp.products[0])
+            swap_cot()
         
-        eqn.h.copy_(hs[0])
-        eqn.uh.zero_()
-        eqn.vh.zero_()
         opt()
 
-        print(ti, loss.item(), eqn_vjp.products[0].aminmax())
+        dhmin, dhmax = d_h_prev_product.data.aminmax()
+        hmin, hmax = eqn.h.data.aminmax()
+        print(ti, loss.item(), hmin.item(), hmax.item(), dhmin.item(), dhmax.item())
     
 
     print("Final simulation")
-    for i in tqdm(range(args.sim_step)):
-        if i % 10 == 0:
+    # for i in tqdm(range(args.sim_step)):
+    for i in tqdm(range(100)):
+        # if i % 10 == 0:
+        if i % 1 == 0:
             x = eqn.x.collect().cpu().numpy(),
             y = eqn.y.collect().cpu().numpy(),
             z = eqn.h.collect().cpu().numpy(),
             if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-                np.savez(f'{args.output}/data{i//10:03d}.npz', x=x, y=y, z=z)
+                # np.savez(f'{args.output}/data{i//10:03d}.npz', x=x, y=y, z=z)
+                np.savez(f'{args.output}/data{i:03d}.npz', x=x, y=y, z=z)
 
         eqn()
+        swap()

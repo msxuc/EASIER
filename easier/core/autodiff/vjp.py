@@ -409,6 +409,8 @@ class VjpTransformer(EasierInterpreter):
         # Must be in the same (whatever) order as `raw_node_diff_args`
         input_primal_nodes: List[Union[Node, Sequence[Node]]] = []
 
+        diffable_roles = []
+
         for argname, raw_node_diff_arg in raw_node_diff_args.items():
 
             if not isinstance(raw_node_diff_arg, (Node, Sequence)):
@@ -436,17 +438,22 @@ class VjpTransformer(EasierInterpreter):
                 input_primal_nodes.append(
                     self.vjp_graph.get_attr(primal_const_tensor_attrname)
                 )
+
+                diffable_roles.append(Role.REPLICATED)
             
             else:  # Node or Node list
                 input_primal_nodes.append(tree_map(
                     raw_node_diff_arg, self.nodemap_raw2primal.__getitem__
                 ))
 
-        roles = collect_meta(
-            collect_meta(input_primal_nodes, get_node_meta, leaf_type=Node),
-            lambda meta: meta.role
-        )
-        if len(set(roles)) >= 2:
+                diffable_roles.extend(collect_meta(
+                    collect_meta(
+                        raw_node_diff_arg, get_node_meta, leaf_type=Node
+                    ),
+                    lambda meta: meta.role
+                ))
+
+        if len(set(diffable_roles)) >= 2:
             logger.warning(
                 f"{self.current_node} takes both distributed and replicated"
                 " arguments, use `expand_as` on the replicated arguments first"
