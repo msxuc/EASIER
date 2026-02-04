@@ -31,7 +31,7 @@ from easier.core.autodiff.autodiff_rule import \
     DiffRuleBase, Differentiability, RequiredParam, \
     diff_rule_registry, differentiabilities, getitem_aux_kw
 from easier.core.autodiff.utils import PrimalMetaPropagator, create_zero_arg_val, simplify_torchfunc_fx_graph, FxConst, wrap_operator_specific_kwargs_normalizer
-from easier.core.utils import EasierJitException
+from easier.core.utils import EasierJitException, logger
 
 _T = TypeVar('_T')
 
@@ -297,6 +297,10 @@ class VjpTransformer(EasierInterpreter):
                 self.vjp_graph.call_function(operator.setitem, (grad_node, (slice(None),), cot))
 
 
+    def if_call_method(self, method_name: str):
+        function = getattr(torch.ops.aten, method_name)
+        self._handle_operation(function)
+
 
     def if_call_function(self, function: Callable) -> None:
         if function is operator.setitem:
@@ -437,6 +441,21 @@ class VjpTransformer(EasierInterpreter):
                 input_primal_nodes.append(tree_map(
                     raw_node_diff_arg, self.nodemap_raw2primal.__getitem__
                 ))
+
+        roles = collect_meta(
+            collect_meta(input_primal_nodes, get_node_meta, leaf_type=Node),
+            lambda meta: meta.role
+        )
+        if len(set(roles)) >= 2:
+            logger.warning(
+                f"{self.current_node} takes both distributed and replicated"
+                " arguments, use `expand_as` on the replicated arguments first"
+                " and OUTSIDE OF esr.vjp scope"
+            )
+            # TODO during vjp we should detect broadcasting semantics from
+            # replica to distributed tensors, expand_as it manually, and
+            # generate an `esr.sum` for BP, otherwise torch.vjp will generate
+            # a common torch.sum which breaks EASIER programming model.
 
 
         return input_primal_nodes
@@ -1284,6 +1303,33 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
             return jvp_inputs[i][ii] # type: ignore
     
     def _prune_subg(self):
+        """
+        TODO there will ultimately be no such pruning process, because:
+
+        -   Currently we only respect the differentiability of parameters
+            on API-level, we didn't take the real arguments into consideration
+            e.g. the argument may be a const scalar or torch.Tensor.
+            So to each diff-able parameter torch.vjp will generate cotangent
+            computations.
+
+            The better approach is to filter those arguments by the value,
+            send to _primal_func as closure.
+            `_generate_subgraph_using_torch_vjp` already has similar
+            functionalities.
+
+        -   Currently, also as a bad side-effect of the #1 point, e.g.
+            `dist * replica` will lead torch.vjp to generate a torch.aten.sum
+            to aggregate cotangent for `replica`.
+            In the current setting this can be pruned.
+
+            However, pruning is not the correct way to handle this, as
+            dist+replica operations are ubiquitous.
+
+            The better approach is to handle torch's broadcasting semantics
+            ourselves:
+            1.  Insert an explicit `torch.expand_as` call to replica arguments;
+            2.  For BP, insert an `esr.sum` aggregator for that `expand_as`.
+        """
         vjp_subgraph_out = cast(Sequence[Node], self.current_graph.output_node().args[0])
         out_cots = vjp_subgraph_out[self.n_flattened_primal_outputs:]
 
