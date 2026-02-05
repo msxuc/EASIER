@@ -98,6 +98,63 @@ def init_target(eqn: ShallowWaterEquation) -> None:
     
     init_target.target_h.save(TARGET_H_HDF5, 'h')
 
+
+def torch_backprop(args, eqn: ShallowWaterEquation, obj: Obj, sim_step: int) -> None:
+    #
+    #
+    return
+    #
+    #
+    [eqn, obj] = esr.compile([eqn, obj], backend='none')  # type: ignore
+
+    def _forward(h, uh, vh):
+        delta_h1, delta_uh1, delta_vh1 = eqn.delta(h, uh, vh)
+        delta_h2, delta_uh2, delta_vh2 = eqn.delta(
+            h + 0.5 * eqn.dt * delta_h1,
+            uh + 0.5 * eqn.dt * delta_uh1,
+            vh + 0.5 * eqn.dt * delta_vh1,)
+        delta_h3, delta_uh3, delta_vh3 = eqn.delta(
+            h + 0.5 * eqn.dt * delta_h2,
+            uh + 0.5 * eqn.dt * delta_uh2,
+            vh + 0.5 * eqn.dt * delta_vh2,)
+        delta_h4, delta_uh4, delta_vh4 = eqn.delta(
+            h + eqn.dt * delta_h3,
+            uh + eqn.dt * delta_uh3,
+            vh + eqn.dt * delta_vh3,)
+
+        h_delta = \
+            eqn.dt / 6 * (delta_h1 + delta_h2 + delta_h3 + delta_h4)
+        uh_delta = \
+            eqn.dt / 6 * (delta_uh1 + delta_uh2 + delta_uh3 + delta_uh4)
+        vh_delta = \
+            eqn.dt / 6 * (delta_vh1 + delta_vh2 + delta_vh3 + delta_vh4)
+        
+        return h + h_delta, uh + uh_delta, vh + vh_delta
+    
+    eqn.h.requires_grad_(True)
+
+    opt = torch.optim.SGD([eqn.h], lr=1.0)
+
+    for ti in range(args.train_step):
+        opt.zero_grad()
+
+        h, uh, vh = eqn.h, eqn.uh, eqn.vh
+
+        # for i in tqdm(range(sim_step)):
+        for i in tqdm(range(21)):
+            h, uh, vh = _forward(h, uh, vh)
+        loss = torch.norm(h - obj.target_h)
+
+        loss.backward()
+
+        opt.step()
+
+        dhmin, dhmax = eqn.h.grad.aminmax()
+        print(ti, loss.item(), dhmin.item(), dhmax.item())
+    
+    exit(0)
+        
+
 if __name__ == "__main__":
     """
     Usage:
@@ -138,6 +195,8 @@ if __name__ == "__main__":
         init_target(eqn)
         print("Init target H. Rerun this torchrun command")
         exit(0)
+    
+    torch_backprop(args, eqn, Obj(eqn), args.sim_step)
 
     # unless we are storing/restoring the same esr.Tensor, for exchanging data
     # between two esr.Tensors like d_h_next and d_h_prev, we need a dedicated

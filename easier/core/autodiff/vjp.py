@@ -439,7 +439,10 @@ class VjpTransformer(EasierInterpreter):
                     self.vjp_graph.get_attr(primal_const_tensor_attrname)
                 )
 
-                diffable_roles.append(Role.REPLICATED)
+                # TODO even currently we don't filter this scalar operands
+                # out, their sub vjp graph are pruned, so we won't face
+                # EASIER-incompatible torch.aten.sum aggregation on cotangent.
+                # diffable_roles.append(Role.REPLICATED)
             
             else:  # Node or Node list
                 input_primal_nodes.append(tree_map(
