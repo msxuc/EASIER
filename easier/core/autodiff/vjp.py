@@ -648,7 +648,7 @@ class VjpTransformer(EasierInterpreter):
 
             # Resume to insert at the end of VJP graph
             cotangent_copier = _TorchVjpSubGraphCotangentPartCopier(
-                gm, subg, self.vjp_graph, primal_copier,
+                gm, subg, self.vjp_graph, self, primal_copier,
                 cotangent,
                 flattened_output_tree,
                 nondiff_inputs_attrname2vjp,
@@ -746,7 +746,7 @@ class VjpTransformer(EasierInterpreter):
 
                 cot_node = self.vjp_graph.call_module(reducer_name, (vjp_out_cot,))
         
-                self.nodemap_primal2sumcot[input_primal] = cot_node
+                self.on_new_cotangent_component(input_primal, cot_node)
 
 
         elif isinstance(submod, esr.Reducer):
@@ -772,10 +772,21 @@ class VjpTransformer(EasierInterpreter):
 
                 cot_node = self.vjp_graph.call_module(selector_name, (vjp_out_cot,))
         
-                self.nodemap_primal2sumcot[input_primal] = cot_node
+                self.on_new_cotangent_component(input_primal, cot_node)
 
         else:
             assert False, 'unreachable'
+    
+    def on_new_cotangent_component(self, primal_node: Node, primal_cot_node: Node):
+        if primal_node in self.nodemap_primal2sumcot:
+            vjp_out_cot_comp = self.nodemap_primal2sumcot[primal_node]
+            primal_cot_node = self.vjp_graph.call_function(
+                torch.add,
+                (vjp_out_cot_comp, primal_cot_node),
+                name=f'{primal_node.name}__cotSum__{primal_cot_node.name}'
+            )
+    
+        self.nodemap_primal2sumcot[primal_node] = primal_cot_node
 
     def _flatten(
         self,
@@ -1084,6 +1095,19 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
             self._record_output(self.current_graph.output_node())
 
         return self
+
+    def _from_flatten(
+        self,
+        jvp_inputs: List[Union[Node, Sequence[Node]]],
+        tree: List[int]
+    ) -> Union[Node, FxConst]:
+        if len(tree) == 1:
+            [i] = tree
+            return jvp_inputs[i]  # type: ignore
+        else:
+            [i, ii] = tree
+            return jvp_inputs[i][ii] # type: ignore
+
         
     def if_placeholder(self, param_name: str):
         """
@@ -1097,21 +1121,10 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         # and not usable.
         is_primal = self._placeholder_i < self.n_flattened_primal_inputs
 
-        def _from_flatten(
-            jvp_inputs: List[Union[Node, Sequence[Node]]],
-            tree: List[int]
-        ) -> Union[Node, FxConst]:
-            if len(tree) == 1:
-                [i] = tree
-                return jvp_inputs[i]  # type: ignore
-            else:
-                [i, ii] = tree
-                return jvp_inputs[i][ii] # type: ignore
-
         if is_primal:
             ph_pos = self._placeholder_i
 
-            vjp_primal = _from_flatten(
+            vjp_primal = self._from_flatten(
                 self.vjp_input_primals, self.input_flatten_tree[ph_pos]
             )
             self.nodemap_subg2vjp[self.current_node] = vjp_primal
@@ -1137,23 +1150,29 @@ class _TorchVjpSubGraphPrimalPartCopier(EasierInterpreter):
         jvp_subgraph_out = cast(
             Sequence[Node], self.current_graph.output_node().args[0]
         )
-        is_output = subg_node in \
+        is_primal_output = subg_node in \
             jvp_subgraph_out[:self.n_flattened_primal_outputs]
+        is_output_cotangent = subg_node in \
+            jvp_subgraph_out[self.n_flattened_primal_outputs:]
 
-        if is_output:
-            name = f'{self.raw_node.name}_vjp'
+        if is_primal_output:
+            name = f'{self.raw_node.name}__vjp'
+
+        elif is_output_cotangent:
+            # TODO move this name logic to CotangentCopier
+            out_cot_pos = jvp_subgraph_out[self.n_flattened_primal_outputs:].index(subg_node)
+            vjp_primal = self._from_flatten(
+                self.vjp_input_primals, self.input_flatten_tree[out_cot_pos]
+            )
+            name = f'{vjp_primal}__cot__{self.raw_node.name}'
+            
         else:
-            name = f'{self.raw_node.name}_vjp_{subg_node.name}'
+            name = f'{self.raw_node.name}__vjp__{subg_node.name}'
         
         ng = get_node_tensor_group(self.raw_node)
         if ng is not None:
             # Sometimes literal batch size 1000 (we picked for fake vjp run)
             # appears in the arg list.
-            def _pick_dist_input(x: Node):
-                if get_node_meta(x).role == Role.DISTRIBUTED:
-                    return x
-                else:
-                    return None
             dist_primal_input = collect_meta(
                 self.vjp_input_primals, leaf_type=Node
             )[0]
@@ -1249,6 +1268,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
 
     def __init__(
         self, subgm: GraphModule, subg: Graph, vjp_graph: Graph,
+        vjp_transformer: VjpTransformer,
         primal_copier: _TorchVjpSubGraphPrimalPartCopier,
         #
         # Structural info about diff-able inputs
@@ -1276,6 +1296,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
     ) -> None:
         super().__init__([subgm], [subg])  # type: ignore
 
+        self.vjp_transformer = vjp_transformer
         self.primal_copier = primal_copier
 
         self.vjp_graph = vjp_graph
@@ -1434,14 +1455,7 @@ class _TorchVjpSubGraphCotangentPartCopier(EasierInterpreter):
             if vjp_out_cot is None:  # has been pruned
                 continue
 
-            if vjp_primal in self.nodemap_primal2sumcot:
-                vjp_out_cot_comp = self.nodemap_primal2sumcot[vjp_primal]
-                vjp_out_cot = self.vjp_graph.call_function(
-                    torch.add,
-                    (vjp_out_cot_comp, vjp_out_cot)
-                )
-        
-            self.nodemap_primal2sumcot[vjp_primal] = vjp_out_cot
+            self.vjp_transformer.on_new_cotangent_component(vjp_primal, vjp_out_cot)
 
     
     def if_call_method(self, method_name: str):

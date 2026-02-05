@@ -99,7 +99,7 @@ def init_target(eqn: ShallowWaterEquation) -> None:
     init_target.target_h.save(TARGET_H_HDF5, 'h')
 
 
-def torch_backprop(args, eqn: ShallowWaterEquation, obj: Obj, sim_step: int) -> None:
+def torch_backprop(args, eqn: ShallowWaterEquation, obj: Obj) -> None:
     #
     #
     return
@@ -133,15 +133,14 @@ def torch_backprop(args, eqn: ShallowWaterEquation, obj: Obj, sim_step: int) -> 
     
     eqn.h.requires_grad_(True)
 
-    opt = torch.optim.SGD([eqn.h], lr=1.0)
+    opt = torch.optim.SGD([eqn.h], lr=float(args.learning_rate))
 
     for ti in range(args.train_step):
         opt.zero_grad()
 
         h, uh, vh = eqn.h, eqn.uh, eqn.vh
 
-        # for i in tqdm(range(sim_step)):
-        for i in tqdm(range(21)):
+        for i in tqdm(range(args.sim_step)):
             h, uh, vh = _forward(h, uh, vh)
         loss = torch.norm(h - obj.target_h)
 
@@ -195,8 +194,13 @@ if __name__ == "__main__":
         init_target(eqn)
         print("Init target H. Rerun this torchrun command")
         exit(0)
+
+
+    # remove assembled initial height
+    eqn.h = esr.Tensor(esr.ones_like(eqn.h), mode='partition')
+
     
-    torch_backprop(args, eqn, Obj(eqn), args.sim_step)
+    torch_backprop(args, eqn, Obj(eqn))
 
     # unless we are storing/restoring the same esr.Tensor, for exchanging data
     # between two esr.Tensors like d_h_next and d_h_prev, we need a dedicated
@@ -221,9 +225,6 @@ if __name__ == "__main__":
         [eqn, eqn_vjp, swap, swap_cot, obj_vjp, opt],
         args.backend
     )
-
-    # remove assembled initial height
-    eqn.h.data[:] = 1.0
 
     for ti in range(args.train_step):
 
